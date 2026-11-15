@@ -1,0 +1,32 @@
+# Status MCP
+
+Plan zaakceptowany. Wykonywanie kart jeszcze się nie rozpoczęło.
+
+- Repozytorium do zapisu: `dlubom/HDMapping`.
+- Branch planu: `mcp/implementation-plan`.
+- Bazowy commit rozpoznania: `3d3a8054986f95fcf580ef0f780889043bfdd475`.
+- Następna karta: **P00**.
+- Kolejne czaty stosują [zasady przekazania](README.md).
+
+| Karta | Stan | Raport |
+| --- | --- | --- |
+| P00 | NOT STARTED | — |
+| P01 | NOT STARTED | — |
+| P02 | NOT STARTED | — |
+| P03 | NOT STARTED | — |
+| P04 | NOT STARTED | — |
+| P05 | NOT STARTED | — |
+| P06 | NOT STARTED | — |
+| P07 | NOT STARTED | — |
+| P08 | NOT STARTED | — |
+| P09 | NOT STARTED | — |
+| P10 | NOT STARTED | — |
+| P11 | NOT STARTED | — |
+| P12 | NOT STARTED | — |
+| P13 | NOT STARTED | — |
+| P14 | NOT STARTED | — |
+| P15 | NOT STARTED | — |
+| P16 | NOT STARTED | — |
+| P17 | NOT STARTED | — |
+
+Dozwolone stany: `NOT STARTED`, `IN PROGRESS`, `INCOMPLETE`, `PASSED`. Raport musi uzasadniać zmianę stanu. Sam commit, push lub ukończenie części sprawdzeń nie oznacza zaliczenia karty.
