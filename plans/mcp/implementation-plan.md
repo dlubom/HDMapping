@@ -10,6 +10,8 @@
 
 **Spec:** [design.md](design.md); decyzje Q1–Q20: [design-tree.md](design-tree.md); źródła: [findings.md](findings.md).
 
+**Jakość:** [quality.md](quality.md) określa obowiązkowe kontrole i wytyczne Go/C++. Kryteria tej sekcji uzupełniają odbiór każdej karty zgodnie z etapem wdrożenia.
+
 Status: plan zaakceptowany do pracy po jednej karcie w osobnym czacie. Żadna karta nie została jeszcze wykonana. Właściciel forka zlecił wersjonowanie tego pakietu w `plans/mcp/`. Oznaczenia P00–P17 są kartami planu, nie numerami zgłoszeń GitHub. Zasady wykonania, dostarczenia i następnego promptu: [README.md](README.md); bieżący stan: [status.md](status.md).
 
 ## Global Constraints
@@ -26,7 +28,8 @@ Status: plan zaakceptowany do pracy po jednej karcie w osobnym czacie. Żadna ka
 - Build z MCP dostarcza Go automatycznie z przypiętych oficjalnych archiwów lub używa zgodnego systemowego kompilatora; nie wymaga ręcznych poleceń Go. Gotowy pakiet nie wymaga Go/Python/Node u użytkownika.
 - Opcja `BUILD_WITH_MCP`: OFF podczas dostarczania niekompletnych kart, ON w kompletnym wydaniu po P17. OFF nie wymaga Go i zachowuje dotychczasowy model GUI. To techniczna propozycja autora, zgodna z jednym wydaniem produktu.
 - Dane odbiorowe poza repozytorium. Testy logiki i kontraktów; GUI sprawdzane w rzeczywistej aplikacji, szczególnie na Windows.
-- Wykonuj wyłącznie kartę wskazaną w bieżącym prompcie użytkownika. Dostarczenie na fork i następny prompt według README; merge i release wymagają odrębnego zlecenia.
+- Kontrole jakości obowiązują od pierwszego kodu danego modułu: kwalifikacja narzędzi w P00, integracja Go w P01, pokrycie nowych modułów C++ w P03. Wersje, zakres i wyniki według [quality.md](quality.md); istniejące workflow obsługują także branche MCP w forku.
+- Wykonuj wyłącznie kartę wskazaną w bieżącym prompcie użytkownika. Dostarczenie na fork i następny prompt według README; scalenie PR lub do `main` oraz release wymagają odrębnego zlecenia. Włączenie przekazanej bazy do brancha karty jest częścią jej rozpoczęcia.
 
 ## Review Focus
 
@@ -89,6 +92,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Sprawdzić uruchomienie odłączonego koordynatora i kontrolowanego workera po zamknięciu klienta oraz okna na trzech platformach; na Windows sprawdzić także ograniczenia procesów potomnych. Dowodem jest dalsza praca, ponowne połączenie i odczyt tego samego ID.
 - [ ] Wybrać mechanizm IPC dostępny wyłącznie dla tego użytkownika oraz metodę uruchamiania na żądanie, bez wymagania uprawnień administratora. Jeżeli jeden mechanizm nie spełnia platform, dostarczyć implementacje platformowe tego samego kontraktu.
 - [ ] Przypiąć Go i moduły z oficjalnych źródeł, ustalić checksums toolchainu dla obsługiwanych architektur; wynik staje się wejściem P01. Go SDK v1.7.0 wymaga `go 1.25.0`; nie zakładać, że domyślny pakiet Ubuntu 24.04 wystarczy.
+- [ ] Zakwalifikować narzędzia i macierz jakości z [quality.md](quality.md): konkretne zgodne wersje, pochodzenie i checksums pobieranych artefaktów, wymagania platformowe, polecenia i wyniki prób w tymczasowym prototypie. Zachować clang-format 21 i obecny styl. Dostarczyć dane do P01/P03 bez dodawania konfiguracji CMake ani CI produktu.
 - [ ] Przygotować bazowe wyniki realnego Parking i wybranego nakładającego się podzbioru wielu sesji (kandydat OmniWarsaw). Zapisać konfigurację i natywny wynik; nie uznawać 25 chunków Parking za 25 sesji.
 - [ ] Sporządzić macierz istniejących operacji i miejsc mutacji GUI dla kroków 1–3, łącznie z importami/eksportami i zależnościami typu BoW/geoidy. To lista odbiorowa kolejnych kart.
 
@@ -96,9 +100,11 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 
 ## P01 — Budowanie i minimalny MCP produktu
 
-**Pliki:** nowe `apps/hdmapping_mcp/{CMakeLists.txt,go.mod,go.sum,cmd/mcp/main.go,internal/mcp/server.go,internal/mcp/server_test.go}`, `cmake/go.cmake`; istniejące top-level CMake, `cmake/install_app.cmake`, platformowe CI, `deploy_mandeye.bat`, `macos_bundle_toolkit/`; build docs wiki.
+**Pliki:** nowe `apps/hdmapping_mcp/{CMakeLists.txt,go.mod,go.sum,.golangci.yml,cmd/mcp/main.go,internal/mcp/server.go,internal/mcp/server_test.go}`, `cmake/go.cmake`; istniejące top-level CMake, `cmake/install_app.cmake`, platformowe CI, skrypty formatowania i `scripts/README.md`, `deploy_mandeye.bat`, `macos_bundle_toolkit/`; build docs wiki.
 **Interfejs:** MCP stdio `server_info`/capabilities z wersją produktu; brak reklamowania niezaimplementowanych operacji.
 
+- [ ] Przed implementacją funkcji MCP wdrożyć kontrole Go z [quality.md](quality.md): formatowanie, wybrane analizy, testy na trzech platformach, race na Linux i govulncheck. Przypiąć narzędzia zakwalifikowane w P00; udostępnić odtwarzalne polecenia lokalne i we wspólnym CI. Rozszerzyć obecny zakres formatowania C++ o planowane `processing/` bez przeformatowania pobocznego kodu.
+- [ ] Sprawdzić, że istniejące workflow rzeczywiście uruchamiają kontrole dla branchy MCP w forku. Tymczasową błędną próbką potwierdzić odrzucenie naruszeń formatowania i analizy; usunąć próbkę przed commitem. PASS wymaga wykonanych kontroli dla nowego kodu, a nie samej obecności plików konfiguracji.
 - [ ] Dodać test klientem SDK: `tools/list` ma poprawne schematy, wersja odpowiada top-level CMake, błędne argumenty dają błąd, log nie trafia na stdout protokołu. Uruchomić i potwierdzić brak wymaganej funkcji przed implementacją.
 - [ ] Zintegrować `go build` i testy w CMake, przypięte źródła i moduły. Automatyczny toolchain pobiera wyłącznie oficjalne archiwum z SHA256; systemowy jest używany tylko po sprawdzeniu zgodności. OFF nie szuka/pobiera Go.
 - [ ] Dodać cele i `hdmapping_install_app`; rozszerzyć wspólny helper o instalację executable z Go, ponieważ obecne `install(TARGETS)` nie obsłuży wprost imported executable. Zachować komponent `applications`, `DESTDIR`, `.exe` i `HDMAPPING_BINARY_PREFIX`; Windows `EXPECTED` uwzględnia opcję ON/OFF. Nie tworzyć osobnego procesu pakowania.
@@ -119,6 +125,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 **Pliki:** `cmd/coordinator/main.go`, `internal/protocol/{messages.go,client.go,server.go}`, `internal/supervisor/` z implementacjami platformowymi i testami; `apps/hdmapping_worker/{CMakeLists.txt,main.cpp}`; `processing/{CMakeLists.txt,include/HDMapping/Processing/Operation.h,src/Operation.cpp,include/HDMapping/Processing/RuntimeProtocol.h,src/RuntimeProtocol.cpp}`; istniejące CMake/install/packaging.
 **Interfejs:** kontrakty z wcześniejszej sekcji; worker opisuje operacje i wykonuje wskazane zadanie, raportuje etap i odbiera anulowanie.
 
+- [ ] Od pierwszych nowych targetów C++ zastosować [quality.md](quality.md): ostrzeżenia jako błędy w kontrolowanym CI, clang-tidy z bazą kompilacji, formatowanie, doctest/CTest oraz ASan+UBSan. Własny kod współbieżny sprawdzić osobno pod TSan. Dodać konfigurację i opcje CMake w tej karcie; sprawdzić zakres i reakcję analizatora na tymczasowy błąd, bez globalnego zaostrzania flag zależności.
 - [ ] Dodać integracyjny test procesu: dwa adaptery odnajdują jeden koordynator; zamknięcie adaptera nie kończy fake workera; ponowne połączenie zwraca to samo ID. Fałszywa tożsamość procesu i niezgodna wersja produktu są odrzucane.
 - [ ] Zaimplementować mechanizm z P00, nadzór i ponowne odnajdowanie rzeczywiście własnych procesów; nie ufać samemu PID. Registry GUI/worker nie pozwala podszyć się pod innego użytkownika. Odnajdywanie executable obsługuje zarówno nieprefiksowane nazwy z build/bundle, jak i prefiks instalacji `HDMAPPING_BINARY_PREFIX`.
 - [ ] Dodać prawdziwy worker C++ z `DescribeOperations` i jawnie nieobsługiwanym nieznanym poleceniem. Wymusić `core_no_gui` przy ON i brak inicjalizacji okna.

@@ -5,6 +5,7 @@ Uzgodniony plan dla forka [dlubom/HDMapping](https://github.com/dlubom/HDMapping
 ## Dokumenty
 
 - [Plan P00–P17](implementation-plan.md): zakres, zależności, interfejsy i kryteria odbioru.
+- [Standard jakości Go i C++](quality.md): obowiązkowe kontrole, wytyczne i moment ich wdrożenia.
 - [Projekt](design.md), [decyzje Q1–Q20](design-tree.md), [słownik](GLOSSARY.md) i [ADR](adr/0002-go-coordinator-cpp-processing.md): uzgodnione zachowanie.
 - [Rozpoznanie](findings.md): dowody ze stanu bazowego; wersje bibliotek i hostów trzeba sprawdzić ponownie w P00.
 - [Status kart](status.md): jedna trwała informacja o postępie, uaktualniana po pracy nad kartą.
@@ -12,10 +13,10 @@ Uzgodniony plan dla forka [dlubom/HDMapping](https://github.com/dlubom/HDMapping
 
 ## Początek każdego czatu
 
-1. Przeczytaj `AGENTS.md`, ten plik, status, projekt oraz ograniczenia i sekcję wskazanej karty w planie. Czytaj pozostałe karty tylko dla potrzeb jej zależności.
+1. Przeczytaj `AGENTS.md`, ten plik, `quality.md`, status, projekt oraz ograniczenia i sekcję wskazanej karty w planie. Czytaj pozostałe karty tylko dla potrzeb jej zależności.
 2. Sprawdź rzeczywisty status Git, remotes i zdalny SHA brancha podanego w prompcie. Fork do zapisu to `dlubom/HDMapping`; identyfikuj go po URL, nie samym słowie `origin`. Zachowaj cudze zmiany.
 3. Porównaj zdalny SHA z przekazanym. Jeśli branch przesunął się, sprawdź nowe commity i raporty przed kontynuacją. Nie resetuj ani nie nadpisuj historii, żeby odtworzyć starszy stan.
-4. Nowa karta powstaje na osobnym branchu `mcp/pXX` od zweryfikowanego końca poprzedniej karty. P00 zaczyna od `mcp/implementation-plan`. Kontynuacja nieukończonej karty używa jej aktualnego brancha. Przy istniejącym branchu sprawdź zawartość zamiast go zastępować.
+4. Nowa karta powstaje na osobnym branchu `mcp/pXX` od zweryfikowanego końca poprzedniej karty. P00 zaczyna od `mcp/implementation-plan`. Kontynuacja nieukończonej karty używa jej aktualnego brancha. Przy istniejącym branchu sprawdź zawartość zamiast go zastępować. Jeśli przekazano nowszą bazę planu, włącz jej uzgodnione zmiany przez fast-forward lub merge, zachowując pracę karty.
 5. Wykonaj tylko wskazaną kartę. Podagenci mogą wykonywać rozpoznanie, implementację i przegląd w jej obrębie; nie rozpoczynają następnych kart. Przy zmianach kodu stosuj izolowany worktree, jeżeli jest potrzebny do zachowania istniejącej pracy.
 
 ## Odbiór i dostarczenie jednej karty
@@ -24,10 +25,13 @@ Każde kryterium ma wynik `PASS`, `FAIL` albo `NOT RUN`, z poleceniem/scenariusz
 
 Wykonaj wszystkie dostępne sprawdzenia przed raportowaniem ograniczenia. P00 nie przechodzi do P01 bez dowodu działania cyklu życia procesów na Windows 11, macOS i Ubuntu 24.04 oraz pozostałych wymaganych prób. Klienty AI sprawdzaj na oficjalnie wspieranych platformach.
 
+Do kryteriów każdej karty należą również właściwe dla jej etapu kontrole z [quality.md](quality.md). P00 kwalifikuje narzędzia; P01 wdraża kontrole Go, a P03 obejmuje analizą i sanitizerami pierwsze nowe moduły C++. Dalsze karty utrzymują te kontrole. Samo zapisanie standardu w dokumentacji nie oznacza wdrożenia ani zaliczenia kontroli.
+
 Zapisz zwięzły, odtwarzalny raport `plans/mcp/results/PXX.md` i uaktualnij status. Raport zawiera:
 
 - kartę, branch, bazowy SHA i zakres zmienionych plików;
 - macierz kryteriów: wynik, platforma/wersje, komenda lub scenariusz, dowód;
+- kontrole jakości właściwe dla karty: wynik, objęte moduły, wersje narzędzi, badany SHA i dowód; jawne braki oraz uzasadnienia dla kontroli, których zakres nie dotyczy;
 - wybrane wersje, checksums, konfigurację i pochodzenie danych;
 - pozostałe braki oraz jednoznacznie `PASSED` albo `INCOMPLETE`;
 - bazę do następnego czatu i informację, czy dotyczy on następnej karty, czy kontynuacji bieżącej.
@@ -36,7 +40,7 @@ Duże logi, pomiary, prototypy i dane pozostają poza śledzonym drzewem. Raport
 
 Po przeglądzie zmian sprawdź `git diff --check` i `git diff --submodule`. Zatwierdź wyłącznie zmiany bieżącej karty i wykonaj zwykły push na jej branch w forku. Commity wyłącznie dokumentacyjne mają `[skip ci]`. Odczytaj zdalny SHA i zweryfikuj opublikowany raport; sprawdzenia dla kodu muszą dotyczyć dokładnego SHA. Jeżeli wymagane CI nadal trwa, nie opisuj go jako zielonego.
 
-Prompt zlecający kartę według tych zasad obejmuje commit/push na fork. Otwarcie PR, merge, push do upstream i release wymagają osobnego polecenia. Przy zmianach przetwarzania przed PR nadal obowiązują realne dane i natywny odczyt z AGENTS.md.
+Prompt zlecający kartę według tych zasad obejmuje commit/push na fork oraz włączenie przekazanej bazy do brancha karty. Otwarcie lub scalenie PR, scalenie do `main`, push do upstream i release wymagają osobnego polecenia. Przy zmianach przetwarzania przed PR nadal obowiązują realne dane i natywny odczyt z AGENTS.md.
 
 ## Obowiązkowy prompt następnego czatu
 
@@ -46,4 +50,4 @@ W końcowej odpowiedzi podaj wynik karty, link do brancha/raportu, dokładny zda
 - `INCOMPLETE`: prompt dotyczy dalszej pracy nad tą samą kartą, wymienia konkretne brakujące warunki i dostępne dowody. Nie omija bramy odbioru.
 - Po P17: prompt przekazania gotowego zakresu do końcowego odbioru, bez dopisywania P18 ani zlecania merge/release.
 
-W każdym kolejnym prompcie powtórz zasadę: **jedna wskazana karta, raport, commit/push, następny prompt i stop**. Kolejnej karty nigdy nie wykonuj w bieżącym czacie. Końcowy SHA podaj po commicie i pushu; nie próbuj zapisywać w commicie jego własnego SHA.
+W każdym kolejnym prompcie wskaż `plans/mcp/quality.md` i powtórz zasadę: **jedna wskazana karta, wymagane kontrole jakości, raport, commit/push, następny prompt i stop**. Kolejnej karty nigdy nie wykonuj w bieżącym czacie. Końcowy SHA podaj po commicie i pushu; nie próbuj zapisywać w commicie jego własnego SHA.

@@ -1,6 +1,8 @@
 # Status MCP
 
-Plan zaakceptowany. Wykonywanie kart jeszcze się nie rozpoczęło.
+Plan zaakceptowany. Brak opublikowanych raportów odbioru kart.
+
+Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwalifikuje narzędzia, P01 wdraża kontrole Go, P03 obejmuje nimi nowe moduły C++. Ta aktualizacja dokumentacji nie zalicza żadnej karty ani nie wdraża narzędzi.
 
 - Repozytorium do zapisu: `dlubom/HDMapping`.
 - Branch planu: `mcp/implementation-plan`.
