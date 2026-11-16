@@ -11,15 +11,25 @@ on:
   release:
     types: [ published ]
 
+# A PR and its branch push validate the same head; keep one active run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
+  PYTHONUTF8: "1"
 
 jobs:
   build:
     # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
     # You can convert this to a matrix build if you need cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["OFF"]') }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -28,6 +38,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: true
           fetch-depth: 0
 
@@ -45,10 +56,10 @@ jobs:
       - name: Configure CMake
         # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
         # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-        run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DHDMAPPING_MCP_QUALITY=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }}
+        run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
 
       - name: Check MCP quality
-        if: (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/'))
+        if: matrix.mcp == 'ON'
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls
 
       - name: Build
@@ -61,14 +72,20 @@ jobs:
         # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
         run: ctest -C ${{env.BUILD_TYPE}} --output-on-failure
 
+      - name: Check installed product relocation
+        run: python scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }}
+
       - name: Deploy mandeye package
         shell: cmd
         run: deploy_mandeye.bat "${{github.workspace}}\deploy\mandeye"
 
+      - name: Check deployed product relocation
+        run: python scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }} --package-dir deploy/mandeye --package-executable hdmapping_mcp.exe
+
       - name: Upload mandeye folder as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mandeye-windows-${{env.VERSION}}
+          name: mandeye-windows-${{env.VERSION}}${{ matrix.mcp == 'ON' && '-mcp' || '' }}
           path: ${{github.workspace}}/deploy/mandeye/
 
       - name: Attach to GitHub release

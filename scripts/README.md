@@ -65,6 +65,22 @@ The subprocess runs with an empty PATH and a temporary working directory.
 Go/Python are developer dependencies only. `-vet=off` avoids duplicating the full
 vet pass already owned by golangci-lint. `go test ./...` remains usable directly.
 
+`check_mcp_install.py` installs the complete `applications` component into a
+temporary prefix, moves it to a path with spaces and Polish characters, then
+reuses CTest's SDK contract against that executable. It takes `--build-dir`,
+`--config` (default `Release`) and `--mcp ON|OFF`. OFF checks the absence of MCP
+tests, the installed executable and Go bootstrap artifacts; use a fresh build
+directory and configure with `-DHDMAPPING_GO_EXECUTABLE=must-not-run-go` to prove
+OFF does not consult Go. To check an existing package instead of CMake install,
+also pass `--package-dir` and its relative `--package-executable`; the entire
+package is copied and relocated before testing. Temporary copies are removed.
+
+The existing platform workflows run ON/OFF on MCP branches and keep OFF for
+other builds. ON runs the Go quality gates; both variants build the full
+product, run CTest and check installation/relocation. Windows deployment,
+Debian package extraction and the macOS bundle are checked the same way.
+This verifies MCP packaging, not the GUI or the full processing chain.
+
 C++ P03 preparation: both existing formatting scripts include `processing/`,
 and the common build already exports `compile_commands.json`. P03 adds
 per-target warning/clang-tidy and separate ASan+UBSan/TSan CMake configurations
