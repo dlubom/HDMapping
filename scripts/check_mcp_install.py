@@ -32,7 +32,8 @@ def main():
         if not line.startswith(("//", "#")) and ":" in line and "=" in line:
             key, value = line.split("=", 1)
             cache[key.split(":", 1)[0]] = value
-    if cache.get("BUILD_WITH_MCP") != args.mcp:
+    enabled = (build / "hdmapping-mcp-enabled.txt").read_text(encoding="utf-8").strip()
+    if enabled != ("1" if args.mcp == "ON" else "0"):
         raise RuntimeError("BUILD_WITH_MCP does not match the requested check")
     tests = json.loads(run(
         ["ctest", "--test-dir", build, "-C", args.config, "--show-only=json-v1"],
