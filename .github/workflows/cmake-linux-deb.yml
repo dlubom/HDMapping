@@ -3,8 +3,9 @@
 name: Build Debian package
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "mcp/**" ]
   pull_request:
     branches: [ "main" ]
   release:
@@ -46,8 +47,12 @@ jobs:
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_WITH_BUNDLED_FREEGLUT=0 -DBUILD_WITH_BUNDLED_EIGEN=0 -DBUILD_WITH_BUNDLED_LIBLASZIP=0 -DBUILD_WITH_BUNDLED_ONETBB=0 -DBUILD_TESTING=ON -DCPACK_PACKAGE_FILE_NAME=hd_mapping-${{env.VERSION}}-amd64
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_WITH_BUNDLED_FREEGLUT=0 -DBUILD_WITH_BUNDLED_EIGEN=0 -DBUILD_WITH_BUNDLED_LIBLASZIP=0 -DBUILD_WITH_BUNDLED_ONETBB=0 -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DHDMAPPING_MCP_QUALITY=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DCPACK_PACKAGE_FILE_NAME=hd_mapping-${{env.VERSION}}-amd64
   
+    - name: Check MCP quality
+      if: (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/'))
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls
+
     - name: Build
       # Build your program with the given configuration
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target package

@@ -62,6 +62,15 @@ rem gated behind BUILD_WITH_HD_MAPPER_APPLICATION, which defaults to OFF, so
 rem listing it would warn on every normal build.
 set "EXPECTED=camera_lidar_calibration.exe camera_lidar_intrinsics_calib.exe camera_lidar_trajectory_viewer.exe concatenate_multi_livox.exe drag_folder_with_mandeye_data_and_drop_here-precision_forestry.exe laz_to_mcap.exe laz_to_pcd.exe laz_to_ply.exe laz_to_txt.exe lidar_odometry_step_1.exe lidar_odometry_step_1_legacy.exe livox_mid_360_intrinsic_calibration.exe mandeye_compare_trajectories.exe mandeye_mission_recorder_calibration.exe mandeye_raw_data_viewer.exe mandeye_raw_data_viewer_legacy.exe mandeye_single_session_viewer.exe matrix_mul.exe mcap_to_laz.exe multiply_timestamps_session_point_cloud_laz.exe multiply_timestamps_session_trajectory_csv.exe multi_session_registration_step_3.exe multi_session_registration_step_3_legacy.exe multi_view_tls_registration_step_2.exe multi_view_tls_registration_step_2_legacy.exe ouster_pcap_to_laz.exe pcd_to_laz.exe precision_forestry_tools.exe session_intensity_panoramas.exe session_to_mcap.exe split_multi_livox.exe freeglut.dll laszip3.dll opencv_world4130.dll proj_9_3.dll tbb12.dll z.dll"
 
+rem Include MCP only for a build configured with BUILD_WITH_MCP=ON.
+findstr /X /C:"1" "%REPO_ROOT%\build\hdmapping-mcp-enabled.txt" >nul 2>nul
+if not errorlevel 1 (
+    set "EXPECTED=!EXPECTED! hdmapping_mcp.exe"
+) else (
+    rem Do not ship a stale executable left by an earlier ON build.
+    if exist "%DEPLOY_DIR%\hdmapping_mcp.exe" del "%DEPLOY_DIR%\hdmapping_mcp.exe"
+)
+
 set "MISSING="
 for %%F in (%EXPECTED%) do (
     if not exist "%DEPLOY_DIR%\%%F" set "MISSING=!MISSING! %%F"

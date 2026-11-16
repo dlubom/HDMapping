@@ -1,8 +1,9 @@
 name: Clang-Format 21 Check
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "mcp/**" ]
   pull_request:
     branches: [ "main" ]
 

@@ -3,8 +3,9 @@
 name: Build with bundled libraries on Ubuntu
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "mcp/**" ]
   pull_request:
     branches: [ "main" ]
 
@@ -41,7 +42,11 @@ jobs:
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DHDMAPPING_MCP_QUALITY=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DHDMAPPING_MCP_RACE=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }}
+
+    - name: Check MCP quality
+      if: (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/'))
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls mcp-race
 
     - name: Build
       # Build your program with the given configuration

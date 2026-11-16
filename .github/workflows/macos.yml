@@ -1,8 +1,9 @@
 name: Build on macOS
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "mcp/**"]
   pull_request:
     branches: ["main"]
 
@@ -36,7 +37,11 @@ jobs:
             -DBUILD_WITH_UTILITY_APPLICATION=ON \
             -DFREEGLUT_COCOA=ON \
             -DHD_CPU_OPTIMIZATION=AUTO \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }} -DHDMAPPING_MCP_QUALITY=${{ (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && 'ON' || 'OFF' }}
+
+      - name: Check MCP quality
+        if: (startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/'))
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls
 
       - name: Build
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)

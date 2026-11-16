@@ -19,6 +19,9 @@ set(HD_CPU_OPTIMIZATION "AUTO" CACHE STRING "CPU optimization target (AUTO, INTE
 set_property(CACHE HD_CPU_OPTIMIZATION PROPERTY STRINGS AUTO INTEL AMD ARM GENERIC)
 
 # Options to enable / disable specific components
+option(BUILD_WITH_MCP "Build the local MCP adapter (in development)" OFF)
+# Packaging scripts consume a normalized boolean, including -DBUILD_WITH_MCP=1/YES.
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/hdmapping-mcp-enabled.txt" CONTENT "$<BOOL:${BUILD_WITH_MCP}>\n")
 option(BUILD_WITH_CLI_TOOLS "Build with command line tools" OFF)
 option(BUILD_WITH_HD_MAPPER_APPLICATION "Build with hd_mapper tool" OFF)
 option(BUILD_WITH_UTILITY_APPLICATION "Enable build of utility applications" OFF)
@@ -127,6 +130,10 @@ if(BUILD_TESTING)
     add_subdirectory(calib_core/tests)
     add_subdirectory(apps/lidar_odometry_step_1/tests)
     add_subdirectory(rosbags/tests)
+endif()
+
+if(BUILD_WITH_MCP)
+    add_subdirectory(apps/hdmapping_mcp)
 endif()
 
 set(CORE_LIBRARIES core)
