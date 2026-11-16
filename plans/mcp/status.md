@@ -1,6 +1,6 @@
 # Status MCP
 
-Plan zaakceptowany. P00 wykonano częściowo; wynik **INCOMPLETE**, bez zgody na rozpoczęcie P01. Szczegóły i dowody: [raport P00](results/P00.md).
+Plan zaakceptowany. P00 wykonano częściowo; wynik **INCOMPLETE**. Właściciel 2026-11-16 polecił odłożyć kwalifikację Windows, Linux i klienta Claude oraz przejść dalej: **P01 można rozpocząć w nowym czacie mimo niepełnego P00**. Szczegóły, dowody i zakres tej decyzji: [raport P00](results/P00.md#decyzja-właściciela-po-raporcie).
 
 Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwalifikuje narzędzia, P01 wdraża kontrole Go, P03 obejmuje nimi nowe moduły C++. Ta aktualizacja dokumentacji nie zalicza żadnej karty ani nie wdraża narzędzi.
 
@@ -9,8 +9,9 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 - Bazowy commit rozpoznania: `3d3a8054986f95fcf580ef0f780889043bfdd475`.
 - Baza aktualnego raportu: `bb3d50c4e727e6119221c1b657fd0c618263759f`.
 - Branch kwalifikacji: `mcp/p00`.
-- Następna praca: **kontynuacja wyłącznie P00**.
+- Następna praca: **wyłącznie P01 na branchu `mcp/p01` od aktualnego `mcp/p00`**, na mocy decyzji właściciela.
 - Braki: Windows 11, Claude Desktop, pełny test klienta/GUI Ubuntu, działający Linux TSan, potwierdzone nakładanie i bazowy projekt kroku 3 oraz zapis/odczyt wyniku optymalizacji GUI kroku 2.
+- Odroczenie nie zmienia wyników kontroli ani wymagań przenośności i nie upoważnia do usuwania istniejących kontroli CI. Braki danych pozostają otwarte; nie są dowodem zgodności przyszłych zmian przetwarzania.
 - Kolejne czaty stosują [zasady przekazania](README.md).
 
 | Karta | Stan | Raport |
