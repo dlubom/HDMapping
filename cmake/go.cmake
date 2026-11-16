@@ -24,6 +24,13 @@ if(CMAKE_CROSSCOMPILING OR (APPLE AND CMAKE_OSX_ARCHITECTURES AND
    NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
     message(FATAL_ERROR "MCP currently requires a native, single-architecture build")
 endif()
+# Visual Studio can select a different target without setting CMAKE_CROSSCOMPILING.
+if(CMAKE_GENERATOR MATCHES "^Visual Studio")
+    if((_go_arch STREQUAL "amd64" AND NOT CMAKE_VS_PLATFORM_NAME STREQUAL "x64") OR
+       (_go_arch STREQUAL "arm64" AND NOT CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
+        message(FATAL_ERROR "MCP currently requires a native Visual Studio target; got ${CMAKE_VS_PLATFORM_NAME} on ${_go_arch}")
+    endif()
+endif()
 set(_go_suffix "")
 set(_go_archive_suffix "tar.gz")
 if(WIN32)
