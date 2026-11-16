@@ -4,6 +4,8 @@ Plan zaakceptowany. P00 wykonano częściowo; wynik **INCOMPLETE**. Właściciel
 
 Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwalifikuje narzędzia, P01 wdraża kontrole Go, P03 obejmuje nimi nowe moduły C++. Wdrożone kontrole Go i ich wykonany zakres opisuje raport P01; samo dodanie konfiguracji nie zalicza pełnej macierzy.
 
+**Decyzja właściciela 2026-11-16:** testy rzeczywistego klienta Claude odkładamy do końcowego odbioru P17. Właściciel nie ma obecnie Claude Code; nie instalujemy ani nie kwalifikujemy teraz klienta Claude. W uzgodnionym planie hostem jest Claude Desktop — odroczenie nie zamienia go automatycznie na Claude Code. Brak klienta nie blokuje prac nad osobno zleconymi kartami; jego testy pozostają `NOT RUN` i muszą wrócić w P17 przed pełnym odbiorem oraz domyślnym włączeniem MCP. Pozostałe braki P00/P01 i ograniczenie jednej karty na czat pozostają jawne.
+
 - Repozytorium do zapisu: `dlubom/HDMapping`.
 - Branch planu: `mcp/implementation-plan`.
 - Bazowy commit rozpoznania: `3d3a8054986f95fcf580ef0f780889043bfdd475`.

@@ -269,6 +269,9 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 **Pliki:** istniejące CMake/opcje, CI, `deploy_mandeye.bat`, `macos_bundle_toolkit/`, CPack, dokumentacja wiki; narzędzie automatyzujące powtarzalny odbiór tylko jeśli potrzebne, z wpisem w `scripts/README.md`.
 **Interfejs:** gotowy pakiet HDMapping, konfiguracja lokalnego stdio w Codex i Claude, wspólna wersja wszystkich komponentów.
 
+**Decyzja właściciela 2026-11-16:** kwalifikację rzeczywistego klienta Claude z P00 oraz jego próby przewidziane podczas implementacji odkładamy do P17. Do tego czasu pozostają `NOT RUN`; brak dostępnego klienta nie blokuje osobno zleconych prac implementacyjnych. Plan nadal wskazuje Claude Desktop; wzmianka o braku Claude Code nie zmienia hosta odbiorowego. P17 nie może zaliczyć integracji Claude na podstawie samego testu SDK.
+
+- [ ] Wrócić do odłożonych testów Claude: zapewnić rzeczywisty klient, sprawdzić discovery/schematy/wywołania/błędy i negocjowaną wersję oraz pełny workflow i przeżycie zamknięcia klienta. Zapisać wersje, platformy, dokładny SHA i dowody; przy braku klienta zachować `INCOMPLETE`.
 - [ ] Uzupełnić pokrycie pakowania wszystkich nowych executable i zasobów w istniejących ścieżkach dystrybucji; usunąć zależność runtime od build/source tree.
 - [ ] Wykonać pełny przebieg realnych danych 1→2→3→eksport, oba sposoby uruchomienia; dwa równoległe zadania GUI/MCP i trzecie w kolejce, cancel, zamknięcie obu klientów i okien, restart i ponowne wykonanie po awarii.
 - [ ] Sprawdzić zwykły wynik i samowystarczalny eksport natywnymi konsumentami z zainstalowanego pakietu. Sprawdzić readback raportów i artefaktów dla dokładnego SHA.
