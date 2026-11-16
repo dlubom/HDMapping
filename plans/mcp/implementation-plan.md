@@ -17,6 +17,7 @@ Status: plan zaakceptowany do pracy po jednej karcie w osobnym czacie. Żadna ka
 ## Global Constraints
 
 - C++20; CMake >= 4.0; Windows 11, macOS i Ubuntu 24.04.
+- Automatyczny odbiór platformowy produktu prowadź w istniejących workflow według [macierzy GitHub Actions](quality.md#macierz-github-actions). Ręczne scenariusze użytkowe wskazane w kartach przekaż do osobnego odbioru na maszynach użytkowników.
 - Jedno repozytorium, wersja z top-level CMake i wspólne wydanie produktu.
 - Domyślny limit: 2 ciężkie zadania; konfigurowalny, z kolejką. Jedna mutacja danego stanu naraz.
 - Cały ciąg 1–3 w GUI i headless; ciężkie przyciski GUI używają tego samego koordynatora co MCP.
@@ -27,7 +28,7 @@ Status: plan zaakceptowany do pracy po jednej karcie w osobnym czacie. Żadna ka
 - Jedna odpowiedzialność na PR, bez porządkowania pobocznego kodu. Każda karta ma własny odbiór; jeśli diff wymaga podziału, dzielić w obrębie tej karty, zachowując jej kryteria.
 - Build z MCP dostarcza Go automatycznie z przypiętych oficjalnych archiwów lub używa zgodnego systemowego kompilatora; nie wymaga ręcznych poleceń Go. Gotowy pakiet nie wymaga Go/Python/Node u użytkownika.
 - Opcja `BUILD_WITH_MCP`: OFF podczas dostarczania niekompletnych kart, ON w kompletnym wydaniu po P17. OFF nie wymaga Go i zachowuje dotychczasowy model GUI. To techniczna propozycja autora, zgodna z jednym wydaniem produktu.
-- Dane odbiorowe poza repozytorium. Testy logiki i kontraktów; GUI sprawdzane w rzeczywistej aplikacji, szczególnie na Windows.
+- Dane odbiorowe poza repozytorium. Automatyczne testy obejmują logikę i kontrakty. Ręczne próby GUI należą do osobnego odbioru użytkowego zgodnie z `AGENTS.md`.
 - Kontrole jakości obowiązują od pierwszego kodu danego modułu: kwalifikacja narzędzi w P00, integracja Go w P01, pokrycie nowych modułów C++ w P03. Wersje, zakres i wyniki według [quality.md](quality.md); istniejące workflow obsługują także branche MCP w forku.
 - Wykonuj wyłącznie kartę wskazaną w bieżącym prompcie użytkownika. Dostarczenie na fork i następny prompt według README; scalenie PR lub do `main` oraz release wymagają odrębnego zlecenia. Włączenie przekazanej bazy do brancha karty jest częścią jej rozpoczęcia.
 
@@ -103,12 +104,14 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 **Pliki:** nowe `apps/hdmapping_mcp/{CMakeLists.txt,go.mod,go.sum,.golangci.yml,cmd/mcp/main.go,internal/mcp/server.go,internal/mcp/server_test.go}`, `cmake/go.cmake`; istniejące top-level CMake, `cmake/install_app.cmake`, platformowe CI, skrypty formatowania i `scripts/README.md`, `deploy_mandeye.bat`, `macos_bundle_toolkit/`; build docs wiki.
 **Interfejs:** MCP stdio `server_info`/capabilities z wersją produktu; brak reklamowania niezaimplementowanych operacji.
 
+**Odbiór P01** obejmuje istniejącą macierz GitHub Actions z [quality.md](quality.md#macierz-github-actions). Windows Server x64 jest wymaganym automatycznym sprawdzeniem Windows. Ręczne próby na Windows 11 lub 10 oraz dodatkowy runner Windows 11 należą do osobnego lub pomocniczego zakresu.
+
 - [ ] Przed implementacją funkcji MCP wdrożyć kontrole Go z [quality.md](quality.md): formatowanie, wybrane analizy, testy na trzech platformach, race na Linux i govulncheck. Przypiąć narzędzia zakwalifikowane w P00; udostępnić odtwarzalne polecenia lokalne i we wspólnym CI. Rozszerzyć obecny zakres formatowania C++ o planowane `processing/` bez przeformatowania pobocznego kodu.
 - [ ] Sprawdzić, że istniejące workflow rzeczywiście uruchamiają kontrole dla branchy MCP w forku. Tymczasową błędną próbką potwierdzić odrzucenie naruszeń formatowania i analizy; usunąć próbkę przed commitem. PASS wymaga wykonanych kontroli dla nowego kodu, a nie samej obecności plików konfiguracji.
 - [ ] Dodać test klientem SDK: `tools/list` ma poprawne schematy, wersja odpowiada top-level CMake, błędne argumenty dają błąd, log nie trafia na stdout protokołu. Uruchomić i potwierdzić brak wymaganej funkcji przed implementacją.
 - [ ] Zintegrować `go build` i testy w CMake, przypięte źródła i moduły. Automatyczny toolchain pobiera wyłącznie oficjalne archiwum z SHA256; systemowy jest używany tylko po sprawdzeniu zgodności. OFF nie szuka/pobiera Go.
 - [ ] Dodać cele i `hdmapping_install_app`; rozszerzyć wspólny helper o instalację executable z Go, ponieważ obecne `install(TARGETS)` nie obsłuży wprost imported executable. Zachować komponent `applications`, `DESTDIR`, `.exe` i `HDMAPPING_BINARY_PREFIX`; Windows `EXPECTED` uwzględnia opcję ON/OFF. Nie tworzyć osobnego procesu pakowania.
-- [ ] Sprawdzić build/install ON i OFF, `go test ./...` oraz uruchomienie z katalogu instalacji poza buildem, ze spacją i polskim znakiem w ścieżce. PASS: handshake i wynik po przeniesieniu instalacji; bez Go na maszynie użytkownika.
+- [ ] W GitHub Actions sprawdzić build/install ON i OFF oraz pakowanie i relokację z macierzy. ON uruchamia `go test ./...` i kontrakt SDK z zainstalowanym adapterem po przeniesieniu do ścieżki ze spacją i polskim znakiem, bez Go w PATH procesu adaptera. OFF potwierdza brak adaptera i bootstrapu Go.
 
 ## P02 — Trwały rejestr, idempotencja i kolejka
 
@@ -161,7 +164,9 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Dodać test zamknięcia źródła w `preparing`: po przyznaniu ID okno znika, proces kończy przekazanie w tle, snapshot pozostaje poprawny. Force-kill źródła daje `interrupted`, nie sukces.
 - [ ] Wprowadzić obsługę komend i rezerwacji na wątku GUI, w tym wszystkich istniejących miejsc mutacji z macierzy P00. Ustalenia NDT/ICP kontrolek oraz silnika aktualizują się razem.
 - [ ] Zaimplementować auto-apply tylko do nadal otwartego ID i zgodnej rewizji; brak okna lub konflikt zachowuje wynik do późniejszego otwarcia. Nie dopasowywać celu po tytule/ścieżce.
-- [ ] Sprawdzić logikę CTest `processing-state` oraz ręcznie trzy GUI na Windows: MCP zmienia parametry, kolejna klatka ich nie cofa, blokada dotyczy danych, kamera działa. Nie pisać testów układu/renderowania.
+- [ ] Sprawdzić logikę kontraktu mostu w CTest `processing-state`.
+
+Osobny odbiór użytkowy trzech GUI na Windows obejmuje zmianę parametrów z MCP, utrzymanie ich w kolejnej klatce, blokadę danych i działanie kamery.
 
 ## P07 — Krok 1 jako wspólne operacje i zadania
 
@@ -171,7 +176,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Test kontraktu TOML/defaults i błędów wejścia; niewłaściwe/niekompletne dane zwracają `OperationError`, nie sam tekst na stdout.
 - [ ] Wydzielić minimalne wywołania istniejących obliczeń; dodać postęp i punkty zatrzymania bez zmiany algorytmów. Istniejące CLI zachowuje argumenty, wyniki i kody błędów.
 - [ ] Podłączyć ciężkie przyciski GUI i MCP do `Submit`; przy ON usunąć obejście do lokalnego niezarządzanego workera, zachowując dotychczasową ścieżkę za OFF. Zastąpić porzucenie przez `_Exit` kontraktem anulowania zadania.
-- [ ] Uruchomić Parking przez stary kontrakt CLI, wspólną operację headless i przycisk GUI: porównać poses/chmury/raport przy tych samych parametrach i sprawdzić zamknięcie okna. Sprawdzić także referencje i consistency z macierzy.
+- [ ] Porównać poses, chmury i raport z Parking dla starego CLI i wspólnej operacji headless przy tych samych parametrach. Sprawdzić referencje i consistency z macierzy oraz kontrakt cyklu życia zadania. Przekazać scenariusz uruchomienia z przycisku GUI i zamknięcia okna do osobnego odbioru.
 - [ ] CTest `processing-step1`, rzeczywisty odczyt zapisanej sesji, potem przegląd i dostarczenie tylko tej integracji według README. Otwarcie PR następuje na odrębne zlecenie.
 
 ## P08 — Rejestracja skanów kroku 2
@@ -182,7 +187,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Dodać testy błędnego zakresu, parametrów i odrzucenia starej rewizji; rejestracja nie zależy od `pc.visible` poza jawnym rozwiązaniem zakresu.
 - [ ] Udostępnić istniejące NDT/ICP/plane features przez wspólne operacje; GUI przyciski wywołują zadania, renderowanie pozostaje w procesie GUI. Nie zmieniać równań, metryk ani domyślnych parametrów.
 - [ ] Sprawdzić realną sesję z Parking wobec bazowego wykonania GUI; dodać meaningful regression na znanej geometrii dla przesunięcia/obrotu i utrzymania nieruchomego skanu.
-- [ ] CTest `processing-step2-registration`, ręczny odczyt/auto-apply w GUI i dwa równoległe niezależne zadania.
+- [ ] Uruchomić CTest `processing-step2-registration` i dwa równoległe niezależne zadania. Przekazać scenariusz odczytu i auto-apply w GUI do osobnego odbioru.
 
 ## P09 — Ręczne więzy i optymalizacja grafu jednej sesji
 
@@ -222,7 +227,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Test znanego segmentu: zmieniają się wyłącznie wskazane poses, jednostki i kolejność transformacji odpowiadają istniejącej operacji. Pusty/nieprawidłowy zakres daje błąd bez efektu ubocznego.
 - [ ] Wydzielić dotychczasową logikę do wspólnego handlera, pozostawiając podgląd/przeciąganie w GUI. Stan w trakcie niezatwierdzonego przeciągania nie jest mylony z zatwierdzoną rewizją przetwarzania.
 - [ ] Podłączyć API i istniejące zatwierdzanie edycji do wspólnej kontroli rewizji; wynik od razu widać w GUI.
-- [ ] CTest `processing-segments` oraz ręczne potwierdzenie granic segmentu i zapisu/odczytu realnej sesji.
+- [ ] Uruchomić CTest `processing-segments` oraz sprawdzić zapis i odczyt realnej sesji. Wizualne potwierdzenie granic segmentu należy do osobnego odbioru.
 
 ## P13 — Wszystkie istniejące importy i eksporty sesji
 
@@ -275,7 +280,7 @@ Każda karta kończy się sprawdzeniami, odczytem `git diff --submodule`, przegl
 - [ ] Uzupełnić pokrycie pakowania wszystkich nowych executable i zasobów w istniejących ścieżkach dystrybucji; usunąć zależność runtime od build/source tree.
 - [ ] Wykonać pełny przebieg realnych danych 1→2→3→eksport, oba sposoby uruchomienia; dwa równoległe zadania GUI/MCP i trzecie w kolejce, cancel, zamknięcie obu klientów i okien, restart i ponowne wykonanie po awarii.
 - [ ] Sprawdzić zwykły wynik i samowystarczalny eksport natywnymi konsumentami z zainstalowanego pakietu. Sprawdzić readback raportów i artefaktów dla dokładnego SHA.
-- [ ] Przejść macierz platform: build/test/package na trzech, test użytkowy Windows 11, Codex i Claude na platformach przez nie wspieranych. Na Ubuntu brak oficjalnego Claude nie może być opisany jako wykonany test tego klienta.
+- [ ] Przejść macierz GitHub Actions dla build/test/package oraz zachować odrębne wymagane testy integracji rzeczywistych klientów na wspieranych platformach. Przekazać scenariusz testu użytkowego Windows 11 do osobnego odbioru.
 - [ ] Udokumentować nowy sposób wykonywania ciężkich przycisków GUI, zależności zwykłych wyników, limit, anulowanie i konfigurację hostów. Zmiana jest zauważalna dla użytkownika i musi być jasno opisana w PR.
 - [ ] Po spełnieniu wszystkich kryteriów ustawić domyślne ON i ponownie sprawdzić czysty build ON/OFF. To gotowość do wydania, nie automatyczna zgoda na merge ani release.
 

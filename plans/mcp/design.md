@@ -135,8 +135,8 @@ Obsługiwaną wersję MCP i SDK przypina się po sprawdzeniu obu hostów. Obecna
 6. Zamknięcie Codex, Claude i wszystkich okien HDMapping nie kończy przyjętego zadania. Po ponownym połączeniu można znaleźć je po ID i odczytać wynik.
 7. Anulowanie w kolejce, przygotowaniu, obliczeniach i zapisie nie zamyka GUI, nie uszkadza wejść i nie publikuje częściowego wyniku. Awaria/system restart pozostawia jednoznaczny stan i możliwość ponowienia.
 8. Wynik otwiera się natywnie po zamknięciu procesu tworzącego. Pełny eksport otwiera się po odłączeniu katalogu źródłowego. Brak automatycznego nadpisywania wejść.
-9. Czysty build, install i odczyt gotowego pakietu na Windows 11, macOS i Ubuntu 24.04. Odbiór hostów na ich oficjalnie wspieranych platformach; na Ubuntu, jeśli Claude Desktop nie jest oficjalnie dostępny, użycie zgodnego klienta testowego uzupełnia test Codex, bez udawania testu Claude.
-10. Testy logiki kontraktów i integracji protokołu/procesów; rzeczywiste ręczne sprawdzenie GUI na Windows. Bez testów odtwarzających rysowanie lub układ kontrolek. CI, formatowanie i realne dane wymagane przed PR/merge zgodnie z AGENTS.md.
+9. Czysty build, instalacja i odczyt gotowego pakietu według [macierzy GitHub Actions](quality.md#macierz-github-actions). Odbiór rzeczywistych klientów na ich oficjalnie wspieranych platformach. Próba zgodnego klienta SDK potwierdza kontrakt protokołu.
+10. Testy logiki kontraktów i integracji protokołu oraz procesów. Ręczne sprawdzenie GUI na Windows 11 i innych maszynach jest osobnym odbiorem użytkowym. CI, formatowanie i realne dane obowiązują zgodnie z `AGENTS.md`.
 
 ## Pozostawione implementującemu
 

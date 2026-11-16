@@ -29,6 +29,8 @@ tej karty. W raporcie podaj zakres kontroli, narzędzia i wersje, polecenia,
 badany SHA oraz PASS/FAIL/NOT RUN z dowodami. Brak wymaganego sprawdzenia
 oznacza INCOMPLETE. P00 kwalifikuje narzędzia, P01 wdraża kontrole Go,
 a P03 obejmuje nimi nowe moduły C++; dalsze karty utrzymują te wymagania.
+Automatyczny odbiór platformowy od P01 opiera się na macierzy GitHub Actions
+z quality.md. Ręczne próby na osobnych maszynach mają własny zakres odbioru.
 
 Wykonaj tylko tę kartę. Zlecam aktualizację raportu i statusu, właściwe
 sprawdzenia, przegląd, commit oraz push na wskazany branch mojego forka.

@@ -21,9 +21,9 @@ Uzgodniony plan dla forka [dlubom/HDMapping](https://github.com/dlubom/HDMapping
 
 ## Odbiór i dostarczenie jednej karty
 
-Każde kryterium ma wynik `PASS`, `FAIL` albo `NOT RUN`, z poleceniem/scenariuszem, środowiskiem i dowodem. Karta jest `PASSED` dopiero wtedy, gdy wszystkie jej wymagane kryteria mają `PASS`. Brak dostępu do Windows, klienta lub danych oznacza `INCOMPLETE`, nie zastępczy sukces. Test klientem SDK nie udaje testu rzeczywistego hosta.
+Każde wymagane kryterium ma wynik `PASS`, `FAIL` albo `NOT RUN`, z poleceniem lub scenariuszem, środowiskiem i dowodem. Karta jest `PASSED` po zaliczeniu wszystkich wymaganych kryteriów. Macierz automatycznej weryfikacji produktu od P01 określa [standard jakości](quality.md#macierz-github-actions). Brak wymaganego przebiegu, klienta używanego w teście integracyjnym lub danych pozostawia kartę `INCOMPLETE`. Test SDK potwierdza kontrakt protokołu.
 
-Wykonaj wszystkie dostępne sprawdzenia przed raportowaniem ograniczenia. P00 nie przechodzi do P01 bez dowodu działania cyklu życia procesów na Windows 11, macOS i Ubuntu 24.04 oraz pozostałych wymaganych prób. Klienty AI sprawdzaj na oficjalnie wspieranych platformach.
+Ręczne próby użytkowe na osobnych maszynach, w tym na Windows 11 i Windows 10, są poza zakresem zlecenia MCP. Scenariusze wymagające ręcznej obsługi zachowaj do osobnego odbioru. Wymagania przenośności oraz warunki merge i wydania wynikają z `AGENTS.md`. Historyczny wynik P00 i decyzje o odroczeniach są zapisane w [raporcie P00](results/P00.md).
 
 Do kryteriów każdej karty należą również właściwe dla jej etapu kontrole z [quality.md](quality.md). P00 kwalifikuje narzędzia; P01 wdraża kontrole Go, a P03 obejmuje analizą i sanitizerami pierwsze nowe moduły C++. Dalsze karty utrzymują te kontrole. Samo zapisanie standardu w dokumentacji nie oznacza wdrożenia ani zaliczenia kontroli.
 

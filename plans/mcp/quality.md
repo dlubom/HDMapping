@@ -17,6 +17,18 @@ Kontrole rozszerzają istniejące workflow HDMapping. Muszą rzeczywiście uruch
 
 Nowe moduły spełniają pełny przyjęty standard. Przy zmianie istniejącego kodu sprawdzaj dotknięte jednostki kompilacji i obszary oraz odróżniaj wcześniejsze zgłoszenia od nowych. Poboczne zaległości otrzymują osobny zakres pracy. Wyłączenie reguły jest wąskie, opisuje konkretną przyczynę i podlega przeglądowi; nie wyłącza całego nowego modułu ani kontroli zależnych od brakującego środowiska.
 
+## Macierz GitHub Actions
+
+Od P01 automatyczny odbiór platformowy opiera się na standardowych runnerach używanych przez istniejące workflow produktu:
+
+| Środowisko | Wymagany zakres P01 |
+| --- | --- |
+| Windows Server x64 (`windows-latest`, w dotychczasowych logach Server 2025) | ON/OFF, CTest, instalacja i relokacja instalacji oraz paczki deploy. Kontrole Go w ON. |
+| macOS ARM64 (`macos-latest`) | ON/OFF, CTest, instalacja i relokacja instalacji oraz bundla, DMG. Kontrole Go w ON. |
+| Ubuntu 24.04 amd64 | ON/OFF w istniejących workflow bundled i Debian. CTest, instalacja i relokacja. Kontrole Go w ON, race w bundled i odczyt paczki DEB w Debian. |
+
+Raportuj rzeczywisty system, architekturę i SHA z logów. Ręczne testy desktopowe na różnych maszynach oraz dodatkowe kombinacje systemu i architektury są osobnym odbiorem użytkowym. Dodatkowy runner `windows-11-arm` może dostarczyć dowód pomocniczy, np. uruchomienie paczki x64 w emulacji. Obowiązkowy przebieg oczekujący na przydział runnera lub anulowany bez wykonania pozostaje `NOT RUN`. Zapisz przyczynę i ponawiaj wyłącznie brakujące joby, z uwzględnieniem dostępności usług.
+
 ## Go
 
 Od P01 polecenia Go uruchamiaj z katalogu modułu `apps/hdmapping_mcp/`. W P00 używaj modułu tymczasowego prototypu poza śledzonym drzewem.
@@ -25,7 +37,7 @@ Od P01 polecenia Go uruchamiaj z katalogu modułu `apps/hdmapping_mcp/`. W P00 u
 | --- | --- |
 | Formatowanie | `gofmt`; CI kończy się błędem przy różnicach. Samo wypisanie plików przez `gofmt -l` nie wystarcza. |
 | Analiza statyczna | Przypięty `golangci-lint v2`, `version: "2"`, `linters.default: none`, jawnie `govet`, `staticcheck`, `errcheck`, `unused`; `gofmt` w sekcji `formatters`. Jeden runner, bez dodatkowego osobnego Staticcheck i pełnego vet. |
-| Testy | `go test ./...` na Windows 11, macOS i Ubuntu 24.04; także testy właściwe dla danej platformy. |
+| Testy | `go test ./...` na Windows Server x64, macOS ARM64 i Ubuntu 24.04 amd64 w [macierzy GitHub Actions](#macierz-github-actions), z testami właściwymi dla danej platformy. |
 | Wyścigi | `go test -race ./...` obowiązkowo na Linux amd64. Zapewnij cgo i kompilator C; dodatkowe platformy wymagają kwalifikacji ich zależności. |
 | Podatności | Przypięty `govulncheck ./...`; jawna macierz konfiguracji platformowych i build tags używanych przez produkt. Raportuj podatne osiągalne wywołania i rozstrzygnięcie zgłoszeń. Ta kontrola nie obejmuje silnika C++. |
 | Fuzzing | Od pierwszego własnego parsera protokołu lub trwałego stanu: zapisany korpus regresyjny w zwykłych testach i aktywny fuzzing z jawnym limitem `-fuzztime`. Zachowuj minimalny reproduktor znalezionego błędu. |
@@ -47,7 +59,7 @@ Wytyczne kodu:
 | Formatowanie | clang-format 21 z istniejącą `.clang-format`. Rozszerz wspólny zakres skryptów o nowe katalogi, w szczególności `processing/`, obecnie pomijany. |
 | Analiza statyczna | Przypięty clang-tidy; rzeczywiste flagi C++20 z `compile_commands.json` generowanego przez CMake. Profil obejmuje `clang-analyzer-*` oraz jawnie wybrane reguły `bugprone` i `performance`; bez włączania wszystkich reguł stylu. |
 | Ostrzeżenia | Dla nowych własnych targetów: GCC/Clang `-Wall -Wextra -Wpedantic`, MSVC `/W4`; kontrolowane CI wymaga także `-Werror` lub `/WX`. Ustawienia mają zakres targetu i nie narzucają tych wymagań third-party. |
-| Testy | doctest i CTest z `BUILD_TESTING=ON` na Windows 11, macOS i Ubuntu 24.04. Zachowaj istniejące testy przepływu danych. |
+| Testy | doctest i CTest z `BUILD_TESTING=ON` w [macierzy GitHub Actions](#macierz-github-actions). Zachowaj istniejące testy przepływu danych. |
 | Pamięć i UB | Osobna konfiguracja Linux/Clang z ASan + UBSan dla nowych modułów i ich testów; prawidłowa instrumentacja kompilacji i linkowania. |
 | Wyścigi | Osobna konfiguracja Linux/Clang z TSan dla własnego kodu współbieżnego; nie łącz jej z ASan. Raportuj zakres instrumentacji, w tym ograniczenia nieinstrumentowanych zależności. |
 
@@ -72,7 +84,7 @@ Testuj obserwowalne zachowanie modułów i procesów. W miarę dostarczania wła
 - ścieżki ze spacjami i znakami Unicode, błędy I/O oraz uruchomienie z przeniesionej instalacji;
 - zgodność obliczeń na rzeczywistych danych i natywny odczyt wyników przy zmianach przetwarzania.
 
-Synchronizacja testów współbieżności opiera się na sterowanych zdarzeniach i ograniczonym czasie oczekiwania, nie przypadkowych opóźnieniach. Testy nie odwzorowują struktury implementacji. Rendering i UX sprawdzaj w rzeczywistej aplikacji zgodnie z `AGENTS.md`; testuj kontrakt mostu GUI bez zrzutów ekranu. Raport pokrycia pomaga znaleźć nieprzetestowane gałęzie błędów; na start nie ma arbitralnego globalnego progu procentowego.
+Synchronizacja testów współbieżności opiera się na sterowanych zdarzeniach i ograniczonym czasie oczekiwania, nie przypadkowych opóźnieniach. Testy nie odwzorowują struktury implementacji. Automatycznie testuj kontrakt mostu GUI. Rendering i UX pozostaw do osobnego odbioru w rzeczywistej aplikacji zgodnie z `AGENTS.md`. Raport pokrycia pomaga znaleźć nieprzetestowane gałęzie błędów.
 
 Przy kwalifikacji narzędzi w P00 oraz podłączeniu ich do CI w P01/P03 wykonaj tymczasowe próby kontrolne: naruszenie formatu, wykrywalny błąd analizatora i błąd testu muszą spowodować niepowodzenie właściwego polecenia. Dla sanitizerów/race potwierdź działanie na małym odpowiednim reproduktorze. Próby pozostają poza kodem produktu; usuwasz je przed docelową weryfikacją. Sprawdź, że kontrole obejmują rzeczywiste pliki, testy są odkrywane, a kod wyjścia nie jest maskowany.
 
