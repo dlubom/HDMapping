@@ -1,0 +1,2 @@
+# gofmt requires LF even when Git for Windows enables core.autocrlf.
+*.go text eol=lf
