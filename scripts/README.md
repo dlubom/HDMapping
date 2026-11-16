@@ -36,7 +36,10 @@
 # MCP developer checks
 
 `run_mcp_checks.py` runs fail-on-difference gofmt, the pinned golangci-lint
-(govet, staticcheck, errcheck, unused), contract tests and govulncheck.
+(govet, staticcheck, errcheck, unused), contract tests, journal parser fuzzing
+and govulncheck. Ordinary tests replay the fuzz seed corpus; `mcp-check` also
+requires discovery of `FuzzDecodeJournal` and runs it with `-fuzztime=10s`
+and two workers on each native CI platform.
 CMake supplies the pinned Go toolchain; quality tools are built from the separate
 `apps/hdmapping_mcp/tools` module and are never installed with the product.
 

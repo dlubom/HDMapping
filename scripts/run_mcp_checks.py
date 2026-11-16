@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--go", required=True)
     parser.add_argument("--tools-dir", type=Path, required=True)
     parser.add_argument("--checks", nargs="+", required=True,
-                        choices=("format", "lint", "test", "race", "vuln", "controls"))
+                        choices=("format", "lint", "test", "race", "fuzz", "vuln", "controls"))
     parser.add_argument("--race-controls", action="store_true")
     args = parser.parse_args()
     go = str(Path(args.go).resolve())
@@ -70,6 +70,14 @@ def main():
             test_env = dict(env, CGO_ENABLED="1" if name == "race" else "0")
             return run([go, "test", "-vet=off", "-count=1", "-timeout=90s",
                         *(["-race"] if name == "race" else []), "./..."], module, test_env, negative)
+        if name == "fuzz":
+            target = "FuzzDecodeJournal"
+            package = "./internal/jobs"
+            discovered = run([go, "test", "-vet=off", f"-list=^{target}$", package], module, env)
+            if target not in discovered.splitlines():
+                raise RuntimeError(f"Fuzz target not discovered: {target}")
+            return run([go, "test", "-vet=off", "-run=^$", f"-fuzz=^{target}$",
+                        "-fuzztime=10s", "-parallel=2", "-timeout=90s", package], module, env)
         if name == "vuln":
             for goos, goarch in PLATFORMS:
                 print(f"govulncheck: {goos}/{goarch}, CGO_ENABLED=0, no build tags", flush=True)

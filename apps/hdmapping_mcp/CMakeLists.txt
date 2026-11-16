@@ -46,7 +46,7 @@ if(HDMAPPING_MCP_QUALITY)
     set(_mcp_check_args --go "${HDMAPPING_GO}" --tools-dir "${CMAKE_BINARY_DIR}/go-tools")
     add_custom_target(mcp-check
         COMMAND "${CMAKE_COMMAND}" -E env ${HDMAPPING_GO_ENV}
-            "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks format lint test vuln
+            "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks format lint test fuzz vuln
         USES_TERMINAL VERBATIM)
     set(_mcp_race_control "")
     if(HDMAPPING_MCP_RACE)
