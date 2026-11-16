@@ -21,6 +21,13 @@ find_dylib_in_build() {
         echo "build/lib/$dylib_name"
         return
     fi
+
+    # Dependency fixups revisit bundled libraries. Avoid traversing the whole
+    # build tree (including Go caches) again for each already copied library.
+    if [ -e "build/HDMapping/lib/$dylib_name" ]; then
+        echo "build/HDMapping/lib/$dylib_name"
+        return
+    fi
     
     # Search recursively in build directory (including symlinks)
     local found=$(find build -name "$dylib_name" \( -type f -o -type l \) 2>/dev/null | head -1)
