@@ -39,6 +39,33 @@ find_dylib_in_build() {
     echo ""
 }
 
+# Resolve a dylib's runpath before flattening the dependency tree into lib/.
+resolve_dylib_runpath() {
+    local dylib_path="$1"
+    local relative_dep="$2"
+    local loader_dir=$(dirname "$dylib_path")
+    local runpath
+    while IFS= read -r runpath; do
+        case "$runpath" in
+            @loader_path) runpath="$loader_dir" ;;
+            @loader_path/*) runpath="$loader_dir/${runpath#@loader_path/}" ;;
+            /*) ;;
+            *) continue ;;
+        esac
+        if [ -f "$runpath/$relative_dep" ]; then
+            printf '%s\n' "$runpath/$relative_dep"
+            return 0
+        fi
+    done < <(otool -l "$dylib_path" | awk '
+        $1 == "cmd" { is_rpath = ($2 == "LC_RPATH") }
+        is_rpath && $1 == "path" {
+            sub(/^[[:space:]]*path /, "")
+            sub(/ \(offset [0-9]+\)$/, "")
+            print
+        }')
+    return 1
+}
+
 # Function to copy a dylib and fix its install name
 bundle_dylib() {
     local dylib_path="$1"
@@ -94,12 +121,17 @@ bundle_dylib() {
     echo "  ✓ Bundled: $dylib_name"
     
     # Recursively bundle dependencies of this dylib
-    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@rpath")
+    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System")
     local loader_dir=$(dirname "$dylib_path")
     for dep in $deps; do
         # Resolve against the original dylib while its source path is known.
         if [[ "$dep" == "@loader_path/"* ]]; then
             dep="$loader_dir/${dep#@loader_path/}"
+        elif [[ "$dep" == "@rpath/"* ]]; then
+            local resolved
+            if resolved=$(resolve_dylib_runpath "$dylib_path" "${dep#@rpath/}"); then
+                dep="$resolved"
+            fi
         fi
         local dep_name=$(basename "$dep")
         if [[ "$dep" == *".dylib"* ]]; then
@@ -164,8 +196,9 @@ fix_binary_dylibs() {
             if [ "$is_dylib" = false ]; then
                 # For executables, change to @executable_path/../lib
                 install_name_tool -change "$dep" "@executable_path/../lib/$dep_name" "$binary" 2>/dev/null || true
+            elif [[ "$dep" != "@loader_path/$dep_name" ]]; then
+                install_name_tool -change "$dep" "@loader_path/$dep_name" "$binary" 2>/dev/null || true
             fi
-            # For dylibs, @loader_path is already correct
         elif [[ "$dep" == "@executable_path/"* ]]; then
             # Already uses @executable_path
             dep_name=$(basename "$dep")
