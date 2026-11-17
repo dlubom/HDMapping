@@ -253,8 +253,9 @@ namespace HDMapping::Processing
             const auto metadata = json::parse(input);
             const auto& settings = metadata.at("Session Settings");
             const auto& scans = metadata.at("laz_file_names");
-            if (settings.at("poses_file_name") != layout::poses || settings.at("initial_poses_file_name") != layout::initial_poses ||
-                !scans.is_array() || scans.empty())
+            const std::string_view current = settings.at("poses_file_name").get_ref<const std::string&>();
+            const std::string_view initial = settings.at("initial_poses_file_name").get_ref<const std::string&>();
+            if (current != layout::poses || initial != layout::initial_poses || !scans.is_array() || scans.empty())
             {
                 throw std::runtime_error("Invalid session snapshot references");
             }
