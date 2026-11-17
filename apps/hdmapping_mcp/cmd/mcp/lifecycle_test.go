@@ -101,6 +101,15 @@ func TestCoordinatorProcessLifecycle(t *testing.T) {
 		}
 	}
 
+	incomplete := submitWithManifest(t, ctx, client, dir, "incomplete", "{}")
+	rejected := waitJob(t, ctx, client, incomplete.ID, "", jobs.Failed)
+	if rejected.Snapshot != nil || rejected.Error == nil || !strings.Contains(rejected.Error.Message, "invalid_snapshot") {
+		t.Fatalf("incomplete snapshot reached the queue: %+v", rejected)
+	}
+	if _, err := os.Stat(filepath.Join(dir, string(incomplete.ID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected job created a worker directory: %v", err)
+	}
+
 	grace := submit(t, ctx, client, dir, "grace")
 	waitJob(t, ctx, client, grace.ID, "ready", jobs.Running)
 	if err := a.Close(); err != nil {
@@ -168,9 +177,14 @@ func call(t *testing.T, ctx context.Context, client *protocol.Client, method str
 
 func submit(t *testing.T, ctx context.Context, client *protocol.Client, dir, operation string) jobs.JobRecord {
 	t.Helper()
+	return submitWithManifest(t, ctx, client, dir, operation, `{"fixture_complete":true}`)
+}
+
+func submitWithManifest(t *testing.T, ctx context.Context, client *protocol.Client, dir, operation, manifest string) jobs.JobRecord {
+	t.Helper()
 	target := jobs.TargetRef{StateID: operation, Revision: 1}
 	snapshot := filepath.Join(dir, operation+".json")
-	if err := os.WriteFile(snapshot, []byte("{}\n"), 0600); err != nil {
+	if err := os.WriteFile(snapshot, []byte(manifest), 0600); err != nil {
 		t.Fatal(err)
 	}
 	var result jobs.JobRecord

@@ -45,6 +45,18 @@ func main() {
 		write(map[string]any{"type": "operations", "operations": []any{}})
 		return
 	}
+	if command.Type == "validate_snapshot" {
+		var input map[string]bool
+		data, err := os.ReadFile(command.Snapshot.ManifestPath)
+		if err != nil || json.Unmarshal(data, &input) != nil || !input["fixture_complete"] {
+			write(map[string]any{"type": "error", "error": map[string]string{
+				"code": "invalid_snapshot", "message": "test fixture is incomplete",
+			}})
+			return
+		}
+		write(map[string]any{"type": "snapshot_validated"})
+		return
+	}
 	if command.Operation.Operation == "durable" {
 		command.Snapshot.ManifestPath = "snapshot.json"
 		if err := os.WriteFile("snapshot.json", []byte("{}"), 0600); err != nil {

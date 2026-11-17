@@ -38,10 +38,30 @@ public:
     static bool is_point_cloud_file(const std::string& file_name);
     bool save(
         const std::string& file_name, const std::string& poses_file_name, const std::string& initial_poses_file_name, bool is_subsession);
+    //! Use the native session metadata codec with private snapshot scan paths relative to the entry.
+    bool load_snapshot_metadata(const std::filesystem::path& file);
+    bool save_snapshot_metadata(const std::filesystem::path& file, const std::string& poses, const std::string& initial_poses);
+
     void fill_session_from_worker_data(
         const std::vector<WorkerData>& worker_data,
         bool save_selected,
         bool filter_on_export,
         bool apply_pose,
         double threshould_output_filter);
+
+private:
+    bool load_impl(
+        const std::filesystem::path& file,
+        bool is_decimate,
+        double bucket_x,
+        double bucket_y,
+        double bucket_z,
+        bool calculate_offset,
+        bool metadata_only);
+    bool save_impl(
+        const std::filesystem::path& file,
+        const std::string& poses,
+        const std::string& initial_poses,
+        bool is_subsession,
+        bool metadata_only);
 };

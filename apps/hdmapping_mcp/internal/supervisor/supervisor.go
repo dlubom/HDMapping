@@ -38,8 +38,24 @@ func (s *Supervisor) Describe(ctx context.Context) (json.RawMessage, error) {
 	return reply.Operations, nil
 }
 
-func (*Supervisor) Prepare(context.Context, jobs.JobRecord) (jobs.SnapshotRef, error) {
-	return jobs.SnapshotRef{}, errors.New("worker requires a previously captured snapshot")
+func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.SnapshotRef, error) {
+	snapshot := job.Request.Snapshot
+	if snapshot == nil || snapshot.Target != job.Request.Operation.Target {
+		return jobs.SnapshotRef{}, errors.New("worker requires a captured snapshot for this revision")
+	}
+	cmd := exec.Command(s.Worker)
+	cmd.Dir, cmd.Stderr = filepath.Dir(s.Worker), os.Stderr
+	reply, err := exchange(ctx, cmd, s.Version, command{Type: "validate_snapshot", Snapshot: snapshot}, nil, false)
+	if err != nil {
+		return jobs.SnapshotRef{}, err
+	}
+	if reply.Error != nil {
+		return jobs.SnapshotRef{}, fmt.Errorf("%s: %s", reply.Error.Code, reply.Error.Message)
+	}
+	if reply.Type != "snapshot_validated" {
+		return jobs.SnapshotRef{}, fmt.Errorf("unexpected snapshot validation response: %s", reply.Type)
+	}
+	return *snapshot, nil
 }
 
 func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publication, error) {

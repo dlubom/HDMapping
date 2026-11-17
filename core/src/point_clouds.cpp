@@ -127,7 +127,7 @@ bool PointClouds::load(
     return true;
 }
 
-bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name)
+bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::filesystem::path& poses_file_name)
 {
     std::ifstream infile(poses_file_name);
     if (!infile.good())
@@ -140,7 +140,8 @@ bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_c
     std::istringstream iss(line);
 
     int num_scans = 0;
-    iss >> num_scans;
+    if (!(iss >> num_scans) || num_scans < 0)
+        return false;
 
     std::cout << "number of scans: " << num_scans << std::endl;
 
@@ -158,15 +159,18 @@ bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_c
 
         std::getline(infile, line);
         std::istringstream iss1(line);
-        iss1 >> r11 >> r12 >> r13 >> t14;
+        if (!(iss1 >> r11 >> r12 >> r13 >> t14))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss2(line);
-        iss2 >> r21 >> r22 >> r23 >> t24;
+        if (!(iss2 >> r21 >> r22 >> r23 >> t24))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss3(line);
-        iss3 >> r31 >> r32 >> r33 >> t34;
+        if (!(iss3 >> r31 >> r32 >> r33 >> t34))
+            return false;
 
         std::getline(infile, line);
 
@@ -318,7 +322,7 @@ bool PointClouds::update_poses_from_RESSO_inverse(const std::string& folder_with
     return true;
 }
 
-bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name)
+bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::filesystem::path& poses_file_name)
 {
     std::ifstream infile(poses_file_name);
     if (!infile.good())
@@ -331,7 +335,8 @@ bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with
     std::istringstream iss(line);
 
     int num_scans = 0;
-    iss >> num_scans;
+    if (!(iss >> num_scans) || num_scans < 0)
+        return false;
 
     std::cout << "number of scans: " << num_scans << std::endl;
 
@@ -349,15 +354,18 @@ bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with
 
         std::getline(infile, line);
         std::istringstream iss1(line);
-        iss1 >> r11 >> r12 >> r13 >> t14;
+        if (!(iss1 >> r11 >> r12 >> r13 >> t14))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss2(line);
-        iss2 >> r21 >> r22 >> r23 >> t24;
+        if (!(iss2 >> r21 >> r22 >> r23 >> t24))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss3(line);
-        iss3 >> r31 >> r32 >> r33 >> t34;
+        if (!(iss3 >> r31 >> r32 >> r33 >> t34))
+            return false;
 
         std::getline(infile, line);
 
@@ -801,69 +809,44 @@ void PointClouds::render(
 }
 #endif
 
-bool PointClouds::save_poses(const std::string file_name, bool is_subsession)
+bool PointClouds::save_poses(const std::filesystem::path& file_name, bool is_subsession, bool initial, bool full_precision)
 {
-    int number_pc = 0;
-    if (!is_subsession)
-    {
-        number_pc = this->point_clouds.size();
-    }
-    else
-    {
-        for (size_t i = 0; i < this->point_clouds.size(); i++)
-        {
-            if (this->point_clouds[i].visible)
-            {
-                number_pc++;
-            }
-        }
-    }
-
-    std::ofstream outfile;
-    outfile.open(file_name);
-    if (!outfile.good())
+    const auto number_pc = is_subsession ? std::count_if(
+                                               point_clouds.begin(),
+                                               point_clouds.end(),
+                                               [](const PointCloud& pc)
+                                               {
+                                                   return pc.visible;
+                                               })
+                                         : point_clouds.size();
+    std::ofstream outfile(file_name);
+    if (!outfile)
     {
         std::cout << "can not save file: " << file_name << std::endl;
-        std::cout << "if you can see only '' it means there is no filename assigned to poses, please read manual or ask for support"
-                  << std::endl;
-        std::cout << "To assign filename to poses please use following two buttons in multi_view_tls_registration_step_2" << std::endl;
-        std::cout << "1: update initial poses from RESSO file" << std::endl;
-        std::cout << "2: update poses from RESSO file" << std::endl;
         return false;
     }
-
-    outfile << number_pc << std::endl;
-    for (size_t i = 0; i < this->point_clouds.size(); i++)
+    if (full_precision)
     {
-        if (!is_subsession)
+        outfile << std::setprecision(std::numeric_limits<double>::max_digits10);
+    }
+    outfile << number_pc << std::endl;
+    for (const auto& pc : point_clouds)
+    {
+        if (is_subsession && !pc.visible)
         {
-            outfile << std::filesystem::path(point_clouds[i].file_name).filename().string() << std::endl;
-            outfile << this->point_clouds[i].m_pose(0, 0) << " " << this->point_clouds[i].m_pose(0, 1) << " "
-                    << this->point_clouds[i].m_pose(0, 2) << " " << this->point_clouds[i].m_pose(0, 3) << std::endl;
-            outfile << this->point_clouds[i].m_pose(1, 0) << " " << this->point_clouds[i].m_pose(1, 1) << " "
-                    << this->point_clouds[i].m_pose(1, 2) << " " << this->point_clouds[i].m_pose(1, 3) << std::endl;
-            outfile << this->point_clouds[i].m_pose(2, 0) << " " << this->point_clouds[i].m_pose(2, 1) << " "
-                    << this->point_clouds[i].m_pose(2, 2) << " " << this->point_clouds[i].m_pose(2, 3) << std::endl;
-            outfile << "0 0 0 1" << std::endl;
+            continue;
         }
-        else
+        const auto& pose_to_write = initial ? pc.m_initial_pose : pc.m_pose;
+        outfile << std::filesystem::path(pc.file_name).filename().string() << std::endl;
+        for (int row = 0; row < 3; ++row)
         {
-            if (this->point_clouds[i].visible)
-            {
-                outfile << std::filesystem::path(point_clouds[i].file_name).filename().string() << std::endl;
-                outfile << this->point_clouds[i].m_pose(0, 0) << " " << this->point_clouds[i].m_pose(0, 1) << " "
-                        << this->point_clouds[i].m_pose(0, 2) << " " << this->point_clouds[i].m_pose(0, 3) << std::endl;
-                outfile << this->point_clouds[i].m_pose(1, 0) << " " << this->point_clouds[i].m_pose(1, 1) << " "
-                        << this->point_clouds[i].m_pose(1, 2) << " " << this->point_clouds[i].m_pose(1, 3) << std::endl;
-                outfile << this->point_clouds[i].m_pose(2, 0) << " " << this->point_clouds[i].m_pose(2, 1) << " "
-                        << this->point_clouds[i].m_pose(2, 2) << " " << this->point_clouds[i].m_pose(2, 3) << std::endl;
-                outfile << "0 0 0 1" << std::endl;
-            }
+            outfile << pose_to_write(row, 0) << " " << pose_to_write(row, 1) << " " << pose_to_write(row, 2) << " " << pose_to_write(row, 3)
+                    << std::endl;
         }
+        outfile << "0 0 0 1" << std::endl;
     }
     outfile.close();
-
-    return true;
+    return outfile.good();
 }
 
 bool PointClouds::save_scans()

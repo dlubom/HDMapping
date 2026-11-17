@@ -1,4 +1,7 @@
 #include <HDMapping/Processing/RuntimeProtocol.h>
+#include <HDMapping/Processing/SnapshotStore.h>
+
+#include "SessionSnapshotPaths.h"
 
 #include "RuntimeReceipt.h"
 
@@ -125,25 +128,30 @@ namespace HDMapping::Processing
             SnapshotRef snapshot;
         };
 
+        SnapshotRef parse_snapshot(const json& snapshot)
+        {
+            const auto& manifest = snapshot.at("manifest_path").get_ref<const std::string&>();
+            if (manifest.empty() || manifest.find('\0') != std::string::npos)
+            {
+                throw std::invalid_argument("Invalid snapshot manifest path");
+            }
+            return { std::filesystem::path(std::u8string(manifest.begin(), manifest.end())), parse_target(snapshot.at("target")) };
+        }
+
         RunCommand parse_run(const json& packet)
         {
             const auto& request = packet.at("operation");
-            const auto& snapshot = packet.at("snapshot");
+            auto snapshot = parse_snapshot(packet.at("snapshot"));
             const auto& operation = request.at("operation").get_ref<const std::string&>();
             const auto& job_id = packet.at("job_id").get_ref<const std::string&>();
-            const auto& manifest_path = snapshot.at("manifest_path").get_ref<const std::string&>();
             const auto& scope = request.at("scope");
             const auto& parameters = request.at("parameters");
             const auto target = parse_target(request.at("target"));
-            const auto snapshot_target = parse_target(snapshot.at("target"));
-            if (operation.empty() || job_id.empty() || manifest_path.empty() || manifest_path.find('\0') != std::string::npos ||
-                !scope.is_object() || !parameters.is_object() || target != snapshot_target)
+            if (operation.empty() || job_id.empty() || !scope.is_object() || !parameters.is_object() || target != snapshot.target)
             {
                 throw std::invalid_argument("Invalid operation request or mismatched snapshot target");
             }
-            return { job_id,
-                     { operation, target, scope, parameters },
-                     { std::filesystem::path(std::u8string(manifest_path.begin(), manifest_path.end())), snapshot_target } };
+            return { job_id, { operation, target, scope, parameters }, std::move(snapshot) };
         }
 
         std::string_view operation_class(OperationClass category)
@@ -308,6 +316,7 @@ namespace HDMapping::Processing
         send_packet(send, { { "type", "hello" }, { "wire", wire_version }, { "version", identity.version }, { "pid", identity.pid } });
         std::string type;
         std::optional<RunCommand> command;
+        std::optional<SnapshotRef> snapshot;
         try
         {
             const auto packet = read_packet(input);
@@ -320,6 +329,10 @@ namespace HDMapping::Processing
             {
                 command = parse_run(*packet);
             }
+            else if (type == "validate_snapshot")
+            {
+                snapshot = parse_snapshot(packet->at("snapshot"));
+            }
         } catch (const std::exception& error)
         {
             send_error(send, { "invalid_request", error.what(), json::object() });
@@ -328,6 +341,23 @@ namespace HDMapping::Processing
         if (type == "describe")
         {
             send_packet(send, describe(operations));
+            return;
+        }
+        if (snapshot)
+        {
+            const auto result = ReadSnapshot(*snapshot);
+            if (const auto* failure = std::get_if<OperationError>(&result))
+            {
+                send_error(send, *failure);
+            }
+            else if (std::get<SnapshotContents>(result).kind != SessionSnapshotPaths::kind)
+            {
+                send_error(send, { "invalid_snapshot", "Unsupported snapshot kind", json::object() });
+            }
+            else
+            {
+                send_packet(send, { { "type", "snapshot_validated" } });
+            }
             return;
         }
         if (!command)

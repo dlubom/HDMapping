@@ -90,8 +90,8 @@ jobs:
       run: |
         cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
           -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=address-undefined
-        cmake --build build-asan --target processing_runtime_test hdmapping_worker processing-check-controls --parallel 2
-        ctest --test-dir build-asan -L processing-runtime --output-on-failure
+        cmake --build build-asan --target processing_runtime_test processing_snapshot_test hdmapping_worker processing-check-controls --parallel 2
+        ctest --test-dir build-asan -L 'processing-(runtime|snapshot)' --output-on-failure
         printf '{"type":"describe"}\n' | build-asan/bin/hdmapping_worker
 
     - name: Verify TSan separately
@@ -99,5 +99,5 @@ jobs:
       run: |
         cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
           -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=thread
-        cmake --build build-tsan --target processing_runtime_test processing-check-controls --parallel 2
-        ctest --test-dir build-tsan -L processing-runtime --output-on-failure
+        cmake --build build-tsan --target processing_runtime_test processing_snapshot_test processing-check-controls --parallel 2
+        ctest --test-dir build-tsan -L 'processing-(runtime|snapshot)' --output-on-failure

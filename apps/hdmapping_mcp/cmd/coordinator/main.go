@@ -103,7 +103,7 @@ func dispatch(scheduler *jobs.Scheduler, processes *supervisor.Supervisor) proto
 			if err := supervisor.CheckArgumentDepth(request.Operation.Parameters); err != nil {
 				return nil, fmt.Errorf("parameters: %w", err)
 			}
-			return scheduler.Submit(ctx, request)
+			return scheduler.SubmitForPreparation(ctx, request)
 		case "jobs.get", "jobs.cancel":
 			var id jobs.JobID
 			if err := json.Unmarshal(body, &id); err != nil {

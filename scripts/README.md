@@ -99,3 +99,12 @@ Use clang-tidy 18.1.3 on Ubuntu or 22.1.8 on macOS and clang-format 21.
 For sanitizers, configure separate Clang builds with
 `HDMAPPING_PROCESSING_SANITIZER=address-undefined` and `thread` respectively
 and run the instrumented `processing_runtime_test` and negative controls.
+
+For P04 run `ctest --test-dir build -L processing-snapshot --output-on-failure`.
+The Ubuntu sanitizer jobs also run this CTest with the instrumented processing
+and session snapshot targets. To exercise a real session in the raylib step 2
+test build, set `HDMAPPING_SNAPSHOT_TEST_DIRECTORY` to a new directory under
+an existing parent, start `multi_view_tls_registration_step_2 session.mjs`,
+and press F9 in the loaded window. Close the window and use
+`processing_snapshot_test --read-gui-snapshot <directory>` to check the
+snapshot in a fresh headless process.

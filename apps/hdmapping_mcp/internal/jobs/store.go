@@ -234,6 +234,10 @@ func sameRequest(a, b SubmitRequest) bool {
 	return bytes.Equal(x, y)
 }
 func (s *Store) Submit(ctx context.Context, req SubmitRequest) (JobRecord, error) {
+	return s.submit(ctx, req, false)
+}
+
+func (s *Store) submit(ctx context.Context, req SubmitRequest, prepare bool) (JobRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.check(ctx, true); err != nil {
@@ -266,11 +270,12 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (JobRecord, error
 	if _, err = rand.Read(id[:]); err != nil {
 		return JobRecord{}, fmt.Errorf("job ID: %w", err)
 	}
-	j := JobRecord{ID: JobID(hex.EncodeToString(id[:])), Request: req, Status: Preparing, Snapshot: req.Snapshot, GUIApplyStatus: "not_requested"}
+	j := JobRecord{ID: JobID(hex.EncodeToString(id[:])), Request: req, Status: Preparing, GUIApplyStatus: "not_requested"}
 	if req.Source == SourceGUI {
 		j.GUIApplyStatus = "pending"
 	}
-	if req.Snapshot != nil {
+	if req.Snapshot != nil && !prepare {
+		j.Snapshot = req.Snapshot
 		j.Status = Queued
 	}
 	if err = s.commit(journalEntry{Job: &j}); err != nil {

@@ -1,5 +1,6 @@
 set(_runtime_sources
     src/Operation.cpp
+    src/SnapshotStore.cpp
     src/RuntimeProtocol.cpp
     src/RuntimeReceipt.cpp
 )
@@ -9,6 +10,13 @@ target_include_directories(processing_ops SYSTEM PUBLIC "${THIRDPARTY_DIRECTORY}
 target_link_libraries(processing_ops PRIVATE Threads::Threads)
 hdmapping_processing_target(processing_ops)
 
+add_library(processing_session_snapshot STATIC src/SessionSnapshot.cpp)
+target_include_directories(processing_session_snapshot SYSTEM PUBLIC "${PROJECT_SOURCE_DIR}/core/include" "${EIGEN3_INCLUDE_DIR}")
+target_compile_definitions(processing_session_snapshot PRIVATE WITH_GUI=0)
+target_link_libraries(processing_session_snapshot PUBLIC processing_ops)
+hdmapping_processing_target(processing_session_snapshot)
+list(APPEND _runtime_sources src/SessionSnapshot.cpp)
+
 if(BUILD_TESTING)
     add_executable(processing_runtime_test tests/runtime_test.cpp tests/runtime_test_main.cpp)
     target_include_directories(processing_runtime_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
@@ -16,7 +24,14 @@ if(BUILD_TESTING)
     hdmapping_processing_target(processing_runtime_test)
     add_test(NAME processing-runtime COMMAND processing_runtime_test)
     set_tests_properties(processing-runtime PROPERTIES LABELS processing-runtime TIMEOUT 45)
-    list(APPEND _runtime_sources tests/runtime_test.cpp)
+    add_executable(processing_snapshot_test tests/snapshot_store_test.cpp tests/snapshot_test_main.cpp)
+    target_include_directories(processing_snapshot_test SYSTEM PRIVATE
+        "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include")
+    target_link_libraries(processing_snapshot_test PRIVATE processing_session_snapshot core_no_gui)
+    hdmapping_processing_target(processing_snapshot_test)
+    add_test(NAME processing-snapshot COMMAND processing_snapshot_test)
+    set_tests_properties(processing-snapshot PROPERTIES LABELS processing-snapshot TIMEOUT 45)
+    list(APPEND _runtime_sources tests/runtime_test.cpp tests/snapshot_store_test.cpp tests/snapshot_test_main.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

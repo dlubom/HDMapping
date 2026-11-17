@@ -1,3 +1,10 @@
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+#include <HDMapping/Processing/SessionSnapshot.h>
+
+#include <chrono>
+#include <cstdlib>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1128,7 +1135,12 @@ bool isGizmoDragging()
     return gizmo_drag_first_index >= 0;
 }
 
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+const auto session_owner = std::make_shared<Session>();
+Session& session = *session_owner;
+#else
 Session session;
+#endif
 PointClouds::PointCloudDimensions session_dims;
 
 // Writes the in-progress drag poses into the scans and ends the drag.
@@ -7685,6 +7697,50 @@ int exportSessionToDirectory(const fs::path& input_file, const fs::path& output_
     return 0;
 }
 
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+// P04 developer probe on the GUI owner thread. P06 adds shared revision tracking and capture RPC.
+static void captureSessionProbe(const fs::path& destination)
+{
+    using namespace HDMapping::Processing;
+    const TargetRef target{ "step2-probe", 1 };
+    const auto& ndt = tls_registration.ndt;
+    SessionCaptureSource source(
+        session_owner,
+        [target]
+        {
+            return target;
+        },
+        { { "ndt",
+            { { "bucket_size", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+              { "number_of_iterations", ndt.number_of_iterations },
+              { "number_of_threads", ndt.number_of_threads },
+              { "is_fix_first_node", ndt.is_fix_first_node },
+              { "is_generalized", ndt.is_generalized } } } });
+    RunContext context{};
+    const auto begin = std::chrono::steady_clock::now();
+    const auto snapshot = CaptureSnapshot(source, target.revision, destination, context);
+    if (const auto* failure = std::get_if<OperationError>(&snapshot))
+    {
+        spdlog::error("Snapshot capture: {}: {}", failure->code, failure->message);
+        return;
+    }
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    const auto& scans = session.point_clouds_container.point_clouds;
+    std::size_t points = 0;
+    for (const auto& scan : scans)
+    {
+        points += scan.points_local.size();
+    }
+    spdlog::info(
+        "Snapshot captured in {:.3f} s: {} scans, {} points, first pose X {:.17g}, NDT iterations {}",
+        elapsed,
+        scans.size(),
+        points,
+        scans.front().m_pose.translation().x(),
+        ndt.number_of_iterations);
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     bool export_requested = false;
@@ -7782,6 +7838,15 @@ int main(int argc, char* argv[])
         // when GetMouseWheelMove() is nonzero, and display() once per frame.
         while (!WindowShouldClose())
         {
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+            if (session_loaded && IsKeyPressed(KEY_F9))
+            {
+                if (const char* destination = std::getenv("HDMAPPING_SNAPSHOT_TEST_DIRECTORY"))
+                {
+                    captureSessionProbe(destination);
+                }
+            }
+#endif
             int mx = static_cast<int>(GetMouseX());
             int my = static_cast<int>(GetMouseY());
 

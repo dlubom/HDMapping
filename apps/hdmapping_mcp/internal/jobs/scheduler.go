@@ -53,12 +53,22 @@ func (s *Scheduler) check() error {
 	return s.err
 }
 func (s *Scheduler) Submit(ctx context.Context, req SubmitRequest) (JobRecord, error) {
+	return s.submit(ctx, req, false)
+}
+
+// SubmitForPreparation validates even pre-captured inputs through Executor.Prepare.
+// Untrusted input can enter the journal in preparing but cannot enter the queue.
+func (s *Scheduler) SubmitForPreparation(ctx context.Context, req SubmitRequest) (JobRecord, error) {
+	return s.submit(ctx, req, true)
+}
+
+func (s *Scheduler) submit(ctx context.Context, req SubmitRequest, prepare bool) (JobRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.check(); err != nil {
 		return JobRecord{}, err
 	}
-	j, err := s.store.Submit(ctx, req)
+	j, err := s.store.submit(ctx, req, prepare)
 	if err != nil {
 		return JobRecord{}, err
 	}

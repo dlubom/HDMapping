@@ -1,5 +1,7 @@
 #include <pch/pch.h>
 
+#include <memory>
+
 #include <Core/point_cloud.h>
 #include <Core/transformations.h>
 
@@ -102,12 +104,23 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         return false;
     }
 
+    bool opened = false;
+    const auto destroy_reader = [&opened](void* reader)
+    {
+        if (opened)
+        {
+            laszip_close_reader(reader);
+        }
+        laszip_destroy(reader);
+    };
+    const std::unique_ptr<void, decltype(destroy_reader)> owner(laszip_reader, destroy_reader);
     laszip_BOOL is_compressed = 0;
     if (laszip_open_reader(laszip_reader, input_file_name.c_str(), &is_compressed))
     {
         spdlog::error(":DLL ERROR: opening laszip reader for '{}'", input_file_name);
         return false;
     }
+    opened = true;
     laszip_header* header;
 
     if (laszip_get_header_pointer(laszip_reader, &header))
@@ -158,7 +171,6 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         if (laszip_read_point(laszip_reader))
         {
             spdlog::error("DLL ERROR: reading point {}", p_count);
-            laszip_close_reader(laszip_reader);
             return false;
         }
 
@@ -197,10 +209,6 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
 
         p_count++;
     }
-
-    laszip_close_reader(laszip_reader);
-    // laszip_clean(laszip_reader);
-    // laszip_destroy(laszip_reader);
 
     // std::cout << std::setprecision(20);
     // std::cout << "min_ts " << min_ts << std::endl;
