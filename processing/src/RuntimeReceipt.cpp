@@ -74,6 +74,16 @@ namespace HDMapping::Processing
                 file_error("sync worker receipt");
             }
         }
+
+        void sync_directory(const std::filesystem::path& path)
+        {
+            const FileDescriptor directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (directory.get() < 0)
+            {
+                file_error("open worker output directory");
+            }
+            sync_file(directory.get());
+        }
 #endif
     } // namespace
 
@@ -134,12 +144,9 @@ namespace HDMapping::Processing
         {
             file_error("publish worker receipt");
         }
-        const FileDescriptor parent(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (parent.get() < 0)
-        {
-            file_error("open worker output directory");
-        }
-        sync_file(parent.get());
+        sync_directory(directory);
+        const auto parent = std::filesystem::absolute(directory).lexically_normal().parent_path();
+        sync_directory(parent);
 #ifdef __APPLE__
         int result;
         do

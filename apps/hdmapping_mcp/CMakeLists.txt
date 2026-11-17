@@ -39,26 +39,26 @@ hdmapping_go_app(hdmapping_coordinator ./cmd/coordinator)
 add_dependencies(hdmapping_mcp_build hdmapping_coordinator_build hdmapping_worker)
 
 if(BUILD_TESTING)
-    add_test(NAME mcp-contract COMMAND "${CMAKE_COMMAND}" -E env ${HDMAPPING_GO_ENV}
-        "HDMAPPING_MCP_EXECUTABLE=$<TARGET_FILE:hdmapping_mcp>"
-        "${HDMAPPING_GO}" test -vet=off -v -count=1 -timeout=90s ./...)
-    set_tests_properties(mcp-contract PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" LABELS "mcp" TIMEOUT 120)
+    add_test(NAME mcp-contract COMMAND "${HDMAPPING_GO}" test -vet=off -v -count=1 -timeout=90s ./...)
+    set_tests_properties(mcp-contract PROPERTIES
+        ENVIRONMENT "${HDMAPPING_GO_ENV};HDMAPPING_MCP_EXECUTABLE=$<TARGET_FILE:hdmapping_mcp>"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" LABELS "mcp" TIMEOUT 120)
 endif()
 if(HDMAPPING_MCP_QUALITY)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(_mcp_checks "${PROJECT_SOURCE_DIR}/scripts/run_mcp_checks.py")
-    set(_mcp_check_args --go "${HDMAPPING_GO}" --tools-dir "${CMAKE_BINARY_DIR}/go-tools")
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/mcp-go-environment.txt"
+        CONTENT "$<JOIN:${HDMAPPING_GO_ENV},\n>\n")
+    set(_mcp_check_args --build-dir "${CMAKE_BINARY_DIR}")
     add_custom_target(mcp-check
-        COMMAND "${CMAKE_COMMAND}" -E env ${HDMAPPING_GO_ENV}
-            "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks format lint test fuzz vuln
+        COMMAND "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks format lint test fuzz vuln
         USES_TERMINAL VERBATIM)
     set(_mcp_race_control "")
     if(HDMAPPING_MCP_RACE)
         set(_mcp_race_control --race-controls)
     endif()
     add_custom_target(mcp-check-controls
-        COMMAND "${CMAKE_COMMAND}" -E env ${HDMAPPING_GO_ENV}
-            "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks controls ${_mcp_race_control}
+        COMMAND "${Python3_EXECUTABLE}" "${_mcp_checks}" ${_mcp_check_args} --checks controls ${_mcp_race_control}
         USES_TERMINAL VERBATIM)
 endif()
 if(HDMAPPING_MCP_RACE)

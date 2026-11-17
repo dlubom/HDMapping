@@ -28,16 +28,30 @@ def run(command, cwd, env, expect_failure=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--go", required=True)
-    parser.add_argument("--tools-dir", type=Path, required=True)
+    parser.add_argument("--build-dir", type=Path)
+    parser.add_argument("--go")
+    parser.add_argument("--tools-dir", type=Path)
     parser.add_argument("--checks", nargs="+", required=True,
                         choices=("format", "lint", "test", "race", "fuzz", "vuln", "controls"))
     parser.add_argument("--race-controls", action="store_true")
     args = parser.parse_args()
-    go = str(Path(args.go).resolve())
-    tools = args.tools_dir.resolve()
+    if args.build_dir:
+        if args.go or args.tools_dir:
+            parser.error("--build-dir supplies --go and --tools-dir")
+        build = args.build_dir.resolve()
+        configured = dict(line.split("=", 1) for line in
+                          (build / "mcp-go-environment.txt").read_text(encoding="utf-8").splitlines())
+        go = configured["HDMAPPING_GO_EXECUTABLE"]
+        tools = build / "go-tools"
+    elif args.go and args.tools_dir:
+        configured = {}
+        go = str(Path(args.go).resolve())
+        tools = args.tools_dir.resolve()
+    else:
+        parser.error("pass --build-dir or both --go and --tools-dir")
     tools.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, GOTOOLCHAIN="local", GOWORK="off", GOENV="off", GOFLAGS="-mod=readonly")
+    env.update(configured)
     env["HDMAPPING_GO_EXECUTABLE"] = go
     env["PATH"] = str(Path(go).parent) + os.pathsep + env.get("PATH", "")
     # A native test/check must not accidentally inherit a cross-build target.

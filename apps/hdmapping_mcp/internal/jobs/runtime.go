@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
 )
 
 var ErrRuntimeLeaseBusy = errors.New("worker still holds its runtime lease")
@@ -13,6 +15,17 @@ var ErrRuntimeLeaseBusy = errors.New("worker still holds its runtime lease")
 func SyncRuntimeReceipt(file *os.File) error {
 	if err := syncJournalFile(file); err != nil {
 		return err
+	}
+	if runtime.GOOS != "windows" {
+		// The job directory is new. Persist its entry before confirming
+		// the receipt inside it.
+		parent, err := os.Open(filepath.Dir(filepath.Dir(file.Name())))
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
+			return err
+		}
 	}
 	return syncJournalDirectory(file)
 }

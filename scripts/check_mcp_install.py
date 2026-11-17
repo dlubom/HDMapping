@@ -69,17 +69,14 @@ def main():
                 raise RuntimeError(f"Installed MCP is missing: {executable}")
             test = contracts[0]
             command = test["command"][:]
-            assignments = [i for i, arg in enumerate(command)
-                           if arg.startswith("HDMAPPING_MCP_EXECUTABLE=")]
-            if len(assignments) != 1:
+            properties = {prop["name"]: prop["value"] for prop in test["properties"]}
+            environment = dict(entry.split("=", 1) for entry in properties["ENVIRONMENT"])
+            if "HDMAPPING_MCP_EXECUTABLE" not in environment:
                 raise RuntimeError("MCP contract must explicitly select the shipped executable")
-            command[assignments[0]] = f"HDMAPPING_MCP_EXECUTABLE={executable}"
-            cwd = next(prop["value"] for prop in test["properties"]
-                       if prop["name"] == "WORKING_DIRECTORY")
-            # Reuse the SDK contract and CMake's pinned Go/environment. The
-            # product subprocess uses a temporary cwd and an empty PATH.
+            environment["HDMAPPING_MCP_EXECUTABLE"] = str(executable)
+            # Run the native test in the same environment as CTest.
             command[-1:] = ["-run=^TestStdioProduct$", "./cmd/mcp"]
-            run(command, cwd=cwd)
+            run(command, cwd=properties["WORKING_DIRECTORY"], env=dict(os.environ, **environment))
         elif executable.exists() or any(
             next(relocated.rglob(f"*{name}*"), None)
             for name in ("hdmapping_mcp", "hdmapping_coordinator", "hdmapping_worker")

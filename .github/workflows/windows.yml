@@ -60,7 +60,8 @@ jobs:
 
       - name: Check MCP quality
         if: matrix.mcp == 'ON'
-        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls
+        # Launch process tests directly. MSBuild custom tasks may impose a Job Object that forbids detached children.
+        run: python scripts/run_mcp_checks.py --build-dir build --checks format lint test fuzz vuln controls
 
       - name: Build
         # Build your program with the given configuration
