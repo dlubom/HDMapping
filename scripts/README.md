@@ -83,8 +83,9 @@ other builds. ON runs Go quality gates including the process tests and fuzzing
 of both the journal and IPC frame parsers. On Windows run
 `python scripts/run_mcp_checks.py --build-dir build --checks format lint test fuzz vuln controls`
 from a standalone console after configuring
-with `HDMAPPING_MCP_QUALITY=ON`. The process tests need to start a coordinator
-outside the MSBuild custom-task Job Object. Both variants build the full product,
+with `HDMAPPING_MCP_QUALITY=ON`. The hosted Windows runner uses
+`check_mcp_windows.ps1` to run these checks, CTest and relocation under the
+same account in an independent Windows process. Both variants build the full product,
 run CTest and check installation/relocation. The checker starts the adapter,
 coordinator and worker from the moved Windows deploy directory, extracted DEB
 or mounted DMG with an empty product PATH. OFF checks for all three binaries.
