@@ -4,7 +4,10 @@
 param(
     [Parameter(Mandatory)][string] $BuildDir,
     [Parameter(Mandatory)][string] $Config,
-    [Parameter(Mandatory)][string] $DeployDir,
+    [string] $DeployDir,
+    [string] $Python,
+    [string] $CMake,
+    [string] $CTest,
     [string] $Transcript,
     [string] $ExpectedSid
 )
@@ -13,7 +16,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
 $BuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
-$DeployDir = (Resolve-Path -LiteralPath $DeployDir).Path
+if ($DeployDir) {
+    $DeployDir = (Resolve-Path -LiteralPath $DeployDir).Path
+}
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
 function Invoke-Check([string] $Program, [string[]] $Arguments) {
@@ -30,13 +35,18 @@ if ($Transcript) {
         if ($sid -ne $ExpectedSid) {
             throw 'Windows MCP tests must run as the original runner account'
         }
+        $env:PYTHONUTF8 = '1'
+        $env:Path = @((Split-Path -Parent $CMake), (Split-Path -Parent $CTest), $env:Path) -join ';'
         Write-Host "Windows MCP checks on $([Environment]::OSVersion.Version), $env:PROCESSOR_ARCHITECTURE, SID $sid"
-        Invoke-Check 'python' @('scripts/run_mcp_checks.py', '--build-dir', $BuildDir, '--checks',
-            'format', 'lint', 'test', 'fuzz', 'vuln', 'controls')
-        Invoke-Check 'ctest' @('--test-dir', $BuildDir, '-C', $Config, '--output-on-failure')
-        $relocation = @('scripts/check_mcp_install.py', '--build-dir', $BuildDir, '--config', $Config, '--mcp', 'ON')
-        Invoke-Check 'python' $relocation
-        Invoke-Check 'python' ($relocation + @('--package-dir', $DeployDir, '--package-executable', 'hdmapping_mcp.exe'))
+        if ($DeployDir) {
+            Invoke-Check $CTest @('--test-dir', $BuildDir, '-C', $Config, '--output-on-failure')
+            $relocation = @('scripts/check_mcp_install.py', '--build-dir', $BuildDir, '--config', $Config, '--mcp', 'ON')
+            Invoke-Check $Python $relocation
+            Invoke-Check $Python ($relocation + @('--package-dir', $DeployDir, '--package-executable', 'hdmapping_mcp.exe'))
+        } else {
+            Invoke-Check $Python @('scripts/run_mcp_checks.py', '--build-dir', $BuildDir, '--checks',
+                'format', 'lint', 'test', 'fuzz', 'vuln', 'controls')
+        }
         $status = 0
     } catch {
         Write-Host $_
@@ -49,23 +59,19 @@ if ($Transcript) {
 
 $transcriptPath = Join-Path ([IO.Path]::GetTempPath()) "hdmapping-mcp-$([Guid]::NewGuid()).log"
 $pwsh = (Get-Process -Id $PID).Path
-$command = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{1}" -BuildDir "{2}" -Config "{3}" -DeployDir "{4}" -Transcript "{5}" -ExpectedSid "{6}"' -f
-    $pwsh, $PSCommandPath, $BuildDir, $Config, $DeployDir, $transcriptPath, $sid
-
-$keys = @('Path', 'SystemRoot', 'ComSpec', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
-    'ProgramFiles', 'ProgramFiles(x86)', 'PROCESSOR_ARCHITECTURE', 'TEMP', 'TMP')
-$environment = @('PYTHONUTF8=1')
-foreach ($key in $keys) {
-    $value = [Environment]::GetEnvironmentVariable($key)
-    if ($value) {
-        $environment += "$key=$value"
-    }
+$Python = (Get-Command python -CommandType Application).Source
+$CMake = (Get-Command cmake -CommandType Application).Source
+$CTest = (Get-Command ctest -CommandType Application).Source
+$command = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{1}" -BuildDir "{2}" -Config "{3}" -Transcript "{4}" -ExpectedSid "{5}" -Python "{6}" -CMake "{7}" -CTest "{8}"' -f
+    $pwsh, $PSCommandPath, $BuildDir, $Config, $transcriptPath, $sid, $Python, $CMake, $CTest
+if ($DeployDir) {
+    $command += ' -DeployDir "{0}"' -f $DeployDir
 }
-# Win32_Process.Create selects the current user via the local WMI provider.
-# The provider's startup flags request CREATE_BREAKAWAY_FROM_JOB and Unicode env.
+
+# Win32_Process.Create uses the same account through the local WMI provider.
+# CREATE_BREAKAWAY_FROM_JOB leaves the provider's process quota job.
 $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
-    CreateFlags = [uint32]0x01000400
-    EnvironmentVariables = [string[]]$environment
+    CreateFlags = [uint32]0x01000000
 }
 $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
     CommandLine = $command

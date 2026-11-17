@@ -58,6 +58,11 @@ jobs:
         # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
         run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
 
+      - name: Check Windows MCP quality and process lifecycle
+        if: matrix.mcp == 'ON'
+        shell: pwsh
+        run: ./scripts/check_mcp_windows.ps1 -BuildDir build -Config ${{ env.BUILD_TYPE }}
+
       - name: Build
         # Build your program with the given configuration
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target package
