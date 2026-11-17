@@ -376,12 +376,13 @@ func peerPID(conn net.Conn, serverSide bool) (int, error) {
 }
 
 func openPeerProcess(pid uint32) (windows.Handle, error) {
-	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
 	if err != nil {
 		return 0, fmt.Errorf("open named pipe peer process: %w", err)
 	}
 	var token windows.Token
 	if err := windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token); err != nil {
+		err = peerAccessError(process, err)
 		_ = windows.CloseHandle(process)
 		return 0, fmt.Errorf("open named pipe peer token: %w", err)
 	}
@@ -415,9 +416,21 @@ func peerExecutable(pid int) (string, error) {
 	path := make([]uint16, 32768)
 	size := uint32(len(path))
 	if err := windows.QueryFullProcessImageName(process, 0, &path[0], &size); err != nil {
-		return "", fmt.Errorf("read named pipe peer image: %w", err)
+		return "", fmt.Errorf("read named pipe peer image: %w", peerAccessError(process, err))
 	}
 	return windows.UTF16ToString(path[:size]), nil
+}
+
+// Windows can deny a token or image query before TerminateProcess finishes.
+// Keep the original denial for a process whose handle remains unsignalled.
+func peerAccessError(process windows.Handle, err error) error {
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		state, waitErr := windows.WaitForSingleObject(process, 200)
+		if waitErr == nil && state == windows.WAIT_OBJECT_0 {
+			return errors.Join(os.ErrNotExist, err)
+		}
+	}
+	return err
 }
 
 var isProcessInJobAPI = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")

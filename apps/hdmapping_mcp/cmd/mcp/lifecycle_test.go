@@ -37,7 +37,7 @@ func stopCoordinator(t *testing.T, local *protocol.Client) {
 	if err := local.Call(ctx, "ping", nil, &pid); err != nil {
 		return
 	}
-	if err := killCoordinator(pid); err != nil {
+	if err := stopTestCoordinator(pid); err != nil {
 		t.Errorf("stop test coordinator %d: %v", pid, err)
 	}
 }

@@ -82,8 +82,12 @@ def main():
             return run([lint, "run", "./..."], module, env, negative)
         if name in ("test", "race"):
             test_env = dict(env, CGO_ENABLED="1" if name == "race" else "0")
+            scope = ["./..."]
+            if negative:
+                target = "TestRaceControl" if name == "race" else "TestControl"
+                scope = [f"-run=^{target}$", "."]
             return run([go, "test", "-vet=off", "-count=1", "-timeout=90s",
-                        *(["-race"] if name == "race" else []), "./..."], module, test_env, negative)
+                        *(["-race"] if name == "race" else []), *scope], module, test_env, negative)
         if name == "fuzz":
             for package, target in (("./internal/jobs", "FuzzDecodeJournal"),
                                     ("./internal/protocol", "FuzzReadFrame")):

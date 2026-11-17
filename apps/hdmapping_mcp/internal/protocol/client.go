@@ -165,7 +165,7 @@ func (c *Client) call(ctx context.Context, method string, input, output any) (bo
 
 	pid, err := peerPID(conn, false)
 	if err != nil {
-		return !peerGone(err), fmt.Errorf("verify coordinator peer: %w", err)
+		return !peerGone(err) && !errors.Is(err, os.ErrNotExist), fmt.Errorf("verify coordinator peer: %w", err)
 	}
 	if err := verifyExecutable(pid, c.coordinator); err != nil {
 		return !peerGone(err) && !errors.Is(err, os.ErrNotExist), err
