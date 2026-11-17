@@ -59,9 +59,9 @@ if ($Transcript) {
 
 $transcriptPath = Join-Path ([IO.Path]::GetTempPath()) "hdmapping-mcp-$([Guid]::NewGuid()).log"
 $pwsh = (Get-Process -Id $PID).Path
-$Python = (Get-Command python -CommandType Application).Source
-$CMake = (Get-Command cmake -CommandType Application).Source
-$CTest = (Get-Command ctest -CommandType Application).Source
+$Python = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+$CMake = (Get-Command cmake -CommandType Application | Select-Object -First 1).Source
+$CTest = (Get-Command ctest -CommandType Application | Select-Object -First 1).Source
 $command = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{1}" -BuildDir "{2}" -Config "{3}" -Transcript "{4}" -ExpectedSid "{5}" -Python "{6}" -CMake "{7}" -CTest "{8}"' -f
     $pwsh, $PSCommandPath, $BuildDir, $Config, $transcriptPath, $sid, $Python, $CMake, $CTest
 if ($DeployDir) {
