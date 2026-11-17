@@ -94,8 +94,13 @@ bundle_dylib() {
     echo "  ✓ Bundled: $dylib_name"
     
     # Recursively bundle dependencies of this dylib
-    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@rpath" | grep -v "@loader_path")
+    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@rpath")
+    local loader_dir=$(dirname "$dylib_path")
     for dep in $deps; do
+        # Resolve against the original dylib while its source path is known.
+        if [[ "$dep" == "@loader_path/"* ]]; then
+            dep="$loader_dir/${dep#@loader_path/}"
+        fi
         local dep_name=$(basename "$dep")
         if [[ "$dep" == *".dylib"* ]]; then
             # Try the original path first, then search
