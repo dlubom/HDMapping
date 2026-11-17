@@ -42,8 +42,7 @@ namespace HDMapping::Processing
                         throw std::runtime_error("Snapshot capture cancelled");
                     }
                     const auto chunk = values.first(std::min(chunk_elements, values.size()));
-                    const auto bytes = std::as_bytes(chunk);
-                    file_.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                    file_.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size_bytes()));
                     values = values.subspan(chunk.size());
                 }
             }
@@ -75,16 +74,16 @@ namespace HDMapping::Processing
             template<typename T>
             void Scalars(std::span<T> values)
             {
-                auto bytes = std::as_writable_bytes(values);
-                if (bytes.size() > remaining_)
+                const auto size = values.size_bytes();
+                if (size > remaining_)
                 {
                     throw std::runtime_error("Truncated snapshot cloud");
                 }
-                if (!bytes.empty())
+                if (!values.empty())
                 {
-                    file_.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                    file_.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(size));
                 }
-                remaining_ -= bytes.size();
+                remaining_ -= size;
             }
 
             std::size_t Size(std::size_t element_bytes)
