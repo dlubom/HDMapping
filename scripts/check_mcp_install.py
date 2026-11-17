@@ -78,9 +78,13 @@ def main():
                        if prop["name"] == "WORKING_DIRECTORY")
             # Reuse the SDK contract and CMake's pinned Go/environment. The
             # product subprocess uses a temporary cwd and an empty PATH.
+            command[-1:] = ["-run=^TestStdioProduct$", "./cmd/mcp"]
             run(command, cwd=cwd)
-        elif executable.exists() or list(relocated.rglob("*hdmapping_mcp*")):
-            raise RuntimeError("MCP OFF unexpectedly installed the MCP executable")
+        elif executable.exists() or any(
+            next(relocated.rglob(f"*{name}*"), None)
+            for name in ("hdmapping_mcp", "hdmapping_coordinator", "hdmapping_worker")
+        ):
+            raise RuntimeError("MCP OFF unexpectedly installed an MCP runtime executable")
         print(f"PASS: MCP {args.mcp}, relocated product: {relocated}", flush=True)
 
 

@@ -214,18 +214,24 @@ BINARY_COUNT=0
 for binary in "$BUILD_BIN_DIR"/*; do
     if [ -f "$binary" ] && [ -x "$binary" ]; then
         binary_name=$(basename "$binary")
-        if [ "$binary_name" = "hdmapping_mcp" ] && ! grep -q '^1$' build/hdmapping-mcp-enabled.txt; then
-            continue
-        fi
+        case "$binary_name" in
+            hdmapping_mcp|hdmapping_coordinator|hdmapping_worker)
+                grep -q '^1$' build/hdmapping-mcp-enabled.txt || continue
+                ;;
+        esac
         cp "$binary" "$BUNDLE_DIR/bin/"
         chmod +x "$BUNDLE_DIR/bin/$binary_name"
         echo "  ✓ $binary_name"
         BINARY_COUNT=$((BINARY_COUNT + 1))
     fi
 done
-if grep -q '^1$' build/hdmapping-mcp-enabled.txt && [ ! -x "$BUNDLE_DIR/bin/hdmapping_mcp" ]; then
-    echo "Error: MCP enabled but hdmapping_mcp was not built"
-    exit 1
+if grep -q '^1$' build/hdmapping-mcp-enabled.txt; then
+    for binary_name in hdmapping_mcp hdmapping_coordinator hdmapping_worker; do
+        if [ ! -x "$BUNDLE_DIR/bin/$binary_name" ]; then
+            echo "Error: MCP enabled but $binary_name was not built"
+            exit 1
+        fi
+    done
 fi
 echo "  Total: $BINARY_COUNT executables copied"
 

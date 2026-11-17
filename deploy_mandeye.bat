@@ -65,10 +65,12 @@ set "EXPECTED=camera_lidar_calibration.exe camera_lidar_intrinsics_calib.exe cam
 rem Include MCP only for a build configured with BUILD_WITH_MCP=ON.
 findstr /X /C:"1" "%REPO_ROOT%\build\hdmapping-mcp-enabled.txt" >nul 2>nul
 if not errorlevel 1 (
-    set "EXPECTED=!EXPECTED! hdmapping_mcp.exe"
+    set "EXPECTED=!EXPECTED! hdmapping_mcp.exe hdmapping_coordinator.exe hdmapping_worker.exe"
 ) else (
     rem Do not ship a stale executable left by an earlier ON build.
-    if exist "%DEPLOY_DIR%\hdmapping_mcp.exe" del "%DEPLOY_DIR%\hdmapping_mcp.exe"
+    for %%F in (hdmapping_mcp.exe hdmapping_coordinator.exe hdmapping_worker.exe) do (
+        if exist "%DEPLOY_DIR%\%%F" del "%DEPLOY_DIR%\%%F"
+    )
 )
 
 set "MISSING="

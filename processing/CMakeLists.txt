@@ -1,0 +1,45 @@
+set(_runtime_sources
+    src/Operation.cpp
+    src/RuntimeProtocol.cpp
+    src/RuntimeReceipt.cpp
+)
+add_library(processing_ops STATIC ${_runtime_sources})
+target_include_directories(processing_ops PUBLIC include)
+target_include_directories(processing_ops SYSTEM PUBLIC "${THIRDPARTY_DIRECTORY}/json/include")
+target_link_libraries(processing_ops PRIVATE Threads::Threads)
+hdmapping_processing_target(processing_ops)
+
+if(BUILD_TESTING)
+    add_executable(processing_runtime_test tests/runtime_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_runtime_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_link_libraries(processing_runtime_test PRIVATE processing_ops)
+    hdmapping_processing_target(processing_runtime_test)
+    add_test(NAME processing-runtime COMMAND processing_runtime_test)
+    set_tests_properties(processing-runtime PROPERTIES LABELS processing-runtime TIMEOUT 45)
+    list(APPEND _runtime_sources tests/runtime_test.cpp)
+endif()
+
+if(HDMAPPING_PROCESSING_TIDY)
+    add_custom_target(processing-tidy
+        COMMAND "${HDMAPPING_PROCESSING_CLANG_TIDY}" -p "${CMAKE_BINARY_DIR}" ${_processing_tidy_args}
+            "--config-file=${CMAKE_CURRENT_SOURCE_DIR}/.clang-tidy"
+            ${_runtime_sources} "${PROJECT_SOURCE_DIR}/apps/hdmapping_worker/main.cpp"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM USES_TERMINAL)
+endif()
+
+if(HDMAPPING_PROCESSING_TIDY OR _processing_sanitizer)
+    find_program(HDMAPPING_PROCESSING_CLANG_FORMAT NAMES clang-format-21 clang-format)
+    add_custom_target(processing-check-controls
+        COMMAND "${CMAKE_COMMAND}"
+            "-DHDMAPPING_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+            "-DCONTROL_DIR=${CMAKE_CURRENT_BINARY_DIR}/negative-controls"
+            "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
+            "-DBUILD_GENERATOR=${CMAKE_GENERATOR}"
+            "-DCLANG_FORMAT=${HDMAPPING_PROCESSING_CLANG_FORMAT}"
+            "-DCLANG_TIDY=${HDMAPPING_PROCESSING_CLANG_TIDY}"
+            "-DCLANG_TIDY_SDK=${_processing_tidy_sdk}"
+            "-DCTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+            "-DSANITIZER=${_processing_sanitizer}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/controls.cmake"
+        VERBATIM USES_TERMINAL)
+endif()

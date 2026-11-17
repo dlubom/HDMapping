@@ -15,13 +15,23 @@ type serverInfo struct {
 
 // New creates the server with the version supplied by the product build.
 func New(version string) *sdk.Server {
+	return NewWithCoordinator(version, nil)
+}
+
+// NewWithCoordinator verifies the local coordinator when server_info is called.
+func NewWithCoordinator(version string, ensure func(context.Context) error) *sdk.Server {
 	server := sdk.NewServer(&sdk.Implementation{Name: "HDMapping", Version: version},
 		&sdk.ServerOptions{Capabilities: &sdk.ServerCapabilities{Tools: &sdk.ToolCapabilities{}}})
 	sdk.AddTool(server, &sdk.Tool{
 		Name:        "server_info",
 		Description: "Return the HDMapping product version and implemented capabilities.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
-	}, func(context.Context, *sdk.CallToolRequest, struct{}) (*sdk.CallToolResult, serverInfo, error) {
+	}, func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, serverInfo, error) {
+		if ensure != nil {
+			if err := ensure(ctx); err != nil {
+				return nil, serverInfo{}, err
+			}
+		}
 		return nil, serverInfo{Name: "HDMapping", Version: version, Capabilities: []string{"server_info"}}, nil
 	})
 	return server

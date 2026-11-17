@@ -87,6 +87,14 @@ jobs:
           ./macos_bundle_toolkit/create_dir_bundle_dmg.sh
           mv build/HDMapping.dmg "build/HDMapping-${VERSION}.dmg"
 
+      - name: Check relocated product from the DMG
+        run: |
+          mount_dir=$(mktemp -d)
+          hdiutil attach "build/HDMapping-${VERSION}.dmg" -readonly -nobrowse -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir"; rmdir "$mount_dir"' EXIT
+          python3 scripts/check_mcp_install.py --build-dir build --config "${BUILD_TYPE}" \
+            --mcp ${{ matrix.mcp }} --package-dir "$mount_dir/HDMapping" --package-executable bin/hdmapping_mcp
+
       - name: Upload DMG Artifact
         uses: actions/upload-artifact@v4
         with:

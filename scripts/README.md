@@ -79,12 +79,18 @@ also pass `--package-dir` and its relative `--package-executable`; the entire
 package is copied and relocated before testing. Temporary copies are removed.
 
 The existing platform workflows run ON/OFF on MCP branches and keep OFF for
-other builds. ON runs the Go quality gates; both variants build the full
-product, run CTest and check installation/relocation. Windows deployment,
-Debian package extraction and the macOS bundle are checked the same way.
-This verifies MCP packaging, not the GUI or the full processing chain.
+other builds. ON runs Go quality gates including the process tests and fuzzing
+of both the journal and IPC frame parsers. Both variants build the full product,
+run CTest and check installation/relocation. The checker starts the adapter,
+coordinator and worker from the moved Windows deploy directory, extracted DEB
+or mounted DMG with an empty product PATH. OFF checks for all three binaries.
 
-C++ P03 preparation: both existing formatting scripts include `processing/`,
-and the common build already exports `compile_commands.json`. P03 adds
-per-target warning/clang-tidy and separate ASan+UBSan/TSan CMake configurations
-when the first processing targets exist at that stage.
+P03 C++ checks run in the bundled Ubuntu workflow. Build with
+`BUILD_WITH_MCP=ON`, `BUILD_TESTING=ON`, `CMAKE_EXPORT_COMPILE_COMMANDS=ON`
+and `HDMAPPING_PROCESSING_TIDY=ON` using Ninja or Makefiles. Run
+`cmake --build build --target processing-tidy processing-check-controls`
+and `ctest --test-dir build -L processing-runtime --output-on-failure`.
+Use clang-tidy 18.1.3 on Ubuntu or 22.1.8 on macOS and clang-format 21.
+For sanitizers, configure separate Clang builds with
+`HDMAPPING_PROCESSING_SANITIZER=address-undefined` and `thread` respectively
+and run the instrumented `processing_runtime_test` and negative controls.

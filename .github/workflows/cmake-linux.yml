@@ -49,14 +49,28 @@ jobs:
     - name: Fix pkg-config visibility
       run: echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
+    - name: Install processing quality tools
+      if: matrix.mcp == 'ON'
+      run: |
+        sudo apt-get install -y --no-install-recommends clang-18 clang-tidy-18 libclang-rt-18-dev
+        python3 -m venv "$RUNNER_TEMP/processing-format"
+        "$RUNNER_TEMP/processing-format/bin/pip" install clang-format==21.1.8
+        echo "$RUNNER_TEMP/processing-format/bin" >> "$GITHUB_PATH"
+        clang++-18 --version
+        clang-tidy-18 --version
+
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }} -DHDMAPPING_MCP_RACE=${{ matrix.mcp }}
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }} -DHDMAPPING_MCP_RACE=${{ matrix.mcp }} -DCMAKE_EXPORT_COMPILE_COMMANDS=${{ matrix.mcp }} -DHDMAPPING_PROCESSING_TIDY=${{ matrix.mcp }}
 
     - name: Check MCP quality
       if: matrix.mcp == 'ON'
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls mcp-race
+
+    - name: Analyze processing targets and verify the quality gates
+      if: matrix.mcp == 'ON'
+      run: cmake --build build --target processing-tidy processing-check-controls
 
     - name: Build
       # Build your program with the given configuration
@@ -71,3 +85,18 @@ jobs:
     - name: Check installed product relocation
       run: python3 scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }}
 
+    - name: Verify ASan and UBSan
+      if: matrix.mcp == 'ON'
+      run: |
+        cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+          -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=address-undefined
+        cmake --build build-asan --target processing_runtime_test hdmapping_worker processing-check-controls --parallel 2
+        ctest --test-dir build-asan -L processing-runtime --output-on-failure
+
+    - name: Verify TSan separately
+      if: matrix.mcp == 'ON' && !cancelled()
+      run: |
+        cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+          -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=thread
+        cmake --build build-tsan --target processing_runtime_test processing-check-controls --parallel 2
+        ctest --test-dir build-tsan -L processing-runtime --output-on-failure

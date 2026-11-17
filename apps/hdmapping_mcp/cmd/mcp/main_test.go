@@ -9,11 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/protocol"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,24 +32,26 @@ func TestStdioProduct(t *testing.T) {
 	version := string(match[1])
 	executable := os.Getenv("HDMAPPING_MCP_EXECUTABLE")
 	if executable == "" {
-		name := "hdmapping_mcp"
-		if runtime.GOOS == "windows" {
-			name += ".exe"
-		}
-		executable = filepath.Join(t.TempDir(), name)
-		goExecutable := os.Getenv("HDMAPPING_GO_EXECUTABLE")
-		if goExecutable == "" {
-			goExecutable = "go"
-		}
-		build := exec.CommandContext(ctx, goExecutable, "build", "-buildvcs=false", "-ldflags=-X=main.productVersion="+version, "-o", executable, ".")
-		if output, err := build.CombinedOutput(); err != nil {
-			t.Fatalf("build MCP: %v\n%s", err, output)
-		}
+		executable, _, _ = buildTestProduct(t, ctx, version, "")
 	}
+	dir, err := protocol.ValidateDirectory(filepath.Join(t.TempDir(), "stan żółć"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := protocol.Companion(executable, "hdmapping_mcp", "hdmapping_coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := protocol.NewClient(dir, version, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stopCoordinator(t, local) })
+
 	cmd := exec.CommandContext(ctx, executable)
 	// The installed product must run without Go, Python, Node or the source cwd.
 	cmd.Dir = t.TempDir()
-	cmd.Env = append(os.Environ(), "PATH=")
+	cmd.Env = append(os.Environ(), "PATH=", "GORACE=atexit_sleep_ms=0 halt_on_error=1", "HDMAPPING_MCP_STATE_DIR="+dir)
 	var wire, logs bytes.Buffer
 	cmd.Stderr = &logs
 	stdout, err := cmd.StdoutPipe()
@@ -95,8 +97,14 @@ func TestStdioProduct(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.IsError || content.Version != version {
-		t.Fatalf("wrong product result: %s", data)
+		t.Fatalf("wrong product result: %s; tool content %v", data, result.Content)
 	}
+	var catalog []json.RawMessage
+	if err := local.Call(ctx, "operations.describe", nil, &catalog); err != nil || catalog == nil || len(catalog) != 0 {
+		coordinatorLog, _ := os.ReadFile(filepath.Join(dir, "coordinator.log"))
+		t.Fatalf("released worker catalog: %v (%v)\n%s", catalog, err, coordinatorLog)
+	}
+	t.Log("adapter, coordinator and worker started from shipped layout")
 	if logs.Len() == 0 {
 		t.Fatal("startup diagnostic missing on stderr")
 	}
