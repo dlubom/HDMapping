@@ -92,6 +92,7 @@ jobs:
           -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=address-undefined
         cmake --build build-asan --target processing_runtime_test hdmapping_worker processing-check-controls --parallel 2
         ctest --test-dir build-asan -L processing-runtime --output-on-failure
+        printf '{"type":"describe"}\n' | build-asan/bin/hdmapping_worker
 
     - name: Verify TSan separately
       if: matrix.mcp == 'ON' && !cancelled()

@@ -18,7 +18,15 @@
 
 namespace
 {
-    using ProtocolFile = std::unique_ptr<std::FILE, decltype(&std::fclose)>;
+    struct CloseProtocolFile
+    {
+        void operator()(std::FILE* file) const noexcept
+        {
+            std::fclose(file);
+        }
+    };
+
+    using ProtocolFile = std::unique_ptr<std::FILE, CloseProtocolFile>;
 
     [[noreturn]] void io_error(const char* operation)
     {
@@ -46,7 +54,7 @@ namespace
             errno = original_errno;
             io_error("open worker protocol stream");
         }
-        ProtocolFile protocol(file, &std::fclose);
+        ProtocolFile protocol(file);
         if (!SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(fd)), HANDLE_FLAG_INHERIT, 0))
         {
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "set worker stream handle flags");
@@ -74,7 +82,7 @@ namespace
             errno = original_errno;
             io_error("open worker protocol stream");
         }
-        ProtocolFile protocol(file, &std::fclose);
+        ProtocolFile protocol(file);
         if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
         {
             io_error("redirect worker output");
