@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"unicode/utf8"
 )
 
 const maxFrameSize = 1 << 20
@@ -187,6 +188,10 @@ func canonicalObject(raw json.RawMessage) (json.RawMessage, error) {
 func normalize(req SubmitRequest) (SubmitRequest, error) {
 	if req.RequestKey == "" || len(req.RequestKey) > 256 || req.Operation.Operation == "" || req.Operation.Target.StateID == "" || len(req.Operation.Target.StateID) > 256 {
 		return req, errors.New("missing or oversized request identity")
+	}
+	// JSON replaces invalid UTF-8, which would change these map keys on replay.
+	if !utf8.ValidString(req.RequestKey) || !utf8.ValidString(req.Operation.Target.StateID) {
+		return req, errors.New("request_key and state_id must be valid UTF-8")
 	}
 	if req.Source != SourceGUI && req.Source != SourceMCP {
 		return req, errors.New("invalid job source")

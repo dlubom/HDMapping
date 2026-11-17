@@ -76,6 +76,43 @@ func TestRetryAndCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSubmitRejectsNonUTF8Identity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		valid   SubmitRequest
+		invalid SubmitRequest
+	}{
+		{"request key", testRequest("key�", "state"), testRequest("key\xff", "other")},
+		{"state ID", testRequest("key", "state�"), testRequest("other", "state\xff")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, path := openTestStore(t)
+			first, err := store.Submit(ctx, tc.valid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, invalidErr := store.Submit(ctx, tc.invalid)
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenStore(path)
+			if err != nil {
+				t.Fatalf("reopen after invalid submit (%v): %v", invalidErr, err)
+			}
+			defer closeStore(t, reopened)
+			if invalidErr == nil {
+				t.Fatal("accepted an identity with invalid UTF-8")
+			}
+			retry, err := reopened.Submit(ctx, tc.valid)
+			if err != nil || retry.ID != first.ID {
+				t.Fatalf("retry with valid UTF-8 after reopening: %+v %v", retry, err)
+			}
+		})
+	}
+}
+
 func closeStore(t *testing.T, s *Store) {
 	t.Helper()
 	if err := s.Close(); err != nil {
