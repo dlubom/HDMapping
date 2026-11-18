@@ -42,7 +42,7 @@ if(BUILD_TESTING)
     add_executable(processing_publication_test tests/result_publisher_test.cpp)
     target_include_directories(processing_publication_test SYSTEM PRIVATE
         "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include" "${EIGEN3_INCLUDE_DIR}"
-        "${PROJECT_SOURCE_DIR}/shared/include")
+        "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include")
     target_link_libraries(processing_publication_test PRIVATE processing_result core_no_gui)
     hdmapping_processing_target(processing_publication_test)
     add_test(NAME processing-publication COMMAND processing_publication_test)

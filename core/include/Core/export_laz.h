@@ -142,7 +142,7 @@ public:
             return false;
         }
 
-        fprintf(stderr, "successfully written %lld points\n", p_count);
+        fprintf(stderr, "successfully written %lld points\n", static_cast<long long>(p_count));
 
         if (laszip_close_writer(writer_))
         {
@@ -355,7 +355,7 @@ inline void save_processed_pc(
         return;
     }
 
-    fprintf(stderr, "successfully written %lld points\n", p_count);
+    fprintf(stderr, "successfully written %lld points\n", static_cast<long long>(p_count));
 
     // close the writer
 
