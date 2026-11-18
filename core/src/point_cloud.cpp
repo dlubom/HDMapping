@@ -4,6 +4,7 @@
 
 #include <Core/point_cloud.h>
 #include <Core/transformations.h>
+#include <HDMapping/SessionPaths.h>
 
 #if WITH_GUI == 1
 #include <GL/freeglut.h>
@@ -92,7 +93,7 @@ bool PointCloud::load(const std::string& file_name)
     return true;
 }
 
-bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mode)
+bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mode, bool utf8_path)
 {
     double min_ts = std::numeric_limits<double>::max();
     double max_ts = std::numeric_limits<double>::lowest();
@@ -114,9 +115,15 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         }
         laszip_destroy(reader);
     };
+    std::ifstream input;
     const std::unique_ptr<void, decltype(destroy_reader)> owner(laszip_reader, destroy_reader);
     laszip_BOOL is_compressed = 0;
-    if (laszip_open_reader(laszip_reader, input_file_name.c_str(), &is_compressed))
+    if (utf8_path)
+    {
+        input.open(sessionPathFromText(input_file_name), std::ios::binary);
+    }
+    if (utf8_path ? (!input || laszip_open_reader_stream(laszip_reader, input, &is_compressed) != 0)
+                  : laszip_open_reader(laszip_reader, input_file_name.c_str(), &is_compressed) != 0)
     {
         spdlog::error(":DLL ERROR: opening laszip reader for '{}'", input_file_name);
         return false;

@@ -13,23 +13,24 @@
 // Path to write into session_file for `path`: relative to the session file's
 // folder with '/' separators, or absolute when there is no relative path (e.g.
 // another drive on Windows). An empty path stays empty.
-inline std::string toSessionPath(const std::string& path, const std::string& session_file)
+inline std::filesystem::path sessionPathRelativeTo(const std::filesystem::path& path, const std::filesystem::path& session_file)
 {
     namespace fs = std::filesystem;
     if (path.empty())
-    {
         return path;
-    }
     std::error_code ec_path;
     std::error_code ec_session;
     const fs::path absolute_path = fs::absolute(path, ec_path).lexically_normal();
     const fs::path session_dir = fs::absolute(session_file, ec_session).parent_path().lexically_normal();
     if (ec_path || ec_session)
-    {
-        return fs::path(path).generic_string();
-    }
+        return path;
     const fs::path relative_path = absolute_path.lexically_relative(session_dir);
-    return (relative_path.empty() ? absolute_path : relative_path).generic_string();
+    return relative_path.empty() ? absolute_path : relative_path;
+}
+
+inline std::string toSessionPath(const std::string& path, const std::string& session_file)
+{
+    return sessionPathRelativeTo(path, session_file).generic_string();
 }
 
 // Absolute path for a path read from session_file. Relative paths resolve
@@ -53,4 +54,28 @@ inline std::string resolveSessionPath(const std::string& stored_path, const std:
         return resolved.string();
     }
     return (session_dir / path.filename()).string();
+}
+
+// Native JSON references are UTF-8, including on Windows where path::string uses the system code page.
+inline std::string sessionPathText(const std::filesystem::path& path)
+{
+    const auto bytes = path.generic_u8string();
+    return { bytes.begin(), bytes.end() };
+}
+
+inline std::filesystem::path sessionPathFromText(const std::string& text)
+{
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
+inline std::filesystem::path sessionTrajectoryPath(const std::filesystem::path& cloud)
+{
+    const auto stem = sessionPathText(cloud.stem());
+    const auto end = stem.find_last_not_of('_');
+    if (end == std::string::npos)
+    {
+        return {};
+    }
+    const auto start = stem.rfind('_', end) + 1;
+    return cloud.parent_path() / sessionPathFromText("trajectory_lio_" + stem.substr(start, end - start + 1) + ".csv");
 }

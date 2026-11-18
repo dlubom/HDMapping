@@ -17,6 +17,14 @@ target_link_libraries(processing_session_snapshot PUBLIC processing_ops)
 hdmapping_processing_target(processing_session_snapshot)
 list(APPEND _runtime_sources src/SessionSnapshot.cpp)
 
+add_library(processing_result STATIC src/ResultPublisher.cpp src/NativeSessionResult.cpp)
+target_include_directories(processing_result SYSTEM PRIVATE
+    "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include" "${EIGEN3_INCLUDE_DIR}")
+target_compile_definitions(processing_result PRIVATE WITH_GUI=0)
+target_link_libraries(processing_result PUBLIC processing_ops)
+hdmapping_processing_target(processing_result)
+list(APPEND _runtime_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp)
+
 if(BUILD_TESTING)
     add_executable(processing_runtime_test tests/runtime_test.cpp tests/runtime_test_main.cpp)
     target_include_directories(processing_runtime_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
@@ -31,7 +39,20 @@ if(BUILD_TESTING)
     hdmapping_processing_target(processing_snapshot_test)
     add_test(NAME processing-snapshot COMMAND processing_snapshot_test)
     set_tests_properties(processing-snapshot PROPERTIES LABELS processing-snapshot TIMEOUT 45)
-    list(APPEND _runtime_sources tests/runtime_test.cpp tests/snapshot_store_test.cpp tests/snapshot_test_main.cpp)
+    add_executable(processing_publication_test tests/result_publisher_test.cpp)
+    target_include_directories(processing_publication_test SYSTEM PRIVATE
+        "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include" "${EIGEN3_INCLUDE_DIR}"
+        "${PROJECT_SOURCE_DIR}/shared/include")
+    target_link_libraries(processing_publication_test PRIVATE processing_result core_no_gui)
+    hdmapping_processing_target(processing_publication_test)
+    add_test(NAME processing-publication COMMAND processing_publication_test)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME processing-publication-process
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/result_publication_process.py"
+            "$<TARGET_FILE:processing_publication_test>")
+    set_tests_properties(processing-publication processing-publication-process
+        PROPERTIES LABELS processing-publication TIMEOUT 90)
+    list(APPEND _runtime_sources tests/runtime_test.cpp tests/snapshot_store_test.cpp tests/snapshot_test_main.cpp tests/result_publisher_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

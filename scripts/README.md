@@ -108,3 +108,10 @@ an existing parent, start `multi_view_tls_registration_step_2 session.mjs`,
 and press F9 in the loaded window. Close the window and use
 `processing_snapshot_test --read-gui-snapshot <directory>` to check the
 snapshot in a fresh headless process.
+
+For P05 build `processing_publication_test` with MCP and testing enabled.
+`ctest --test-dir build -L processing-publication --output-on-failure` runs the
+publication contracts and a Python 3 subprocess test. The test binary also
+provides `--publish <session.mjs> <destination> <attempt-id>`,
+`--export <published-directory> <destination>` and `--read <published-directory>`
+for a native session round trip on an existing dataset.

@@ -1,6 +1,7 @@
 #include <HDMapping/Processing/SnapshotStore.h>
 
 #include "SessionSnapshotPaths.h"
+#include "SnapshotStorage.h"
 
 #include <array>
 #include <fstream>
@@ -18,6 +19,40 @@ namespace HDMapping::Processing
 {
     namespace fs = std::filesystem;
     using nlohmann::json;
+
+    void SyncSnapshotPath(const fs::path& path, bool directory)
+    {
+#ifdef _WIN32
+        if (directory)
+        {
+            return; // Publication uses a write-through move on Windows.
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            throw fs::filesystem_error(
+                "Open snapshot input for sync", path, std::error_code(static_cast<int>(GetLastError()), std::system_category()));
+        }
+        const auto status = FlushFileBuffers(file) ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(file);
+        if (status != ERROR_SUCCESS)
+        {
+            throw fs::filesystem_error("Sync snapshot input", path, std::error_code(static_cast<int>(status), std::system_category()));
+        }
+#else
+        const int file = open(path.c_str(), (directory ? O_RDONLY | O_DIRECTORY : O_RDONLY) | O_CLOEXEC);
+        if (file < 0)
+        {
+            throw fs::filesystem_error("Open snapshot input for sync", path, std::error_code(errno, std::generic_category()));
+        }
+        const auto status = fsync(file) == 0 ? 0 : errno;
+        close(file);
+        if (status != 0)
+        {
+            throw fs::filesystem_error("Sync snapshot input", path, std::error_code(status, std::generic_category()));
+        }
+#endif
+    }
 
     namespace
     {
@@ -112,40 +147,6 @@ namespace HDMapping::Processing
             return { { "size", size }, { "fnv1a64", hash } };
         }
 
-        void sync_path(const fs::path& path, bool directory)
-        {
-#ifdef _WIN32
-            if (directory)
-            {
-                return; // Publication uses a write-through move on Windows.
-            }
-            HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (file == INVALID_HANDLE_VALUE)
-            {
-                throw fs::filesystem_error(
-                    "Open snapshot input for sync", path, std::error_code(static_cast<int>(GetLastError()), std::system_category()));
-            }
-            const auto status = FlushFileBuffers(file) ? ERROR_SUCCESS : GetLastError();
-            CloseHandle(file);
-            if (status != ERROR_SUCCESS)
-            {
-                throw fs::filesystem_error("Sync snapshot input", path, std::error_code(static_cast<int>(status), std::system_category()));
-            }
-#else
-            const int file = open(path.c_str(), (directory ? O_RDONLY | O_DIRECTORY : O_RDONLY) | O_CLOEXEC);
-            if (file < 0)
-            {
-                throw fs::filesystem_error("Open snapshot input for sync", path, std::error_code(errno, std::generic_category()));
-            }
-            const auto status = fsync(file) == 0 ? 0 : errno;
-            close(file);
-            if (status != 0)
-            {
-                throw fs::filesystem_error("Sync snapshot input", path, std::error_code(status, std::generic_category()));
-            }
-#endif
-        }
-
         class Stage
         {
         public:
@@ -184,7 +185,7 @@ namespace HDMapping::Processing
                 fs::rename(path, destination);
 #endif
                 path = destination;
-                sync_path(destination.parent_path(), true);
+                SyncSnapshotPath(destination.parent_path(), true);
                 published = true;
             }
 
@@ -215,7 +216,7 @@ namespace HDMapping::Processing
                     files[path_text(relative)] = fingerprint(input.path(), stop);
                     if (capture)
                     {
-                        sync_path(input.path(), false);
+                        SyncSnapshotPath(input.path(), false);
                     }
                 }
             }
@@ -223,7 +224,7 @@ namespace HDMapping::Processing
             {
                 for (auto it = directories.rbegin(); it != directories.rend(); ++it)
                 {
-                    sync_path(*it, true);
+                    SyncSnapshotPath(*it, true);
                 }
             }
             return files;
@@ -340,8 +341,8 @@ namespace HDMapping::Processing
             output.exceptions(std::ios::failbit | std::ios::badbit);
             output << manifest;
             output.close();
-            sync_path(manifest_path, false);
-            sync_path(stage.path, true);
+            SyncSnapshotPath(manifest_path, false);
+            SyncSnapshotPath(stage.path, true);
             if (source.Target() != target)
             {
                 return error("revision_conflict", "Capture target changed during handoff");

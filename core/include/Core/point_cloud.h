@@ -156,7 +156,7 @@ public:
     bool fixed_ka = false;
 
     bool load(const std::string& file_name);
-    bool load_pc(const std::string& input_file_name, bool load_cache_mode);
+    bool load_pc(const std::string& input_file_name, bool load_cache_mode, bool utf8_path = false);
     void update_from_gui();
     bool save_as_global(const std::string& file_name);
     // rgd

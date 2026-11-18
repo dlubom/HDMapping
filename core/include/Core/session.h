@@ -40,6 +40,8 @@ public:
         const std::string& file_name, const std::string& poses_file_name, const std::string& initial_poses_file_name, bool is_subsession);
     //! Use the native session metadata codec with private snapshot scan paths relative to the entry.
     bool load_snapshot_metadata(const std::filesystem::path& file);
+    //! Read the complete native MJS with strict paths and complete pose coverage.
+    bool load_published(const std::filesystem::path& file);
     bool save_snapshot_metadata(const std::filesystem::path& file, const std::string& poses, const std::string& initial_poses);
 
     void fill_session_from_worker_data(
@@ -57,7 +59,8 @@ private:
         double bucket_y,
         double bucket_z,
         bool calculate_offset,
-        bool metadata_only);
+        bool metadata_only,
+        bool strict_paths = false);
     bool save_impl(
         const std::filesystem::path& file,
         const std::string& poses,
