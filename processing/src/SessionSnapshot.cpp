@@ -237,12 +237,20 @@ namespace HDMapping::Processing
             {
                 return OperationError{ "cancelled", "Snapshot capture cancelled", json::object() };
             }
-            if (session_->load_cache_mode && scan.points_local.empty() && !scan.laz_in_memory_only)
+            if (scan.deferred_points)
             {
-                PointCloud cached;
-                if (!cached.load_pc(scan.file_name, true))
+                const auto& deferred = *scan.deferred_points;
+                if (deferred.format == PointCloud::DeferredPoints::Format::Ply)
                 {
-                    return OperationError{ "snapshot_capture_failed", "Could not read cached cloud: " + scan.file_name, json::object() };
+                    return OperationError{ "snapshot_capture_failed",
+                                           "Load the RESSO point clouds before capturing a snapshot",
+                                           json::object() };
+                }
+                PointCloud cached;
+                const auto file_name = deferred.source.string();
+                if (!cached.load_pc(file_name, true))
+                {
+                    return OperationError{ "snapshot_capture_failed", "Could not read cached cloud: " + file_name, json::object() };
                 }
                 write_cloud(path, scan, cached, context.stop);
             }

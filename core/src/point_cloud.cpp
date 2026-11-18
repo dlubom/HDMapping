@@ -88,6 +88,7 @@ bool PointCloud::load(const std::string& file_name)
 
 #endif
     std::cout << "File: '" << file_name << "' loaded" << std::endl;
+    deferred_points.reset();
     return true;
 }
 
@@ -214,6 +215,7 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
     // std::cout << "min_ts " << min_ts << std::endl;
     // std::cout << "max_ts " << max_ts << std::endl;
     // std::cout << "number_of_points_with_timestamp_eq_0: " << number_of_points_with_timestamp_eq_0 << std::endl;
+    deferred_points.reset();
     return true;
 }
 

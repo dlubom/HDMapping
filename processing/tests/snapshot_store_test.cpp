@@ -153,10 +153,14 @@ TEST_CASE("Session snapshot retains unsaved poses, constraints, CP/GCP and a RAM
     gcp.lidar_height_above_ground = 0.177;
     const auto cache = scratch.path / "transient-cache.laz";
     REQUIRE(exportLaz(cache.string(), { Eigen::Vector3d(10, 20, 30) }, { 31 }, { 151.25 }));
-    auto& cached_scan = session->point_clouds_container.point_clouds.emplace_back();
-    cached_scan.file_name = cache.string();
-    cached_scan.m_initial_pose = Eigen::Affine3d::Identity();
     session->load_cache_mode = true;
+    PointClouds deferred_scans;
+    REQUIRE(deferred_scans.load_whu_tls({ cache.string() }, false, 0, 0, 0, false, session->load_cache_mode));
+    REQUIRE(deferred_scans.point_clouds.front().points_local.empty());
+    deferred_scans.point_clouds.front().m_initial_pose = Eigen::Affine3d::Identity();
+    deferred_scans.point_clouds.front().file_name = (scratch.path / "renamed.laz").string();
+    session->point_clouds_container.point_clouds.push_back(std::move(deferred_scans.point_clouds.front()));
+    session->load_cache_mode = false;
     const TargetRef target{ "session-test", 51 };
     const nlohmann::json parameters{ { "iterations", 179 }, { "radius", 0.681 } };
     RunContext context{};
@@ -212,6 +216,35 @@ TEST_CASE("Session snapshot retains unsaved poses, constraints, CP/GCP and a RAM
     CHECK(restored_cache.timestamps == std::vector<double>{ 151.25e9 });
     fs::remove(snapshot.manifest_path.parent_path() / "cloud_0.bin");
     CHECK(ValidateSnapshot(snapshot).has_value());
+}
+
+TEST_CASE("Session snapshot rejects deferred RESSO geometry instead of publishing an empty scan")
+{
+    Scratch scratch;
+    const auto cloud = scratch.path / "scan.ply";
+    std::ofstream(cloud) << "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\n"
+                            "end_header\n1 2 3\n";
+    const auto poses = scratch.path / "source.reg";
+    std::ofstream(poses) << "1\nscan.ply\n1 0 0 0\n0 1 0 0\n0 0 1 0\n\n";
+
+    auto session = std::make_shared<Session>();
+    REQUIRE(session->point_clouds_container.load(scratch.path.string(), poses.string(), false, 0, 0, 0, true));
+    REQUIRE(session->point_clouds_container.point_clouds.front().points_local.empty());
+    const TargetRef target{ "resso", 1 };
+    SessionCaptureSource source(
+        session,
+        [target]
+        {
+            return target;
+        },
+        nlohmann::json::object());
+    RunContext context{};
+    const auto destination = scratch.path / "snapshot";
+    const auto capture = CaptureSnapshot(source, target.revision, destination, context);
+    REQUIRE(std::holds_alternative<OperationError>(capture));
+    CHECK(std::get<OperationError>(capture).code == "snapshot_capture_failed");
+    CHECK_FALSE(fs::exists(destination));
+    CHECK_FALSE(fs::exists(scratch.path / "snapshot.preparing"));
 }
 
 TEST_CASE("Preparing and another job's owned files cannot be submitted as snapshots")

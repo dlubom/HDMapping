@@ -115,6 +115,12 @@ bool PointClouds::load(
                 sum_points_after_decimation += pc.points_local.size();
             }
         }
+        else
+        {
+            pc.deferred_points =
+                PointCloud::DeferredPoints{ PointCloud::DeferredPoints::Format::Ply,
+                                            std::filesystem::absolute(std::filesystem::path(folder_with_point_clouds) / pc.file_name) };
+        }
 
         point_clouds.push_back(pc);
     }
@@ -1120,6 +1126,11 @@ bool PointClouds::load_whu_tls(
         auto& pc = point_clouds_nodata[i]; // reference directly to vector slot
 
         pc.file_name = input_file_names[i];
+        if (load_cache_mode)
+        {
+            pc.deferred_points =
+                PointCloud::DeferredPoints{ PointCloud::DeferredPoints::Format::Las, std::filesystem::absolute(input_file_names[i]) };
+        }
         //---
         std::filesystem::path path = std::filesystem::path(pc.file_name);
 

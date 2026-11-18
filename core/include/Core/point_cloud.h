@@ -2,6 +2,8 @@
 
 #include <Eigen/Eigen>
 
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -67,6 +69,18 @@ public:
         Eigen::Vector3d imu_diff_angle_om_fi_ka_deg = Eigen::Vector3d::Zero();
     };
 
+    struct DeferredPoints
+    {
+        enum class Format
+        {
+            Ply,
+            Las
+        };
+
+        Format format;
+        std::filesystem::path source;
+    };
+
     PointCloud()
     {
         m_pose = Eigen::Affine3d::Identity();
@@ -88,6 +102,8 @@ public:
     std::vector<PointBucketIndexPair> index_pairs;
     std::vector<Bucket> buckets;
     std::string file_name;
+    //! Source of points skipped by the native loader, until it reads the geometry.
+    std::optional<DeferredPoints> deferred_points;
     // True when file_name does not exist on disk yet (e.g. scan imported from E57);
     // "Save session as" in step 2 exports the cloud as .laz next to the session.
     bool laz_in_memory_only = false;
