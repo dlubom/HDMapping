@@ -73,7 +73,12 @@ namespace HDMapping::Processing
             const auto normalize_inventory = [&owned](json& inventory)
             {
                 const auto snapshot = owned(inventory.at("snapshot").at("manifest_path"));
-                for (auto& file : inventory.at("files").get_ref<json::array_t&>())
+                auto& files = inventory.at("files");
+                if (!files.is_array())
+                {
+                    throw std::invalid_argument("Expected an array of files in the result inventory");
+                }
+                for (auto& file : files)
                 {
                     owned(file);
                 }
