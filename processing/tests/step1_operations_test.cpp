@@ -131,6 +131,21 @@ TEST_CASE("A cancelled Step 1 operation yields a structured error and no output"
     CHECK(fs::is_empty(scratch.path));
 }
 
+TEST_CASE("Legacy IMU newline retains the final zero-time update")
+{
+    Scratch scratch;
+    const auto input = scratch.path / "imu0000.csv";
+    std::ofstream(input) << "1000000000 1 2 3 4 5 6 0\n";
+    const auto with_newline = load_imu(input.string(), 0, true);
+    REQUIRE(with_newline.size() == 2);
+    CHECK(std::get<0>(with_newline.front()) == std::get<0>(with_newline.back()));
+    CHECK(std::get<1>(with_newline.front()).x() == std::get<1>(with_newline.back()).x());
+
+    std::ofstream(input) << "1000000000 1 2 3 4 5 6 0";
+    const auto without_newline = load_imu(input.string(), 0, true);
+    CHECK(without_newline.size() == 1);
+}
+
 TEST_CASE("Preparation rejects an empty set of usable LiDAR windows")
 {
     Scratch scratch;

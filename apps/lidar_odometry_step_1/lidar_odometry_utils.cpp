@@ -468,8 +468,10 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
             std::ifstream myfile(imu_file);
             if (myfile.is_open())
             {
+                bool repeatLastSample = false;
                 for (std::string line; std::getline(myfile, line);)
                 {
+                    repeatLastSample = false;
                     if (stop.stop_requested())
                         return {};
                     double data[7];
@@ -499,7 +501,16 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
                         if (validate && (!std::isfinite(data[0]) || !std::isfinite(timestampUnix) || !gyr.allFinite() || !acc.allFinite()))
                             throw std::invalid_argument("Non-finite legacy IMU sample");
                         all_data.emplace_back(std::pair(data[0] / 1e9, timestampUnix / 1e9), gyr, acc);
+                        repeatLastSample = imuId == 0 && !myfile.eof();
                     }
+                }
+                // Legacy odometry revisits the last IMU 0 sample at the closing newline.
+                // Preserve the zero-time AHRS update using the parsed sample.
+                if (repeatLastSample)
+                {
+                    auto sample = all_data.back();
+                    std::get<0>(sample).second = 0.0;
+                    all_data.push_back(std::move(sample));
                 }
                 myfile.close();
             }
