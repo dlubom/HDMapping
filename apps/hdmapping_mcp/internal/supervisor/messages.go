@@ -13,6 +13,8 @@ type command struct {
 	ID        jobs.JobID             `json:"job_id,omitempty"`
 	Operation *jobs.OperationRequest `json:"operation,omitempty"`
 	Snapshot  *jobs.SnapshotRef      `json:"snapshot,omitempty"`
+	Recording *jobs.Step1Recording   `json:"recording,omitempty"`
+	Directory string                 `json:"directory,omitempty"`
 }
 
 type event struct {
@@ -20,6 +22,7 @@ type event struct {
 	Type       string              `json:"type"`
 	Progress   *jobs.ProgressEvent `json:"progress,omitempty"`
 	Operations json.RawMessage     `json:"operations,omitempty"`
+	Snapshot   *jobs.SnapshotRef   `json:"snapshot,omitempty"`
 	Error      *jobs.JobError      `json:"error,omitempty"`
 }
 

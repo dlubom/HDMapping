@@ -193,36 +193,6 @@ namespace HDMapping::Processing
             }
         };
 
-        void move_path(const fs::path& from, const fs::path& to, bool replace)
-        {
-#ifdef _WIN32
-            const DWORD flags = MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0);
-            if (!MoveFileExW(from.c_str(), to.c_str(), flags))
-            {
-                throw fs::filesystem_error(
-                    "Commit published result", from, to, { static_cast<int>(GetLastError()), std::system_category() });
-            }
-#else
-            if (replace)
-            {
-                fs::rename(from, to);
-                return;
-            }
-#if defined(__APPLE__)
-            if (renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0)
-#elif defined(__linux__)
-            if (renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0)
-#else
-            errno = ENOTSUP;
-            if (false)
-#endif
-            {
-                return;
-            }
-            throw fs::filesystem_error("Move published result without overwrite", from, to, { errno, std::generic_category() });
-#endif
-        }
-
         void write_manifest(const fs::path& path, const std::string& text)
         {
             std::ofstream output(path, std::ios::binary);
@@ -259,14 +229,14 @@ namespace HDMapping::Processing
             return id;
         }
 
-        std::pair<ArtifactManifest, SnapshotContents> read_artifact(const fs::path& root, const std::string& id)
+        std::pair<ArtifactManifest, SnapshotContents> read_artifact(const fs::path& root, const std::string& id, std::stop_token stop = {})
         {
             const auto path = root / snapshot_manifest;
             const auto header = read_json(path, snapshot_limit);
             const auto& target = header.at("target");
             const TargetRef identity{ target.at("state_id").get<std::string>(), target.at("revision").get<std::uint64_t>() };
             SnapshotRef ref{ path, identity };
-            auto snapshot = ReadSnapshot(ref);
+            auto snapshot = ReadSnapshot(ref, stop);
             if (const auto* error = std::get_if<OperationError>(&snapshot))
             {
                 throw std::runtime_error(error->message);
@@ -298,10 +268,10 @@ namespace HDMapping::Processing
                 return artifact.target;
             }
 
-            CaptureResult Materialize(const fs::path& directory, RunContext&) override
+            CaptureResult Materialize(const fs::path& directory, RunContext& context) override
             {
-                const auto copied = CopyNativeSession(contents, artifact, directory);
-                if (const auto error = ValidateSnapshot(artifact.snapshot))
+                const auto copied = CopyNativeSession(contents, artifact, directory, context.stop);
+                if (const auto error = ValidateSnapshot(artifact.snapshot, context.stop))
                 {
                     return *error;
                 }
@@ -325,6 +295,35 @@ namespace HDMapping::Processing
             return base / named(stage_prefix, id);
         }
     } // namespace
+
+    void MovePublishedPath(const fs::path& from, const fs::path& to, bool replace)
+    {
+#ifdef _WIN32
+        const DWORD flags = MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!MoveFileExW(from.c_str(), to.c_str(), flags))
+        {
+            throw fs::filesystem_error("Commit published result", from, to, { static_cast<int>(GetLastError()), std::system_category() });
+        }
+#else
+        if (replace)
+        {
+            fs::rename(from, to);
+            return;
+        }
+#if defined(__APPLE__)
+        if (renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0)
+#elif defined(__linux__)
+        if (renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0)
+#else
+        errno = ENOTSUP;
+        if (false)
+#endif
+        {
+            return;
+        }
+        throw fs::filesystem_error("Move published result without overwrite", from, to, { errno, std::generic_category() });
+#endif
+    }
 
     RunResult PublishResult(
         const fs::path& staging_directory, const fs::path& destination, const PublishOptions& options, const PublicationIO& io)
@@ -408,7 +407,7 @@ namespace HDMapping::Processing
 
     RunResult PublishResult(const fs::path& stage, const fs::path& destination, const PublishOptions& options)
     {
-        return PublishResult(stage, destination, options, { write_manifest, move_path });
+        return PublishResult(stage, destination, options, { write_manifest, MovePublishedPath });
     }
 
     std::optional<OperationError> DiscardResultStaging(const fs::path& staging_directory, const fs::path& destination)
@@ -505,7 +504,7 @@ namespace HDMapping::Processing
         }
     }
 
-    RunResult ExportComplete(const ArtifactManifest& source, const fs::path& destination)
+    RunResult ExportComplete(const ArtifactManifest& source, const fs::path& destination, std::stop_token stop)
     {
         try
         {
@@ -519,7 +518,7 @@ namespace HDMapping::Processing
             {
                 throw std::invalid_argument("Complete export requires a published artifact");
             }
-            const auto [artifact, contents] = read_artifact(root, source.artifact_id);
+            const auto [artifact, contents] = read_artifact(root, source.artifact_id, stop);
             if (artifact.snapshot.manifest_path != source.snapshot.manifest_path || artifact.snapshot.target != source.snapshot.target ||
                 artifact.target != source.target || artifact.files != source.files || artifact.dependencies != source.dependencies)
             {
@@ -528,12 +527,17 @@ namespace HDMapping::Processing
             ValidateNativeSessionReferences(contents, artifact);
 
             CompleteExport export_source(artifact, contents);
-            RunContext context{};
+            RunContext context{ {}, stop, {} };
             const auto stage = export_stage(final.parent_path());
             auto captured = CaptureSnapshot(export_source, artifact.target.revision, stage, context);
             if (const auto* error = std::get_if<OperationError>(&captured))
             {
                 return *error;
+            }
+            if (stop.stop_requested())
+            {
+                DiscardResultStaging(stage, final);
+                return OperationError{ "cancelled", "Complete export cancelled", json::object() };
             }
             return PublishResult(stage, final);
         } catch (const PublicationConflict& error)
@@ -541,7 +545,7 @@ namespace HDMapping::Processing
             return failure("publication_conflict", error);
         } catch (const std::exception& error)
         {
-            return failure("complete_export_failed", error);
+            return failure(stop.stop_requested() ? "cancelled" : "complete_export_failed", error);
         }
     }
 } // namespace HDMapping::Processing

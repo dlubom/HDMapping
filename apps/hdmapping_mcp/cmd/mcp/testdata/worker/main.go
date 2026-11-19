@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
@@ -37,12 +38,21 @@ func main() {
 		ID        jobs.JobID            `json:"job_id"`
 		Operation jobs.OperationRequest `json:"operation"`
 		Snapshot  jobs.SnapshotRef      `json:"snapshot"`
+		Directory string                `json:"directory"`
+		Recording struct {
+			Directory string `json:"directory"`
+			TOML      string `json:"toml"`
+		} `json:"recording"`
 	}
 	if err := protocol.ReadFrame(reader, &command); err != nil {
 		os.Exit(3)
 	}
 	if command.Type == "describe" {
-		write(map[string]any{"type": "operations", "operations": []any{}})
+		var operations []map[string]string
+		for _, id := range []string{"step1.consistency", "step1.export", "step1.load", "step1.odometry", "step1.prepare", "step1.reference", "step1.save"} {
+			operations = append(operations, map[string]string{"id": id})
+		}
+		write(map[string]any{"type": "operations", "operations": operations})
 		return
 	}
 	if command.Type == "validate_snapshot" {
@@ -57,9 +67,23 @@ func main() {
 		write(map[string]any{"type": "snapshot_validated"})
 		return
 	}
-	if command.Operation.Operation == "durable" {
+	if command.Type == "capture_step1_recording" {
+		if !filepath.IsAbs(command.Recording.Directory) || command.Recording.TOML != filepath.Join(command.Recording.Directory, "parking.toml") {
+			os.Exit(9)
+		}
+		if err := os.Mkdir(command.Directory, 0700); err != nil {
+			os.Exit(10)
+		}
+		path := filepath.Join(command.Directory, "snapshot.json")
+		if err := os.WriteFile(path, []byte(`{"fixture_complete":true}`), 0600); err != nil {
+			os.Exit(11)
+		}
+		write(map[string]any{"type": "snapshot_captured", "snapshot": jobs.SnapshotRef{ManifestPath: path, Target: command.Operation.Target}})
+		return
+	}
+	if command.Operation.Operation == "durable" || command.Operation.Operation == "step1.prepare" {
 		command.Snapshot.ManifestPath = "snapshot.json"
-		if err := os.WriteFile("snapshot.json", []byte("{}"), 0600); err != nil {
+		if err := os.WriteFile("snapshot.json", []byte(`{"fixture_complete":true}`), 0600); err != nil {
 			os.Exit(8)
 		}
 		file, err := os.OpenFile("result.json", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
@@ -77,6 +101,10 @@ func main() {
 			os.Exit(6)
 		}
 		progress("durable")
+		if command.Operation.Operation == "step1.prepare" {
+			write(map[string]any{"type": "completed"})
+			return
+		}
 	} else {
 		progress("ready")
 	}

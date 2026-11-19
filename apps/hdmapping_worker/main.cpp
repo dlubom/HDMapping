@@ -1,5 +1,7 @@
 #include <HDMapping/Processing/RuntimeProtocol.h>
 
+#include "recording_capture.h"
+
 #include <cerrno>
 #include <cstdio>
 #include <iostream>
@@ -120,7 +122,13 @@ int main()
             { HDMAPPING_WORKER_VERSION, process_id() },
             std::filesystem::current_path(),
             DescribeOperations(),
-            ExecuteOperation);
+            ExecuteOperation,
+            [](const TargetRef& target, const std::filesystem::path& recording, const std::filesystem::path& toml, RunContext& context)
+            {
+                RecordingCapture source(target, recording, toml);
+                return CaptureSnapshot(source, target.revision, context.output_directory, context);
+            },
+            CaptureStep1References);
         return 0;
     } catch (const std::exception& error)
     {

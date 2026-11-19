@@ -18,6 +18,8 @@ namespace HDMapping::Processing
         //! Pin the current input on the window thread. Materialize and destruction may run on a worker.
         std::function<std::unique_ptr<CaptureSource>(TargetRef)> PinCapture;
         std::function<std::optional<OperationError>(const ArtifactManifest&)> ApplyResult;
+        //! Pin operation-specific inputs on the window thread when supported by this application.
+        std::function<std::unique_ptr<CaptureSource>(const OperationRequest&)> PinOperationCapture = {};
     };
 
     using GuiResponse = std::variant<nlohmann::json, OperationError>;

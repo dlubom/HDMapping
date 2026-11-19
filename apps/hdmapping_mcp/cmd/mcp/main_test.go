@@ -9,10 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/protocol"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -31,7 +33,8 @@ func TestStdioProduct(t *testing.T) {
 	}
 	version := string(match[1])
 	executable := os.Getenv("HDMAPPING_MCP_EXECUTABLE")
-	if executable == "" {
+	shipped := executable != ""
+	if !shipped {
 		executable, _, _ = buildTestProduct(t, ctx, version, "")
 	}
 	dir, err := protocol.ValidateDirectory(filepath.Join(t.TempDir(), "stan żółć"))
@@ -77,6 +80,29 @@ func TestStdioProduct(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, callErr := client.CallTool(ctx, &sdk.CallToolParams{Name: "server_info", Arguments: map[string]any{}})
+	catalogResult, catalogErr := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_step1_operations", Arguments: map[string]any{}})
+	if catalogErr != nil || catalogResult.IsError {
+		t.Fatalf("call Step 1 catalog: %v (%v)", catalogErr, catalogResult)
+	}
+	if shipped {
+		input := map[string]any{"request_key": "empty-step1", "recording": map[string]string{"directory": t.TempDir()}}
+		operation, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "step1_odometry", Arguments: input})
+		if err != nil || operation.IsError {
+			t.Fatalf("submit empty Step 1 recording: %v (%v)", err, operation)
+		}
+		raw, err := json.Marshal(operation.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var job jobs.JobRecord
+		if err := json.Unmarshal(raw, &job); err != nil || job.ID == "" {
+			t.Fatalf("decode Step 1 submission: %v (%s)", err, raw)
+		}
+		rejected := waitJob(t, ctx, local, job.ID, "", jobs.Failed)
+		if rejected.Error == nil || rejected.Error.OperationCode != "invalid_input" || rejected.Result != nil {
+			t.Fatalf("expected a structured Step 1 input error: %+v", rejected)
+		}
+	}
 	info := client.InitializeResult()
 	closeErr := client.Close()
 	waitErr := cmd.Wait()
@@ -99,10 +125,23 @@ func TestStdioProduct(t *testing.T) {
 	if result.IsError || content.Version != version {
 		t.Fatalf("wrong product result: %s; tool content %v", data, result.Content)
 	}
-	var catalog []json.RawMessage
-	if err := local.Call(ctx, "operations.describe", nil, &catalog); err != nil || catalog == nil || len(catalog) != 0 {
-		coordinatorLog, _ := os.ReadFile(filepath.Join(dir, "coordinator.log"))
-		t.Fatalf("released worker catalog: %v (%v)\n%s", catalog, err, coordinatorLog)
+	var catalog struct {
+		Operations []struct{ ID string }
+	}
+	data, err = json.Marshal(catalogResult.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, operation := range catalog.Operations {
+		ids = append(ids, operation.ID)
+	}
+	sort.Strings(ids)
+	if strings.Join(ids, " ") != "step1.consistency step1.export step1.load step1.odometry step1.prepare step1.reference step1.save" {
+		t.Fatalf("released worker has wrong operations: %v", ids)
 	}
 	t.Log("adapter, coordinator and worker started from shipped layout")
 	if logs.Len() == 0 {

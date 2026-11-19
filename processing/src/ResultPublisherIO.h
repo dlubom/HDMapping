@@ -11,6 +11,9 @@ namespace HDMapping::Processing
         void (*move)(const std::filesystem::path&, const std::filesystem::path&, bool replace);
     };
 
+    //! Commit a same-filesystem staging file or directory with native no-replace semantics.
+    void MovePublishedPath(const std::filesystem::path& source, const std::filesystem::path& destination, bool replace);
+
     RunResult PublishResult(
         const std::filesystem::path& staging_directory,
         const std::filesystem::path& destination,

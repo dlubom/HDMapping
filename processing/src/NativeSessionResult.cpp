@@ -162,13 +162,20 @@ namespace HDMapping::Processing
         }
     }
 
-    SnapshotContents CopyNativeSession(const SnapshotContents& source, const ArtifactManifest& manifest, const fs::path& directory)
+    SnapshotContents CopyNativeSession(
+        const SnapshotContents& source, const ArtifactManifest& manifest, const fs::path& directory, std::stop_token stop)
     {
+        const auto check_stop = [&]
+        {
+            if (stop.stop_requested())
+                throw std::runtime_error("Complete export cancelled");
+        };
         const auto root = manifest.snapshot.manifest_path.parent_path();
         const auto rel_entry = source.entry.lexically_relative(root);
         const auto destination = directory / rel_entry;
         for (const auto& file : manifest.files)
         {
+            check_stop();
             if (file != source.entry && file != manifest.snapshot.manifest_path)
             {
                 const auto target = directory / file.lexically_relative(root);
@@ -193,6 +200,7 @@ namespace HDMapping::Processing
         }
         for (const auto& dependency : source.dependencies)
         {
+            check_stop();
             const auto [folder, added] =
                 relocated_directories.try_emplace(dependency.parent_path(), files_directory / std::to_string(relocated_directories.size()));
             if (added)

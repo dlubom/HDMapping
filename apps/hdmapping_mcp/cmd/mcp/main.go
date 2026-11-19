@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 
@@ -20,8 +21,17 @@ func main() {
 		logger.Print("product version missing; build through CMake")
 		os.Exit(1)
 	}
-	if len(os.Args) == 2 && os.Args[1] == "--gui-bridge" {
-		if err := relay(context.Background(), os.Stdin, os.Stdout); err != nil {
+	var serveGUI func(context.Context, io.Reader, io.Writer) error
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "--gui-bridge":
+			serveGUI = relay
+		case "--gui-rpc":
+			serveGUI = relayJobs
+		}
+	}
+	if serveGUI != nil {
+		if err := serveGUI(context.Background(), os.Stdin, os.Stdout); err != nil {
 			logger.Print(err)
 			os.Exit(1)
 		}

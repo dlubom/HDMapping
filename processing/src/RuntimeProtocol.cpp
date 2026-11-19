@@ -1,6 +1,7 @@
 #include <HDMapping/Processing/RuntimeProtocol.h>
 #include <HDMapping/Processing/SnapshotStore.h>
 
+#include "NativeSessionResult.h"
 #include "SessionSnapshotPaths.h"
 
 #include "RuntimeJson.h"
@@ -88,6 +89,49 @@ namespace HDMapping::Processing
             SnapshotRef snapshot;
         };
 
+        struct RecordingCommand
+        {
+            TargetRef target;
+            std::filesystem::path recording, toml, destination;
+        };
+
+        struct ReferenceCommand
+        {
+            SnapshotRef base;
+            std::vector<std::filesystem::path> files;
+            std::filesystem::path destination;
+        };
+
+        std::filesystem::path absolute_path(const json& value)
+        {
+            const auto& text = value.get_ref<const std::string&>();
+            const std::filesystem::path path(std::u8string(text.begin(), text.end()));
+            if (!path.is_absolute() || text.find('\0') != std::string::npos)
+                throw std::invalid_argument("Recording capture requires absolute paths");
+            return path;
+        }
+
+        std::filesystem::path capture_destination(const json& packet)
+        {
+            const auto id = packet.at("job_id").get<std::string>();
+            const auto destination = absolute_path(packet.at("directory"));
+            if (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                destination.filename() != "inputs-" + id)
+                throw std::invalid_argument("Invalid recording capture job directory");
+            return destination;
+        }
+
+        RecordingCommand parse_recording(const json& packet)
+        {
+            const auto& operation = packet.at("operation");
+            const auto name = operation.at("operation").get<std::string>();
+            if (name != "step1.load" && name != "step1.prepare" && name != "step1.odometry")
+                throw std::invalid_argument("The requested operation does not accept a raw recording");
+            const auto& recording = packet.at("recording");
+            const auto toml = recording.contains("toml") ? absolute_path(recording.at("toml")) : std::filesystem::path{};
+            return { parse_target(operation.at("target")), absolute_path(recording.at("directory")), toml, capture_destination(packet) };
+        }
+
         SnapshotRef parse_snapshot(const json& snapshot)
         {
             const auto& manifest = snapshot.at("manifest_path").get_ref<const std::string&>();
@@ -96,6 +140,36 @@ namespace HDMapping::Processing
                 throw std::invalid_argument("Invalid snapshot manifest path");
             }
             return { std::filesystem::path(std::u8string(manifest.begin(), manifest.end())), parse_target(snapshot.at("target")) };
+        }
+
+        ReferenceCommand parse_references(const json& packet)
+        {
+            auto base = parse_snapshot(packet.at("snapshot"));
+            const auto& operation = packet.at("operation");
+            const auto& scope = operation.at("scope");
+            if (!base.manifest_path.is_absolute() || parse_target(operation.at("target")) != base.target ||
+                operation.at("operation") != "step1.reference" || scope.at("mode") != "load" || !scope.at("files").is_array() ||
+                scope.at("files").empty())
+                throw std::invalid_argument("Invalid Step 1 reference capture request");
+            std::vector<std::filesystem::path> files;
+            for (const auto& item : scope.at("files"))
+            {
+                const auto& text = item.get_ref<const std::string&>();
+                if (text.empty() || text.find('\0') != std::string::npos)
+                    throw std::invalid_argument("Invalid path in Step 1 reference capture");
+                files.emplace_back(std::u8string(text.begin(), text.end()));
+            }
+            return { std::move(base), std::move(files), capture_destination(packet) };
+        }
+
+        std::variant<json, OperationError> captured_snapshot(std::variant<SnapshotRef, OperationError> captured)
+        {
+            if (auto* failure = std::get_if<OperationError>(&captured))
+                return std::move(*failure);
+            const auto& ref = std::get<SnapshotRef>(captured);
+            return json{ { "type", "snapshot_captured" },
+                         { "snapshot",
+                           { { "manifest_path", path_to_utf8(ref.manifest_path) }, { "target", target_to_json(ref.target) } } } };
         }
 
         RunCommand parse_run(const json& packet)
@@ -172,14 +246,13 @@ namespace HDMapping::Processing
             const RunCommand& command, const OperationExecutor& execute, RunContext& context, const WorkerIdentity& identity)
         {
             const auto result = execute(command.operation, command.snapshot, context);
-            if (context.stop.stop_requested())
-            {
-                return OperationError{ "cancelled", "Worker was asked to stop", json::object() };
-            }
             if (const auto* error = std::get_if<OperationError>(&result))
             {
+                if (context.stop.stop_requested())
+                    return OperationError{ "cancelled", "Worker was asked to stop", json::object() };
                 return *error;
             }
+            // A returned artifact has crossed its publication boundary. A late stop cannot undo it.
             const auto& manifest = std::get<ArtifactManifest>(result);
             const auto directory = std::filesystem::canonical(context.output_directory);
             if (manifest.target != command.operation.target || manifest.artifact_id.empty() || manifest.snapshot.target.state_id.empty() ||
@@ -203,13 +276,8 @@ namespace HDMapping::Processing
             return std::nullopt;
         }
 
-        void run_operation(
-            std::istream& input,
-            const SendWorkerPacket& send,
-            const RunCommand& command,
-            const std::filesystem::path& directory,
-            const WorkerIdentity& identity,
-            const OperationExecutor& execute)
+        template<class Work>
+        void run_cancellable(std::istream& input, const SendWorkerPacket& send, const std::filesystem::path& directory, const Work& work)
         {
             std::exception_ptr send_failure;
             std::jthread operation(
@@ -223,25 +291,21 @@ namespace HDMapping::Processing
                                             {
                                                 send_progress(send, event);
                                             } };
-                        std::optional<OperationError> error;
+                        std::variant<json, OperationError> result;
                         try
                         {
-                            error = execute_run(command, execute, context, identity);
+                            result = work(context);
                         } catch (const std::exception& exception)
                         {
-                            error = OperationError{ "worker_failed", exception.what(), json::object() };
+                            result = OperationError{ "worker_failed", exception.what(), json::object() };
                         } catch (...)
                         {
-                            error = OperationError{ "worker_failed", "Unhandled worker operation exception", json::object() };
+                            result = OperationError{ "worker_failed", "Unhandled worker operation exception", json::object() };
                         }
-                        if (!error)
-                        {
-                            send_packet(send, { { "type", "completed" } });
-                        }
-                        else
-                        {
+                        if (const auto* error = std::get_if<OperationError>(&result))
                             send_error(send, *error);
-                        }
+                        else
+                            send_packet(send, std::get<json>(result));
                     } catch (...)
                     {
                         send_failure = std::current_exception();
@@ -271,12 +335,16 @@ namespace HDMapping::Processing
         const WorkerIdentity& identity,
         const std::filesystem::path& output_directory,
         const std::vector<OperationDescriptor>& operations,
-        const OperationExecutor& execute)
+        const OperationExecutor& execute,
+        const CaptureRecording& capture_recording,
+        const CaptureReferences& capture_references)
     {
         send_packet(send, { { "type", "hello" }, { "wire", wire_version }, { "version", identity.version }, { "pid", identity.pid } });
         std::string type;
         std::optional<RunCommand> command;
         std::optional<SnapshotRef> snapshot;
+        std::optional<RecordingCommand> recording;
+        std::optional<ReferenceCommand> references;
         try
         {
             const auto packet = read_packet(input);
@@ -292,6 +360,14 @@ namespace HDMapping::Processing
             else if (type == "validate_snapshot")
             {
                 snapshot = parse_snapshot(packet->at("snapshot"));
+            }
+            else if (type == "capture_step1_recording" && capture_recording)
+            {
+                recording = parse_recording(*packet);
+            }
+            else if (type == "capture_step1_references" && capture_references)
+            {
+                references = parse_references(*packet);
             }
         } catch (const std::exception& error)
         {
@@ -310,7 +386,8 @@ namespace HDMapping::Processing
             {
                 send_error(send, *failure);
             }
-            else if (std::get<SnapshotContents>(result).kind != SessionSnapshotPaths::kind)
+            else if (const auto& kind = std::get<SnapshotContents>(result).kind; kind != SessionSnapshotPaths::kind &&
+                     kind != native_session_kind && kind != "step1_recording" && kind != "step1_prepared")
             {
                 send_error(send, { "invalid_snapshot", "Unsupported snapshot kind", json::object() });
             }
@@ -318,6 +395,30 @@ namespace HDMapping::Processing
             {
                 send_packet(send, { { "type", "snapshot_validated" } });
             }
+            return;
+        }
+        if (recording)
+        {
+            run_cancellable(
+                input,
+                send,
+                recording->destination,
+                [&](RunContext& context)
+                {
+                    return captured_snapshot(capture_recording(recording->target, recording->recording, recording->toml, context));
+                });
+            return;
+        }
+        if (references)
+        {
+            run_cancellable(
+                input,
+                send,
+                references->destination,
+                [&](RunContext& context)
+                {
+                    return captured_snapshot(capture_references(references->base, references->files, context));
+                });
             return;
         }
         if (!command)
@@ -336,6 +437,15 @@ namespace HDMapping::Processing
                 send, { "unsupported_operation", "Unknown processing operation", { { "operation", command->operation.operation } } });
             return;
         }
-        run_operation(input, send, *command, output_directory, identity, execute);
+        run_cancellable(
+            input,
+            send,
+            output_directory,
+            [&](RunContext& context) -> std::variant<json, OperationError>
+            {
+                if (auto error = execute_run(*command, execute, context, identity))
+                    return std::move(*error);
+                return json{ { "type", "completed" } };
+            });
     }
 } // namespace HDMapping::Processing

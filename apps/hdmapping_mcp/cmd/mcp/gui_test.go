@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -79,7 +80,7 @@ type received struct {
 		Directory  string
 		Job        jobs.JobID `json:"job_id"`
 		Target     jobs.TargetRef
-		Operation  string
+		Operation  json.RawMessage
 		Parameters map[string]any
 	}
 }
@@ -148,7 +149,7 @@ func checkLiveTools(t *testing.T, ctx context.Context, d *desktop, assistant *sd
 			t.Fatalf("unexpected target %+v", command.Body)
 		}
 		if tc.name == "set_state_parameters" {
-			if command.Body.Operation != "step2.set_parameters" || command.Body.Parameters["iterations"] != float64(12) {
+			if string(command.Body.Operation) != `"step2.set_parameters"` || command.Body.Parameters["iterations"] != float64(12) {
 				t.Fatalf("unexpected GUI mutation: %+v", command.Body)
 			}
 			target.Revision++
@@ -247,10 +248,19 @@ func TestLiveGUIHandoff(t *testing.T) {
 			}
 			go func() {
 				var j jobs.JobRecord
-				err := client.Call(ctx, "jobs.submit", request, &j)
+				var err error
+				if scenario == "applied" {
+					j, err = submitFromDesktop(ctx, adapter, dir, request)
+				} else {
+					err = client.Call(ctx, "jobs.submit", request, &j)
+				}
 				admitted <- admission{j, err}
 			}()
 			reserve := d.next(t, ctx, nil, "states.capture", "reserve")
+			var operation jobs.OperationRequest
+			if err := json.Unmarshal(reserve.Body.Operation, &operation); err != nil || operation.Operation != request.Operation.Operation || operation.Target != target {
+				t.Fatalf("reservation lost operation: %s (%v)", reserve.Body.Operation, err)
+			}
 			select {
 			case a := <-admitted:
 				t.Fatalf("admitted before reservation: %+v", a)
@@ -277,6 +287,7 @@ func TestLiveGUIHandoff(t *testing.T) {
 			}
 			write := d.next(t, ctx, c, "states.capture", "write")
 			var same jobs.JobRecord
+			request.Source = a.job.Request.Source
 			call(t, ctx, client, "jobs.submit", request, &same)
 			if same.ID != a.job.ID {
 				t.Fatal("duplicate GUI job")
@@ -380,4 +391,35 @@ func TestLiveGUIHandoff(t *testing.T) {
 			}
 		})
 	}
+}
+
+func submitFromDesktop(ctx context.Context, adapter, dir string, request jobs.SubmitRequest) (jobs.JobRecord, error) {
+	var j jobs.JobRecord
+	var input bytes.Buffer
+	if err := protocol.WriteFrame(&input, map[string]any{
+		"wire": protocol.WireVersion, "version": "1.2.3", "method": "jobs.submit", "body": request,
+	}); err != nil {
+		return j, err
+	}
+	cmd := exec.CommandContext(ctx, adapter, "--gui-rpc")
+	cmd.Stdin, cmd.Stderr = &input, os.Stderr
+	cmd.Env = append(os.Environ(), "HDMAPPING_MCP_STATE_DIR="+dir, "GORACE=atexit_sleep_ms=0 halt_on_error=1")
+	data, err := cmd.Output()
+	if err != nil {
+		return j, err
+	}
+	var reply struct {
+		Body  jobs.JobRecord
+		Error string
+	}
+	if err = protocol.ReadFrame(bufio.NewReader(bytes.NewReader(data)), &reply); err != nil {
+		return j, err
+	}
+	if reply.Error != "" {
+		return j, errors.New(reply.Error)
+	}
+	if reply.Body.Request.Source != jobs.SourceGUI {
+		return j, errors.New("desktop job lost its source")
+	}
+	return reply.Body, nil
 }

@@ -71,11 +71,14 @@ type SnapshotRef struct {
 	ManifestPath string    `json:"manifest_path"`
 	Target       TargetRef `json:"target"`
 }
+type Step1Recording struct {
+	Directory string `json:"directory" jsonschema:"Absolute path to the Mandeye recording directory"`
+	TOML      string `json:"toml,omitempty" jsonschema:"Absolute path to an optional Step 1 TOML file"`
+}
 
 // SubmitRequest describes one heavy job. Access controls exclusive reservation,
-// independently of its source. Snapshot, if supplied, is already durably captured.
-// Otherwise CaptureSource identifies a source reserved by the caller until Prepare
-// returns; ordinary client disconnection must not destroy that source.
+// independently of its source. Exactly one input is specified: a durable Snapshot,
+// a live CaptureSource reserved until Prepare returns, or a raw Step 1 Recording.
 type SubmitRequest struct {
 	RequestKey    string           `json:"request_key"`
 	Operation     OperationRequest `json:"operation"`
@@ -83,6 +86,7 @@ type SubmitRequest struct {
 	Access        Access           `json:"access"`
 	Snapshot      *SnapshotRef     `json:"snapshot,omitempty"`
 	CaptureSource string           `json:"capture_source,omitempty"`
+	Recording     *Step1Recording  `json:"recording,omitempty"`
 }
 type ProgressEvent struct {
 	Stage   string  `json:"stage"`
@@ -91,16 +95,21 @@ type ProgressEvent struct {
 	Message string  `json:"message,omitempty"`
 }
 type JobError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code          string          `json:"code"`
+	Message       string          `json:"message"`
+	OperationCode string          `json:"operation_code,omitempty"`
+	Details       json.RawMessage `json:"details,omitempty"`
 }
+
+func (e *JobError) Error() string { return e.Code + ": " + e.Message }
 
 // Publication is a receipt from the executor AFTER full result publication.
 // Its truth must be established by the publisher, not inferred from process exit.
 type Publication struct {
-	Confirmed       bool   `json:"confirmed"`
-	OutputDirectory string `json:"output_directory"`
-	ManifestPath    string `json:"manifest_path"`
+	Confirmed       bool         `json:"confirmed"`
+	OutputDirectory string       `json:"output_directory"`
+	ManifestPath    string       `json:"manifest_path"`
+	Snapshot        *SnapshotRef `json:"snapshot,omitempty"`
 }
 type JobRecord struct {
 	ID             JobID         `json:"job_id"`

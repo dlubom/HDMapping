@@ -43,7 +43,11 @@ func readReceipt(dir, version string, job jobs.JobRecord) (result jobs.Publicati
 	if err := jobs.SyncRuntimeReceipt(file); err != nil {
 		return result, fmt.Errorf("sync worker receipt: %w", err)
 	}
-	return jobs.Publication{Confirmed: true, OutputDirectory: dir, ManifestPath: path}, nil
+	snapshot := received.Manifest.Snapshot
+	if !filepath.IsAbs(snapshot.ManifestPath) {
+		snapshot.ManifestPath = filepath.Join(dir, snapshot.ManifestPath)
+	}
+	return jobs.Publication{Confirmed: true, OutputDirectory: dir, ManifestPath: path, Snapshot: &snapshot}, nil
 }
 
 // Both the manifest and listed owned files must resolve within this job's

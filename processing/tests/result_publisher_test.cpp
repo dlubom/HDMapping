@@ -6,6 +6,7 @@
 #include <Core/export_laz.h>
 #include <Core/session.h>
 #include <HDMapping/Processing/ResultPublisher.h>
+#include <HDMapping/Processing/RuntimeProtocol.h>
 #include <HDMapping/Processing/SnapshotStore.h>
 #include <HDMapping/SessionPaths.h>
 
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <span>
+#include <sstream>
 
 using namespace HDMapping::Processing;
 namespace fs = std::filesystem;
@@ -177,6 +179,26 @@ TEST_CASE("Publishing and exporting preserves native files and immutable shared 
     const auto published = checked_result(PublishResult(stage, destination));
     CHECK_FALSE(fs::exists(stage));
     REQUIRE(published.dependencies.size() == 2);
+    const json validation{
+        { "type", "validate_snapshot" },
+        { "snapshot",
+          { { "manifest_path", sessionPathText(published.snapshot.manifest_path) },
+            { "target", { { "state_id", published.snapshot.target.state_id }, { "revision", published.snapshot.target.revision } } } } }
+    };
+    std::istringstream worker_input(validation.dump() + '\n');
+    std::vector<json> packets;
+    ServeWorker(
+        worker_input,
+        [&](std::string_view packet)
+        {
+            packets.push_back(json::parse(packet));
+        },
+        { "test", 1 },
+        {},
+        {},
+        {});
+    REQUIRE(packets.size() == 2);
+    CHECK(packets.back().at("type") == "snapshot_validated");
     CHECK(checked_result(ReadPublishedResult(destination)).artifact_id == published.artifact_id);
     const auto export_path = scratch.path / fs::path(u8"pełny zestaw");
     const auto immutable = unicode_source / "scan room_lio_0.laz";

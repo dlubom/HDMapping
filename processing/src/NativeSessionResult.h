@@ -14,5 +14,5 @@ namespace HDMapping::Processing
 
     //! Materialize the same native session with only local references.
     SnapshotContents CopyNativeSession(
-        const SnapshotContents& source, const ArtifactManifest& manifest, const std::filesystem::path& directory);
+        const SnapshotContents& source, const ArtifactManifest& manifest, const std::filesystem::path& directory, std::stop_token stop);
 } // namespace HDMapping::Processing

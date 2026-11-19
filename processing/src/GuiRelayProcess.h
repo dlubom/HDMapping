@@ -15,7 +15,12 @@ namespace HDMapping::Processing
     class GuiRelayProcess
     {
     public:
-        explicit GuiRelayProcess(std::string_view executable_name);
+        enum class Mode
+        {
+            State,
+            Jobs
+        };
+        explicit GuiRelayProcess(std::string_view executable_name, Mode mode = Mode::State);
         ~GuiRelayProcess();
         std::string Exchange(std::string frame);
 

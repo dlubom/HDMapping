@@ -322,6 +322,12 @@ func (s *Scheduler) finish(j JobRecord, result Publication, runErr error) {
 			}
 		}
 		j.Error = &JobError{Code: "execution_failed", Message: message}
+		if worker, found := errors.AsType[*JobError](runErr); found && len(worker.Code) <= 256 {
+			j.Error.OperationCode = worker.Code
+			if len(worker.Details) <= 4096 {
+				j.Error.Details = worker.Details
+			}
+		}
 	}
 	s.save(j)
 	s.release(j.ID)

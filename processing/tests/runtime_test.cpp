@@ -26,7 +26,7 @@ namespace
         "\n";
 
     std::vector<json> run_worker(
-        const std::string& input, const std::vector<OperationDescriptor>& operations, const OperationExecutor& executor)
+        const std::string& input, const std::vector<OperationDescriptor>& operations = {}, const OperationExecutor& executor = {})
     {
         std::vector<json> packets;
         std::istringstream stream(input);
@@ -46,10 +46,12 @@ namespace
 
 TEST_CASE("Describe lists exactly the capabilities of this worker build")
 {
-    const auto packets = run_worker("{\"type\":\"describe\"}\n", DescribeOperations(), ExecuteOperation);
+    const auto packets = run_worker("{\"type\":\"describe\"}\n", test_operations);
     REQUIRE(packets.size() == 2);
     CHECK(packets[0] == json{ { "type", "hello" }, { "wire", 1 }, { "version", "0.106.0" }, { "pid", 300 } });
-    CHECK(packets[1] == json{ { "type", "operations" }, { "operations", json::array() } });
+    CHECK(packets[1].at("type") == "operations");
+    REQUIRE(packets[1].at("operations").size() == 1);
+    CHECK(packets[1].at("operations").at(0).at("id") == "test-operation");
 }
 
 TEST_CASE("Unknown commands and malformed frames produce explicit protocol errors")
@@ -62,7 +64,7 @@ TEST_CASE("Unknown commands and malformed frames produce explicit protocol error
     for (const auto& [frame, expected] : cases)
     {
         CAPTURE(expected);
-        const auto packets = run_worker(frame, DescribeOperations(), ExecuteOperation);
+        const auto packets = run_worker(frame);
         REQUIRE(packets.size() == 2);
         CHECK(packets[1].at("type") == "error");
         CHECK(packets[1].at("error").at("code") == expected);
@@ -75,12 +77,12 @@ TEST_CASE("Worker enforces the byte limit on valid JSON packets")
     const std::string prefix = R"({"type":"describe","padding":")";
     const std::string suffix = "\"}\n";
     const auto within_limit = prefix + std::string(byte_limit - prefix.size() - suffix.size() + 1, 'x') + suffix;
-    const auto accepted = run_worker(within_limit, DescribeOperations(), ExecuteOperation);
+    const auto accepted = run_worker(within_limit);
     REQUIRE(accepted.size() == 2);
     CHECK(accepted[1].at("type") == "operations");
 
     const auto over_limit = prefix + "x" + within_limit.substr(prefix.size());
-    const auto rejected = run_worker(over_limit, DescribeOperations(), ExecuteOperation);
+    const auto rejected = run_worker(over_limit);
     REQUIRE(rejected.size() == 2);
     CHECK(rejected[1].at("error").at("code") == "invalid_request");
 }
@@ -238,4 +240,46 @@ TEST_CASE("Completion follows an atomically published receipt")
     CHECK(receipt.at("manifest").at("target") == json{ { "state_id", "open" }, { "revision", 42 } });
     CHECK(receipt.at("manifest").at("snapshot").at("manifest_path") == "snapshot.json");
     CHECK(receipt.at("manifest").at("files") == json::array({ "snapshot.json" }));
+}
+
+TEST_CASE("A late cancellation preserves an already committed result")
+{
+    const TemporaryDirectory directory;
+    std::ofstream(directory.path / "snapshot.json") << "{}";
+    SupervisorInput input(run_command);
+    std::istream stream(&input);
+    std::vector<json> packets;
+    ServeWorker(
+        stream,
+        [&](std::string_view line)
+        {
+            const auto packet = json::parse(line);
+            if (packet.at("type") == "progress")
+                input.close();
+            packets.push_back(packet);
+        },
+        identity,
+        directory.path,
+        test_operations,
+        [](const OperationRequest& request, const SnapshotRef&, RunContext& context) -> RunResult
+        {
+            context.progress({ "committed", {}, {}, {} });
+            std::mutex mutex;
+            std::unique_lock lock(mutex);
+            std::condition_variable_any stopped;
+            stopped.wait_for(
+                lock,
+                context.stop,
+                std::chrono::seconds(5),
+                []
+                {
+                    return false;
+                });
+            if (!context.stop.stop_requested())
+                return OperationError{ "timeout", "Test did not observe cancellation", json::object() };
+            return ArtifactManifest{ "output-id", request.target, { "snapshot.json", request.target }, { "snapshot.json" }, {} };
+        });
+    REQUIRE(packets.size() == 3);
+    CHECK(packets.back().at("type") == "completed");
+    CHECK(std::filesystem::is_regular_file(directory.path / "result.json"));
 }

@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"unicode/utf8"
 )
@@ -30,7 +32,8 @@ func validSnapshot(s *SnapshotRef, target TargetRef) bool {
 }
 
 func validPublication(p Publication) bool {
-	return p.Confirmed && p.OutputDirectory != "" && len(p.OutputDirectory) <= maxPathSize && p.ManifestPath != "" && len(p.ManifestPath) <= maxPathSize
+	return p.Confirmed && p.OutputDirectory != "" && len(p.OutputDirectory) <= maxPathSize && p.ManifestPath != "" && len(p.ManifestPath) <= maxPathSize &&
+		(p.Snapshot == nil || (p.Snapshot.Target.StateID != "" && filepath.IsAbs(p.Snapshot.ManifestPath) && len(p.Snapshot.ManifestPath) <= maxPathSize))
 }
 
 type journalFile interface {
@@ -144,16 +147,25 @@ func clone(j JobRecord) JobRecord {
 		v := *j.Request.Snapshot
 		j.Request.Snapshot = &v
 	}
+	if j.Request.Recording != nil {
+		v := *j.Request.Recording
+		j.Request.Recording = &v
+	}
 	if j.Snapshot != nil {
 		v := *j.Snapshot
 		j.Snapshot = &v
 	}
 	if j.Result != nil {
 		v := *j.Result
+		if v.Snapshot != nil {
+			snapshot := *v.Snapshot
+			v.Snapshot = &snapshot
+		}
 		j.Result = &v
 	}
 	if j.Error != nil {
 		v := *j.Error
+		v.Details = bytes.Clone(v.Details)
 		j.Error = &v
 	}
 	if j.Progress.Current != nil {
@@ -201,16 +213,24 @@ func normalize(req SubmitRequest) (SubmitRequest, error) {
 	if req.Access != AccessRead && req.Access != AccessMutate {
 		return req, errors.New("invalid job access")
 	}
-	if req.Snapshot == nil {
-		if req.CaptureSource == "" {
-			return req, errors.New("snapshot or capture source required")
+	switch {
+	case req.Recording != nil:
+		if req.Snapshot != nil || req.CaptureSource != "" {
+			return req, errors.New("recording requires an exclusive input source")
 		}
-	} else {
+		v := *req.Recording
+		if !strings.HasPrefix(req.Operation.Operation, "step1.") || !filepath.IsAbs(v.Directory) || (v.TOML != "" && !filepath.IsAbs(v.TOML)) {
+			return req, errors.New("raw recording requires a Step 1 operation and absolute input paths")
+		}
+		req.Recording = &v
+	case req.Snapshot != nil:
 		if req.CaptureSource != "" || !validSnapshot(req.Snapshot, req.Operation.Target) {
 			return req, errors.New("invalid snapshot reference")
 		}
 		v := *req.Snapshot
 		req.Snapshot = &v
+	case req.CaptureSource == "":
+		return req, errors.New("snapshot, capture source or recording required")
 	}
 	var err error
 	req.Operation.Scope, err = canonicalObject(req.Operation.Scope)
@@ -474,7 +494,8 @@ func (r *registry) validate(e journalEntry) error {
 	if err != nil || len(progress) > maxProgressSize {
 		return errors.New("progress exceeds metadata limit")
 	}
-	if j.Error != nil && (len(j.Error.Code) > 256 || len(j.Error.Message) > 4096) {
+	if j.Error != nil && (len(j.Error.Code) > 256 || len(j.Error.OperationCode) > 256 ||
+		len(j.Error.Message) > 4096 || len(j.Error.Details) > 4096) {
 		return errors.New("job error exceeds metadata limit")
 	}
 	old, exists := r.jobs[j.ID]

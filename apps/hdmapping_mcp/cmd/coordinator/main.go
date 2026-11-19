@@ -119,13 +119,13 @@ func dispatch(scheduler *jobs.Scheduler, processes *guiJobs) protocol.Handler {
 			if err := supervisor.CheckArgumentDepth(request.Operation.Parameters); err != nil {
 				return nil, fmt.Errorf("parameters: %w", err)
 			}
-			if request.Snapshot == nil {
+			live := request.Snapshot == nil && request.Recording == nil
+			if live {
 				if request.CaptureSource != request.Operation.Target.StateID {
 					return nil, errors.New("live capture requires its target state ID")
 				}
-				return processes.submit(ctx, scheduler, request)
 			}
-			if request.Source == jobs.SourceGUI {
+			if live || request.Source == jobs.SourceGUI {
 				return processes.submit(ctx, scheduler, request)
 			}
 			return scheduler.SubmitForPreparation(ctx, request)

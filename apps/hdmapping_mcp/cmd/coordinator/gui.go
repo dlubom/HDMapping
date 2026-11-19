@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/gui"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
@@ -24,27 +25,57 @@ type guiJobs struct {
 	wg       sync.WaitGroup
 }
 type captureCommand struct {
-	Target    jobs.TargetRef `json:"target"`
-	Job       jobs.JobID     `json:"job_id"`
-	Access    jobs.Access    `json:"access"`
-	Phase     string         `json:"phase"`
-	Directory string         `json:"directory,omitempty"`
+	Target    jobs.TargetRef         `json:"target"`
+	Job       jobs.JobID             `json:"job_id"`
+	Access    jobs.Access            `json:"access"`
+	Phase     string                 `json:"phase"`
+	Directory string                 `json:"directory,omitempty"`
+	Operation *jobs.OperationRequest `json:"operation,omitempty"`
 }
 
 func capture(j jobs.JobRecord, phase, dir string) captureCommand {
-	return captureCommand{Target: j.Request.Operation.Target, Job: j.ID, Access: j.Request.Access, Phase: phase, Directory: dir}
+	c := captureCommand{Target: j.Request.Operation.Target, Job: j.ID, Access: j.Request.Access, Phase: phase, Directory: dir}
+	if phase == "reserve" {
+		c.Operation = &j.Request.Operation
+	}
+	return c
 }
+
+func (g *guiJobs) findCaptureOwner(ctx context.Context, req jobs.SubmitRequest) (*gui.Session, error) {
+	id := req.Operation.Target.StateID
+	if req.Source != jobs.SourceGUI {
+		return g.registry.Find(id)
+	}
+	// The job RPC may start a coordinator before the independent desktop
+	// poll has advertised its opening. Allow a few poll cycles for discovery.
+	wait, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		owner, err := g.registry.Find(id)
+		if err == nil {
+			return owner, nil
+		}
+		select {
+		case <-wait.Done():
+			return nil, err
+		case <-ticker.C:
+		}
+	}
+}
+
 func (g *guiJobs) submit(ctx context.Context, scheduler *jobs.Scheduler, req jobs.SubmitRequest) (jobs.JobRecord, error) {
 	var owner *gui.Session
 	var reserved jobs.JobRecord
 	fresh := false
 	job, err := scheduler.SubmitWithReservation(ctx, req, func(j jobs.JobRecord) error {
 		fresh = true
-		var err error
-		owner, err = g.registry.Find(req.Operation.Target.StateID)
-		if req.Snapshot != nil {
+		if req.Snapshot != nil || req.Recording != nil {
 			return nil
 		}
+		var err error
+		owner, err = g.findCaptureOwner(ctx, req)
 		if err != nil {
 			return err
 		}
@@ -117,7 +148,7 @@ func (g *guiJobs) apply(j jobs.JobRecord) string {
 	return "applied"
 }
 func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotRef, error) {
-	if j.Request.Snapshot != nil {
+	if j.Request.Snapshot != nil || j.Request.Recording != nil {
 		return g.Supervisor.Prepare(ctx, j)
 	}
 	g.mu.Lock()

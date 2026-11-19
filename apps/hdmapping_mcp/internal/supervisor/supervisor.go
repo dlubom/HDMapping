@@ -39,9 +39,20 @@ func (s *Supervisor) Describe(ctx context.Context) (json.RawMessage, error) {
 }
 
 func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.SnapshotRef, error) {
+	if job.Request.Recording != nil {
+		return s.captureInput(ctx, job, "capture_step1_recording")
+	}
 	snapshot := job.Request.Snapshot
 	if snapshot == nil || snapshot.Target != job.Request.Operation.Target {
 		return jobs.SnapshotRef{}, errors.New("worker requires a captured snapshot for this revision")
+	}
+	if job.Request.CaptureSource == "" && job.Request.Operation.Operation == "step1.reference" {
+		var scope struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.Unmarshal(job.Request.Operation.Scope, &scope); err == nil && scope.Mode == "load" {
+			return s.captureInput(ctx, job, "capture_step1_references")
+		}
 	}
 	cmd := exec.Command(s.Worker)
 	cmd.Dir, cmd.Stderr = filepath.Dir(s.Worker), os.Stderr
@@ -50,12 +61,56 @@ func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.Snap
 		return jobs.SnapshotRef{}, err
 	}
 	if reply.Error != nil {
-		return jobs.SnapshotRef{}, fmt.Errorf("%s: %s", reply.Error.Code, reply.Error.Message)
+		return jobs.SnapshotRef{}, reply.Error
 	}
 	if reply.Type != "snapshot_validated" {
 		return jobs.SnapshotRef{}, fmt.Errorf("unexpected snapshot validation response: %s", reply.Type)
 	}
 	return *snapshot, nil
+}
+
+func (s *Supervisor) captureInput(ctx context.Context, job jobs.JobRecord, kind string) (jobs.SnapshotRef, error) {
+	jobDir, err := s.jobDirectory(job.ID)
+	if err != nil {
+		return jobs.SnapshotRef{}, err
+	}
+	dir := filepath.Join(s.Directory, "inputs-"+filepath.Base(jobDir))
+	cmd := exec.Command(s.Worker)
+	cmd.Dir, cmd.Stderr = filepath.Dir(s.Worker), os.Stderr
+	reply, err := exchange(ctx, cmd, s.Version, command{
+		Type: kind, ID: job.ID, Operation: &job.Request.Operation, Snapshot: job.Request.Snapshot,
+		Recording: job.Request.Recording, Directory: dir,
+	}, s.reportProgress(job.ID), false)
+	if err != nil {
+		return jobs.SnapshotRef{}, err
+	}
+	if reply.Error != nil {
+		return jobs.SnapshotRef{}, reply.Error
+	}
+	snapshot := reply.Snapshot
+	if reply.Type != "snapshot_captured" || snapshot == nil || snapshot.Target != job.Request.Operation.Target || !filepath.IsAbs(snapshot.ManifestPath) {
+		return jobs.SnapshotRef{}, errors.New("worker returned an invalid Step 1 input capture")
+	}
+	resolved, err := filepath.EvalSymlinks(snapshot.ManifestPath)
+	if err != nil {
+		return jobs.SnapshotRef{}, fmt.Errorf("resolve captured Step 1 input manifest: %w", err)
+	}
+	rel, err := filepath.Rel(dir, resolved)
+	if err != nil || rel == "." || !filepath.IsLocal(rel) {
+		return jobs.SnapshotRef{}, errors.New("input capture manifest outside reserved directory")
+	}
+	return *snapshot, nil
+}
+
+func (s *Supervisor) reportProgress(id jobs.JobID) func(event) {
+	return func(reply event) {
+		if s.Progress == nil {
+			return
+		}
+		if err := s.Progress(id, *reply.Progress); err != nil {
+			fmt.Fprintf(os.Stderr, "record job progress: %v\n", err)
+		}
+	}
 }
 
 func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publication, error) {
@@ -71,16 +126,9 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 	cmd.Stderr = os.Stderr
 	reply, runErr := exchange(ctx, cmd, s.Version, command{
 		Type: "run", ID: job.ID, Operation: &job.Request.Operation, Snapshot: job.Snapshot,
-	}, func(reply event) {
-		if s.Progress == nil {
-			return
-		}
-		if err := s.Progress(job.ID, *reply.Progress); err != nil {
-			fmt.Fprintf(os.Stderr, "record job progress: %v\n", err)
-		}
-	}, true)
+	}, s.reportProgress(job.ID), true)
 	if reply.Error != nil {
-		runErr = errors.Join(runErr, fmt.Errorf("%s: %s", reply.Error.Code, reply.Error.Message))
+		runErr = errors.Join(runErr, reply.Error)
 	}
 	// If the keeper itself was lost, the worker still owns its inherited
 	// lease. Keep the reservation until it has stopped using its inputs.

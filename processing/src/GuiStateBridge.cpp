@@ -39,7 +39,7 @@ namespace HDMapping::Processing
             return path;
         }
 
-        RunResult read_result(const json& params, const TargetRef& expected)
+        RunResult read_result(const json& params, const TargetRef& expected, bool accepts_odometry)
         {
             const auto path = required_path(params.at("manifest_path"));
             if (path.filename() != "result.json" || fs::file_size(path) > 1024 * 1024)
@@ -85,6 +85,19 @@ namespace HDMapping::Processing
                 return snapshot;
             };
             const auto snapshot = normalize_inventory(manifest);
+            // The Step 1 adapter validates and restores its private prepared snapshot before changing the opening.
+            if (accepts_odometry && snapshot.parent_path() == root / "prepared" && snapshot.filename() == "snapshot.json")
+            {
+                const auto target = parse_target(manifest.at("target"));
+                const auto snapshot_target = parse_target(manifest.at("snapshot").at("target"));
+                const auto id = manifest.at("artifact_id").get<std::string>();
+                if (target != expected || snapshot_target != expected || id.empty() || !manifest.at("dependencies").empty())
+                    return error("invalid_published_result", "Invalid prepared odometry receipt");
+                std::vector<fs::path> files;
+                for (const auto& file : manifest.at("files"))
+                    files.push_back(sessionPathFromText(file.get_ref<const std::string&>()));
+                return ArtifactManifest{ id, target, { snapshot, snapshot_target }, std::move(files), {} };
+            }
             auto result = ReadPublishedGeneration(snapshot.parent_path().parent_path(), manifest.at("artifact_id").get<std::string>());
             if (const auto* artifact = std::get_if<ArtifactManifest>(&result))
             {
@@ -274,7 +287,7 @@ namespace HDMapping::Processing
                     return error("state_busy", "A conflicting reservation is active");
                 }
             }
-            auto result = read_result(params, target);
+            auto result = read_result(params, target, static_cast<bool>(callbacks_.PinOperationCapture));
             if (const auto* failure = std::get_if<OperationError>(&result))
             {
                 return *failure;
@@ -323,7 +336,18 @@ namespace HDMapping::Processing
             {
                 return error("state_busy", "Conflicting capture reservation");
             }
-            auto source = callbacks_.PinCapture(target);
+            std::unique_ptr<CaptureSource> source;
+            if (callbacks_.PinOperationCapture && params.contains("operation"))
+            {
+                const auto& operation = params.at("operation");
+                if (parse_target(operation.at("target")) != target || !operation.at("scope").is_object() ||
+                    !operation.at("parameters").is_object())
+                    return error("invalid_request", "Invalid operation for capture");
+                source = callbacks_.PinOperationCapture(
+                    { operation.at("operation").get<std::string>(), target, operation.at("scope"), operation.at("parameters") });
+            }
+            else
+                source = callbacks_.PinCapture(target);
             if (!source || source->Target() != target)
             {
                 return error("capture_failed", "The opening could not pin its data");

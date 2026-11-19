@@ -1,5 +1,4 @@
 set(_runtime_sources
-    src/Operation.cpp
     src/SnapshotStore.cpp
     src/RuntimeProtocol.cpp
     src/RuntimeReceipt.cpp
@@ -25,6 +24,45 @@ target_link_libraries(processing_result PUBLIC processing_ops)
 hdmapping_processing_target(processing_result)
 list(APPEND _runtime_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp)
 
+set(_step1_dir "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1")
+add_library(processing_step1_engine STATIC
+    "${_step1_dir}/lidar_odometry.cpp"
+    "${_step1_dir}/lidar_odometry_utils.cpp"
+    "${_step1_dir}/lidar_odometry_utils_optimizers.cpp"
+    "${_step1_dir}/points_global_spill.cpp"
+    "${_step1_dir}/raw_cloud_loader.cpp"
+    "${_step1_dir}/toml_io.cpp")
+target_compile_definitions(processing_step1_engine PRIVATE UTL_PROFILER_DISABLE)
+target_compile_definitions(processing_step1_engine PUBLIC WITH_GUI=0)
+target_include_directories(processing_step1_engine SYSTEM PUBLIC
+    "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include"
+    "${EIGEN3_INCLUDE_DIR}" "${THIRDPARTY_DIRECTORY}" "${THIRDPARTY_DIRECTORY}/tomlplusplus/include"
+    "${THIRDPARTY_DIRECTORY}/observation_equations/codes" "${THIRDPARTY_DIRECTORY}/vqf/vqf/cpp"
+    "${THIRDPARTY_DIRECTORY}/Fusion/Fusion" "${LASZIP_INCLUDE_DIR}/LASzip/include")
+target_link_libraries(processing_step1_engine PUBLIC step1_run_report unordered_dense::unordered_dense
+    PRIVATE core_no_gui vqf Fusion spdlog::spdlog UTL::include ${PLATFORM_LASZIP_LIB} ${PLATFORM_MISCELLANEOUS_LIBS})
+if(_processing_sanitizer)
+    target_compile_options(processing_step1_engine PRIVATE
+        -fsanitize=${_processing_sanitizer} -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
+endif()
+if(MSVC)
+    target_compile_definitions(processing_step1_engine PRIVATE _USE_MATH_DEFINES)
+    target_compile_options(processing_step1_engine PRIVATE /bigobj)
+endif()
+
+set(_step1_sources src/Operation.cpp "${_step1_dir}/step1_operations.cpp"
+    "${_step1_dir}/step1_parameters.cpp" "${_step1_dir}/recording_capture.cpp" "${_step1_dir}/odometry_capture.cpp")
+add_library(processing_step1 STATIC ${_step1_sources})
+target_include_directories(processing_step1 PUBLIC "${_step1_dir}")
+target_include_directories(processing_step1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(processing_step1 SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/json/include")
+target_link_libraries(processing_step1 PUBLIC processing_result processing_step1_engine)
+hdmapping_processing_target(processing_step1)
+if(MSVC)
+    target_compile_options(processing_step1 PRIVATE /bigobj)
+endif()
+list(APPEND _runtime_sources ${_step1_sources})
+
 set(_gui_sources src/GuiStateBridge.cpp src/GuiStateConnection.cpp src/GuiRelayProcess.cpp)
 add_library(processing_gui_state STATIC ${_gui_sources})
 target_include_directories(processing_gui_state SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/shared/include")
@@ -34,9 +72,9 @@ hdmapping_processing_target(processing_gui_state)
 list(APPEND _runtime_sources ${_gui_sources})
 
 set(_gui_capture_sources
-    "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1/odometry_capture.cpp"
     "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp")
-list(APPEND _runtime_sources ${_gui_capture_sources} "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration/step2_state_parameters.cpp")
+list(APPEND _runtime_sources "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp"
+    "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration/step2_state_parameters.cpp")
 
 if(BUILD_TESTING)
     add_executable(processing_state_test
@@ -48,7 +86,7 @@ if(BUILD_TESTING)
         "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1" "${PROJECT_SOURCE_DIR}/apps/multi_session_registration")
     target_compile_definitions(processing_state_test PRIVATE HDMAPPING_GUI_VERSION="${CMAKE_PROJECT_VERSION}")
     target_link_libraries(processing_state_test PRIVATE
-        processing_gui_state processing_session_snapshot core_no_gui unordered_dense::unordered_dense)
+        processing_gui_state processing_session_snapshot processing_step1 core_no_gui unordered_dense::unordered_dense)
     if(MSVC)
         target_compile_options(processing_state_test PRIVATE /bigobj)
     endif()
@@ -84,6 +122,17 @@ if(BUILD_TESTING)
     set_tests_properties(processing-publication processing-publication-process
         PROPERTIES LABELS processing-publication TIMEOUT 90)
     list(APPEND _runtime_sources tests/runtime_test.cpp tests/snapshot_store_test.cpp tests/snapshot_test_main.cpp tests/result_publisher_test.cpp)
+
+    add_executable(processing_step1_test tests/step1_operations_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_step1_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_link_libraries(processing_step1_test PRIVATE processing_step1)
+    hdmapping_processing_target(processing_step1_test)
+    if(MSVC)
+        target_compile_options(processing_step1_test PRIVATE /bigobj)
+    endif()
+    add_test(NAME processing-step1 COMMAND processing_step1_test)
+    set_tests_properties(processing-step1 PROPERTIES LABELS processing-step1 TIMEOUT 90)
+    list(APPEND _runtime_sources tests/step1_operations_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

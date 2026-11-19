@@ -27,5 +27,5 @@ namespace HDMapping::Processing
     RunResult ReadPublishedGeneration(const std::filesystem::path& destination, const std::string& artifact_id);
 
     //! Copy a published session and its inputs into a relocatable result at a new destination.
-    RunResult ExportComplete(const ArtifactManifest& source, const std::filesystem::path& destination);
+    RunResult ExportComplete(const ArtifactManifest& source, const std::filesystem::path& destination, std::stop_token stop = {});
 } // namespace HDMapping::Processing

@@ -137,7 +137,7 @@ namespace HDMapping::Processing
     {
 #ifdef _WIN32
         Handle input, output, child;
-        explicit Process(const fs::path& relay)
+        Process(const fs::path& relay, Mode mode)
         {
             SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
             Handle child_in, child_out, child_err;
@@ -160,7 +160,8 @@ namespace HDMapping::Processing
             startup.StartupInfo.hStdError = child_err.value;
             startup.lpAttributeList = attributes.list;
             PROCESS_INFORMATION info{};
-            std::wstring command = L"\"" + relay.wstring() + L"\" --gui-bridge";
+            const auto flag = mode == Mode::State ? L" --gui-bridge" : L" --gui-rpc";
+            std::wstring command = L"\"" + relay.wstring() + L"\"" + flag;
             if (!CreateProcessW(
                     relay.c_str(),
                     command.data(),
@@ -208,7 +209,7 @@ namespace HDMapping::Processing
 #else
         Descriptor socket;
         pid_t child{ -1 };
-        explicit Process(const fs::path& relay)
+        Process(const fs::path& relay, Mode mode)
         {
             int pair[2];
             if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0)
@@ -227,8 +228,8 @@ namespace HDMapping::Processing
                 if (int error = posix_spawn_file_actions_adddup2(&actions.value, remote.value, fd))
                     throw std::system_error(error, std::generic_category(), "Cannot redirect GUI relay stdio");
             auto executable = relay.string();
-            char flag[] = "--gui-bridge";
-            char* argv[] = { executable.data(), flag, nullptr };
+            std::string flag = mode == Mode::State ? "--gui-bridge" : "--gui-rpc";
+            char* argv[] = { executable.data(), flag.data(), nullptr };
 #ifdef __APPLE__
             char** env = *_NSGetEnviron();
 #else
@@ -283,8 +284,8 @@ namespace HDMapping::Processing
 #endif
     };
 
-    GuiRelayProcess::GuiRelayProcess(std::string_view executable_name)
-        : process_(std::make_unique<Process>(companion(executable_name)))
+    GuiRelayProcess::GuiRelayProcess(std::string_view executable_name, Mode mode)
+        : process_(std::make_unique<Process>(companion(executable_name), mode))
         , watchdog_(
               [this](std::stop_token stop)
               {

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -193,6 +194,48 @@ namespace HDMapping::Processing
         }
     };
 
+    struct GuiStateConnection::JobConnection
+    {
+        std::string name;
+        std::unique_ptr<GuiRelayProcess> relay;
+        std::future<GuiResponse> pending;
+
+        bool request(std::string_view method, json body)
+        {
+            if (pending.valid())
+                return false;
+            json request{ { "wire", 1 }, { "version", HDMAPPING_GUI_VERSION }, { "method", method }, { "body", std::move(body) } };
+            pending = std::async(
+                std::launch::async,
+                [this, request = std::move(request)]() -> GuiResponse
+                {
+                    try
+                    {
+                        if (!relay)
+                            relay = std::make_unique<GuiRelayProcess>(name, GuiRelayProcess::Mode::Jobs);
+                        auto response = json::parse(relay->Exchange(request.dump()));
+                        if (response.at("wire") != 1 || response.at("version") != HDMAPPING_GUI_VERSION)
+                            throw std::runtime_error("Incompatible GUI job relay");
+                        if (response.contains("error"))
+                            return OperationError{ "job_request_failed", response.at("error").get<std::string>(), json::object() };
+                        return std::move(response.at("body"));
+                    } catch (const std::exception& error)
+                    {
+                        relay.reset();
+                        return OperationError{ "job_transport_failed", error.what(), json::object() };
+                    }
+                });
+            return true;
+        }
+
+        std::optional<GuiResponse> take()
+        {
+            if (!pending.valid() || pending.wait_for(0s) != std::future_status::ready)
+                return std::nullopt;
+            return pending.get();
+        }
+    };
+
     GuiStateConnection::GuiStateConnection(GuiStateBridge& bridge, std::string_view executable_name)
         : connection_(std::make_unique<Connection>(bridge, executable_name))
     {
@@ -205,8 +248,19 @@ namespace HDMapping::Processing
     {
         connection_->poll();
     }
+    bool GuiStateConnection::RequestJob(std::string_view method, json body)
+    {
+        if (!jobs_)
+            jobs_ = std::make_unique<JobConnection>(connection_->name);
+        return jobs_->request(method, std::move(body));
+    }
+    std::optional<GuiResponse> GuiStateConnection::TakeJobReply()
+    {
+        return jobs_ ? jobs_->take() : std::nullopt;
+    }
     void GuiStateConnection::Close()
     {
         connection_->close();
+        jobs_.reset();
     }
 } // namespace HDMapping::Processing
