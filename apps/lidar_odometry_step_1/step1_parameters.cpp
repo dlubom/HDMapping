@@ -51,8 +51,10 @@ namespace
 
     void apply_fields(const json& settings, LidarOdometryParams& params)
     {
-        for (const auto& [name, value] : settings.items())
+        for (const auto& item : settings.items())
         {
+            const auto& name = item.key();
+            const auto& value = item.value();
             const auto scalar = TomlIO::POINTERS.find(name);
             const auto motion = TomlIO::MOTION_MODEL_CORRECTION_POINTERS.find(name);
             const auto grid = std::ranges::find_if(
@@ -64,7 +66,7 @@ namespace
             if (scalar != TomlIO::POINTERS.end() && is_configuration(name))
             {
                 std::visit(
-                    [&](auto pointer)
+                    [&params, &value, &name](auto pointer)
                     {
                         using ValueType = std::remove_cvref_t<decltype(params.*pointer)>;
                         params.*pointer = read_value<ValueType>(value, name);
@@ -156,10 +158,10 @@ json Step1Parameters(const LidarOdometryParams& params)
     for (const auto& [name, member] : TomlIO::POINTERS)
     {
         if (is_configuration(name))
-            std::visit(
-                [&](auto pointer)
+            fields[name] = std::visit(
+                [&params](auto pointer) -> json
                 {
-                    fields[name] = params.*pointer;
+                    return params.*pointer;
                 },
                 member);
     }
