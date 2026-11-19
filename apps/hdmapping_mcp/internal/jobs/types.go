@@ -41,6 +41,7 @@ const (
 )
 
 var (
+	ErrSourceLost       = errors.New("GUI source disconnected")
 	ErrRequestConflict  = errors.New("request_key already has different arguments")
 	ErrReserved         = errors.New("state is reserved by another job")
 	ErrNotFound         = errors.New("job not found")

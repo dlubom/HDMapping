@@ -91,6 +91,19 @@ func (s *Supervisor) Recover(ctx context.Context, store *jobs.Store) error {
 			case jobs.Running, jobs.Cancelling:
 				err = s.recoverRunning(ctx, store, job)
 			}
+			if err == nil && job.GUIApplyStatus == "pending" {
+				// A crash may occur after GUI mutation but before its acknowledgement.
+				// Preserve the artifact without replaying the mutation.
+				var recovered jobs.JobRecord
+				recovered, err = store.Get(ctx, job.ID)
+				if err == nil && recovered.Status == jobs.Completed {
+					status := "unconfirmed"
+					if job.Request.Access == jobs.AccessRead {
+						status = "not_requested"
+					}
+					err = store.RecordGUIApply(ctx, job.ID, status)
+				}
+			}
 			if err != nil {
 				return fmt.Errorf("recover job %s: %w", job.ID, err)
 			}

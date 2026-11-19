@@ -12,9 +12,10 @@
 int main(int argc, char** argv)
 {
     using namespace HDMapping::Processing;
-    if (argc == 3 && std::string_view(argv[1]) == "--read-gui-snapshot")
+    if ((argc == 3 || argc == 5) && std::string_view(argv[1]) == "--read-gui-snapshot")
     {
-        const SnapshotRef ref{ std::filesystem::canonical(argv[2]) / "snapshot.json", { "step2-probe", 1 } };
+        const TargetRef target = argc == 5 ? TargetRef{ argv[3], std::stoull(argv[4]) } : TargetRef{ "step2-probe", 1 };
+        const SnapshotRef ref{ std::filesystem::canonical(argv[2]) / "snapshot.json", target };
         const auto result = LoadSessionSnapshot(ref);
         if (const auto* error = std::get_if<OperationError>(&result))
         {

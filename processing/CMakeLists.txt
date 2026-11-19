@@ -25,7 +25,38 @@ target_link_libraries(processing_result PUBLIC processing_ops)
 hdmapping_processing_target(processing_result)
 list(APPEND _runtime_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp)
 
+set(_gui_sources src/GuiStateBridge.cpp src/GuiStateConnection.cpp src/GuiRelayProcess.cpp)
+add_library(processing_gui_state STATIC ${_gui_sources})
+target_include_directories(processing_gui_state SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/shared/include")
+target_compile_definitions(processing_gui_state PRIVATE HDMAPPING_GUI_VERSION="${CMAKE_PROJECT_VERSION}")
+target_link_libraries(processing_gui_state PUBLIC processing_result)
+hdmapping_processing_target(processing_gui_state)
+list(APPEND _runtime_sources ${_gui_sources})
+
+set(_gui_capture_sources
+    "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1/odometry_capture.cpp"
+    "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp")
+list(APPEND _runtime_sources ${_gui_capture_sources} "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration/step2_state_parameters.cpp")
+
 if(BUILD_TESTING)
+    add_executable(processing_state_test
+        tests/state_revision_test.cpp tests/gui_capture_test.cpp tests/runtime_test_main.cpp ${_gui_capture_sources})
+    target_include_directories(processing_state_test SYSTEM PRIVATE
+        "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include" "${EIGEN3_INCLUDE_DIR}"
+        "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include"
+        "${THIRDPARTY_DIRECTORY}" "${THIRDPARTY_DIRECTORY}/observation_equations/codes" "${THIRDPARTY_DIRECTORY}/vqf/vqf/cpp"
+        "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1" "${PROJECT_SOURCE_DIR}/apps/multi_session_registration")
+    target_compile_definitions(processing_state_test PRIVATE HDMAPPING_GUI_VERSION="${CMAKE_PROJECT_VERSION}")
+    target_link_libraries(processing_state_test PRIVATE
+        processing_gui_state processing_session_snapshot core_no_gui unordered_dense::unordered_dense)
+    if(MSVC)
+        target_compile_options(processing_state_test PRIVATE /bigobj)
+    endif()
+    hdmapping_processing_target(processing_state_test)
+    add_test(NAME processing-state COMMAND processing_state_test)
+    set_tests_properties(processing-state PROPERTIES LABELS processing-state TIMEOUT 45)
+    list(APPEND _runtime_sources tests/state_revision_test.cpp tests/gui_capture_test.cpp
+        "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration/step2_state_parameters_test.cpp")
     add_executable(processing_runtime_test tests/runtime_test.cpp tests/runtime_test_main.cpp)
     target_include_directories(processing_runtime_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
     target_link_libraries(processing_runtime_test PRIVATE processing_ops)

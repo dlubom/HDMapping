@@ -170,7 +170,8 @@ void ManualPoseGraphLoopClosure::Gui(
     GroundControlPoints& gcps,
     ControlPoints& cps,
     int num_edge_extended_before,
-    int num_edge_extended_after)
+    int num_edge_extended_after,
+    void (*cache_edited)())
 {
     if (point_clouds_container.point_clouds.size() > 0)
     {
@@ -598,6 +599,8 @@ void ManualPoseGraphLoopClosure::Gui(
 
                         if (ImGui::Button(("Reload cache##" + std::to_string(i)).c_str()))
                         {
+                            if (cache_edited)
+                                cache_edited();
                             std::cout << point_clouds_container.point_clouds[edges[index_active_edge].index_from].file_name << std::endl;
                             std::cout << point_clouds_container.point_clouds[edges[index_active_edge].index_to].file_name << std::endl;
 
@@ -613,7 +616,8 @@ void ManualPoseGraphLoopClosure::Gui(
                         }
 
                         ImGui::SameLine();
-                        ImGui::InputDouble("downsampling_voxel_size ", &downsampling_voxel_size);
+                        if (ImGui::InputDouble("downsampling_voxel_size ", &downsampling_voxel_size) && cache_edited)
+                            cache_edited();
                     }
 
                     ImGui::BeginDisabled(true);

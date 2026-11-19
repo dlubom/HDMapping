@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"sync"
 	"unicode/utf8"
 )
@@ -67,6 +68,7 @@ func newRegistry() *registry {
 // must already exist durably. A write/sync error poisons mutations until reopen;
 // Get/List still expose the last acknowledged state. Never unlink a live journal.
 type Store struct {
+	admission sync.Mutex
 	mu        sync.Mutex
 	file      journalFile
 	state     *registry
@@ -234,10 +236,14 @@ func sameRequest(a, b SubmitRequest) bool {
 	return bytes.Equal(x, y)
 }
 func (s *Store) Submit(ctx context.Context, req SubmitRequest) (JobRecord, error) {
-	return s.submit(ctx, req, false)
+	return s.submit(ctx, req, false, nil)
 }
 
-func (s *Store) submit(ctx context.Context, req SubmitRequest, prepare bool) (JobRecord, error) {
+func (s *Store) submit(ctx context.Context, req SubmitRequest, prepare bool, reserve func(JobRecord) error) (JobRecord, error) {
+	// Serialize admission by request key across the GUI pin handshake. Other
+	// store operations (including progress, cancellation and lookup) stay live.
+	s.admission.Lock()
+	defer s.admission.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.check(ctx, true); err != nil {
@@ -271,12 +277,23 @@ func (s *Store) submit(ctx context.Context, req SubmitRequest, prepare bool) (Jo
 		return JobRecord{}, fmt.Errorf("job ID: %w", err)
 	}
 	j := JobRecord{ID: JobID(hex.EncodeToString(id[:])), Request: req, Status: Preparing, GUIApplyStatus: "not_requested"}
-	if req.Source == SourceGUI {
+	if req.Access == AccessMutate && (req.Source == SourceGUI || req.CaptureSource != "") {
 		j.GUIApplyStatus = "pending"
 	}
 	if req.Snapshot != nil && !prepare {
 		j.Snapshot = req.Snapshot
 		j.Status = Queued
+	}
+	if reserve != nil {
+		s.mu.Unlock()
+		err = reserve(j)
+		s.mu.Lock()
+		if err != nil {
+			return JobRecord{}, err
+		}
+	}
+	if err = s.check(ctx, true); err != nil {
+		return JobRecord{}, err
 	}
 	if err = s.commit(journalEntry{Job: &j}); err != nil {
 		return JobRecord{}, err
@@ -370,6 +387,9 @@ func (s *Store) setLimit(ctx context.Context, limit int) error {
 	return s.commit(journalEntry{Limit: &limit})
 }
 func (s *Store) commit(e journalEntry) error {
+	if j := e.Job; j != nil && j.Status.terminal() && j.Status != Completed && j.GUIApplyStatus == "pending" {
+		j.GUIApplyStatus = "not_requested"
+	}
 	e.Version = 1
 	e.Sequence = s.state.sequence + 1
 	if err := s.state.validate(e); err != nil {
@@ -403,6 +423,13 @@ func (s *Store) commit(e journalEntry) error {
 	s.state.apply(e)
 	return nil
 }
+func applyOutcome(status string) bool {
+	switch status {
+	case "applied", "closed", "stale_revision", "not_applied", "unconfirmed":
+		return true
+	}
+	return false
+}
 func (r *registry) validate(e journalEntry) error {
 	if e.Version != 1 || e.Sequence != r.sequence+1 {
 		return errors.New("invalid journal version or sequence")
@@ -427,7 +454,7 @@ func (r *registry) validate(e journalEntry) error {
 	if j.Status != Preparing && j.Status != Queued && j.Status != Running && j.Status != Cancelling && !j.Status.terminal() {
 		return errors.New("invalid job status")
 	}
-	if j.GUIApplyStatus != "pending" && j.GUIApplyStatus != "not_requested" {
+	if j.GUIApplyStatus != "pending" && j.GUIApplyStatus != "not_requested" && (j.Status != Completed || !applyOutcome(j.GUIApplyStatus)) {
 		return errors.New("invalid GUI apply status")
 	}
 	if j.Snapshot != nil && !validSnapshot(j.Snapshot, j.Request.Operation.Target) {
@@ -463,6 +490,14 @@ func (r *registry) validate(e journalEntry) error {
 			return ErrRequestConflict
 		}
 		if old.Status.terminal() {
+			// Older journals marked read-only results as pending.
+			readOnly := j.Request.Access == AccessRead && j.GUIApplyStatus == "not_requested"
+			if old.Status == Completed && old.GUIApplyStatus == "pending" && (readOnly || applyOutcome(j.GUIApplyStatus)) {
+				old.GUIApplyStatus = j.GUIApplyStatus
+				if reflect.DeepEqual(old, *j) {
+					return nil
+				}
+			}
 			return errors.New("terminal job is immutable")
 		}
 		allowed := j.Status == old.Status || j.Status == Interrupted ||
@@ -554,4 +589,19 @@ func decodeJournal(reader io.Reader) (*registry, int64, error) {
 		r.apply(e)
 		valid += int64(len(header)) + int64(n)
 	}
+}
+
+// RecordGUIApply updates only the separate application outcome after publication.
+func (s *Store) RecordGUIApply(ctx context.Context, id JobID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.check(ctx, true); err != nil {
+		return err
+	}
+	j, ok := s.state.jobs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	j.GUIApplyStatus = status
+	return s.commit(journalEntry{Job: &j})
 }

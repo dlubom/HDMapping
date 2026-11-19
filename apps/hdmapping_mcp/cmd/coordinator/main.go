@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/gui"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/protocol"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/supervisor"
@@ -71,7 +73,11 @@ func serve(ctx context.Context, processes *supervisor.Supervisor) (err error) {
 	if err := processes.Recover(recovery, store); err != nil {
 		return err
 	}
-	scheduler, err := jobs.NewScheduler(store, processes)
+	g := &guiJobs{Supervisor: processes, registry: gui.NewRegistry(), owners: make(map[jobs.JobID]*gui.Session)}
+	life, stop := context.WithCancel(ctx)
+	g.wg.Go(func() { g.registry.Expire(life) })
+	defer func() { stop(); g.wg.Wait() }()
+	scheduler, err := jobs.NewScheduler(store, g)
 	if err != nil {
 		return err
 	}
@@ -79,11 +85,21 @@ func serve(ctx context.Context, processes *supervisor.Supervisor) (err error) {
 	processes.Progress = func(id jobs.JobID, progress jobs.ProgressEvent) error {
 		return scheduler.ReportProgress(context.Background(), id, progress)
 	}
-	return protocol.Serve(ctx, processes.Directory, processes.Version, dispatch(scheduler, processes))
+	return protocol.Serve(ctx, processes.Directory, processes.Version, dispatch(scheduler, g))
 }
 
-func dispatch(scheduler *jobs.Scheduler, processes *supervisor.Supervisor) protocol.Handler {
+func dispatch(scheduler *jobs.Scheduler, processes *guiJobs) protocol.Handler {
+	// Calls awaiting a GUI must leave transport slots for its polls and replies.
+	awaiting := make(chan struct{}, 16)
 	return func(ctx context.Context, method string, body json.RawMessage) (any, error) {
+		if !strings.HasPrefix(method, "gui.") {
+			select {
+			case awaiting <- struct{}{}:
+				defer func() { <-awaiting }()
+			default:
+				return nil, errors.New("coordinator busy: retry request")
+			}
+		}
 		switch method {
 		case "ping":
 			return os.Getpid(), nil
@@ -94,7 +110,7 @@ func dispatch(scheduler *jobs.Scheduler, processes *supervisor.Supervisor) proto
 			if err := json.Unmarshal(body, &request); err != nil {
 				return nil, fmt.Errorf("decode submit request: %w", err)
 			}
-			if request.Snapshot == nil || !filepath.IsAbs(request.Snapshot.ManifestPath) {
+			if request.Snapshot != nil && !filepath.IsAbs(request.Snapshot.ManifestPath) {
 				return nil, errors.New("submit requires an absolute captured snapshot path")
 			}
 			if err := supervisor.CheckArgumentDepth(request.Operation.Scope); err != nil {
@@ -102,6 +118,15 @@ func dispatch(scheduler *jobs.Scheduler, processes *supervisor.Supervisor) proto
 			}
 			if err := supervisor.CheckArgumentDepth(request.Operation.Parameters); err != nil {
 				return nil, fmt.Errorf("parameters: %w", err)
+			}
+			if request.Snapshot == nil {
+				if request.CaptureSource != request.Operation.Target.StateID {
+					return nil, errors.New("live capture requires its target state ID")
+				}
+				return processes.submit(ctx, scheduler, request)
+			}
+			if request.Source == jobs.SourceGUI {
+				return processes.submit(ctx, scheduler, request)
 			}
 			return scheduler.SubmitForPreparation(ctx, request)
 		case "jobs.get", "jobs.cancel":
@@ -120,7 +145,7 @@ func dispatch(scheduler *jobs.Scheduler, processes *supervisor.Supervisor) proto
 			}
 			return scheduler.List(ctx, filter)
 		default:
-			return nil, fmt.Errorf("unsupported coordinator method %q", method)
+			return processes.handle(ctx, method, body)
 		}
 	}
 }

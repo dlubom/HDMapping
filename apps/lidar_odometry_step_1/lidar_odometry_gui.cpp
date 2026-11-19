@@ -28,6 +28,11 @@
 #include <Core/registration_plane_feature.h>
 #include <Core/session.h>
 
+#ifdef HDMAPPING_GUI_BRIDGE
+#include "odometry_capture.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#endif
 #include "toml_io.h"
 #include <HDMapping/HDMAPPING_ConfigureInfo.hpp>
 #include <chrono>
@@ -203,6 +208,108 @@ bool pipelinePending = false;
 bool pendingCompute = true, pendingSave = true;
 std::string pendingFolder;
 void startPipeline(const std::string& folder, bool compute, bool save);
+
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace proc = HDMapping::Processing;
+namespace
+{
+    using json = nlohmann::json;
+    std::unique_ptr<proc::GuiStateBridge> guiState;
+    std::unique_ptr<proc::GuiStateConnection> guiConnection;
+
+    json odometryParameters()
+    {
+        static const TomlIO schema;
+        json values = json::object();
+        for (const auto& [name, member] : schema.POINTERS)
+            std::visit(
+                [&](auto pointer)
+                {
+                    values[name] = params.*pointer;
+                },
+                member);
+        for (const auto& [name, member] : schema.MOTION_MODEL_CORRECTION_POINTERS)
+            values[name] = params.motion_model_correction.*member;
+        const auto grid = [](const NDT::GridParameters& g)
+        {
+            return json::array({ g.resolution_X, g.resolution_Y, g.resolution_Z });
+        };
+        values["indoor_resolution"] = grid(params.in_out_params_indoor);
+        values["outdoor_resolution"] = grid(params.in_out_params_outdoor);
+        values["ablation"] = { params.ablation_study_use_planarity,           params.ablation_study_use_norm,
+                               params.ablation_study_use_hierarchical_rgd,    params.ablation_study_use_view_point_and_normal_vectors,
+                               params.ablation_study_use_threshold_outer_rgd, params.ablation_study_use_anisotropic_weighting };
+        values["remove_initial_imu_bias"] = params.use_removie_imu_bias_from_first_stationary_scan;
+        values["save_index_pose"] = params.save_index_pose;
+        values["lm_factor_damping"] = params.lm_factor_damping;
+        values["convergence_delta_threshold_outer_rgd"] = params.convergence_delta_threshold_outer_rgd;
+        auto visible = json::array();
+        for (size_t i = 0; i < worker_data.size(); ++i)
+            if (worker_data[i].show)
+                visible.push_back(i);
+        values["selected_chunks"] = std::move(visible);
+        values["range"] = { index_begin, index_end };
+        values["initial_transform"] = std::vector<double>(params.m_g.data(), params.m_g.data() + 16);
+        return values;
+    }
+
+    proc::StateSummary describeOdometry()
+    {
+        if (loRunning || pipelinePending)
+            return { {}, json::object(), { { "step", 1 }, { "busy", true } } };
+        return { {},
+                 odometryParameters(),
+                 { { "step", 1 },
+                   { "busy", false },
+                   { "directory", working_directory },
+                   { "chunks", worker_data.size() },
+                   { "prepared", step_1_done } } };
+    }
+
+    proc::MutationResult mutateOdometry(const proc::OperationRequest& request)
+    {
+        if (loRunning || pipelinePending)
+            return proc::OperationError{ "state_busy", "Odometry owns the prepared data", json::object() };
+        const auto& values = request.parameters;
+        if (request.operation != "step1.set_parameters" || !request.scope.empty() || values.empty())
+            return proc::OperationError{ "invalid_request", "Expected odometry parameters and an empty scope", json::object() };
+        bool parallel = params.useMultithread;
+        int iterations = params.nr_iter;
+        for (const auto& [key, value] : values.items())
+        {
+            if (key == "useMultithread" && value.is_boolean())
+                parallel = value.get<bool>();
+            else if (key == "nr_iter" && value.is_number_integer() && value >= 1 && value <= std::numeric_limits<int>::max())
+                iterations = value.get<int>();
+            else
+                return proc::OperationError{ "invalid_parameters", "Invalid odometry parameter: " + key, json::object() };
+        }
+        params.useMultithread = parallel;
+        params.nr_iter = iterations;
+        return describeOdometry();
+    }
+
+    void connectOdometry()
+    {
+        guiState = std::make_unique<proc::GuiStateBridge>(proc::GuiStateCallbacks{
+            describeOdometry,
+            mutateOdometry,
+            [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
+            {
+                if (loRunning || pipelinePending || calculations_failed)
+                    return {};
+                return std::make_unique<OdometryCapture>(std::move(target), worker_data, params, odometryParameters());
+            },
+            [](const proc::ArtifactManifest&) -> std::optional<proc::OperationError>
+            {
+                return proc::OperationError{ "incompatible_result",
+                                             "A published registration session cannot replace an odometry workspace",
+                                             json::object() };
+            } });
+        guiConnection = std::make_unique<proc::GuiStateConnection>(*guiState, "lidar_odometry_step_1");
+    }
+} // namespace
+#endif
 
 static void resources_gui()
 {
@@ -1227,6 +1334,9 @@ void settings_gui()
             if (ImGui::Button("Point cloud consistency and trajectory smoothness"))
             {
                 run_consistency(worker_data, params);
+#ifdef HDMAPPING_GUI_BRIDGE
+                guiState->Changed();
+#endif
                 trajectory_points_dirty = true;
             }
             if (ImGui::IsItemHovered())
@@ -1349,6 +1459,9 @@ void settings_gui()
                 {
                     show_reference_points = true;
                     load_reference_point_clouds(input_file_names, params);
+#ifdef HDMAPPING_GUI_BRIDGE
+                    guiState->Changed();
+#endif
                 }
             }
 
@@ -1375,6 +1488,9 @@ void settings_gui()
                 if (ImGui::Button("Filter reference buckets"))
                 {
                     filter_reference_buckets(params);
+#ifdef HDMAPPING_GUI_BRIDGE
+                    guiState->Changed();
+#endif
                 }
             }
 
@@ -1612,6 +1728,9 @@ void settings_gui()
 
                     if (ImGui::Button("Accept Gizmo (only translation)"))
                     {
+#ifdef HDMAPPING_GUI_BRIDGE
+                        guiState->Changed();
+#endif
                         if (index_end < worker_data.size())
                         {
                             if (worker_data[index_end].intermediate_trajectory.size() > 0)
@@ -1874,6 +1993,14 @@ void startPipeline(const std::string& folder, bool compute, bool save)
 {
     if (loRunning)
         return;
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState->Reserved())
+        return;
+    if (!folder.empty())
+        guiState->Open();
+    else
+        guiState->Changed();
+#endif
     pendingFolder = folder;
     pendingCompute = compute;
     pendingSave = save;
@@ -2074,6 +2201,22 @@ static void quit_abandoned_run()
 
 void display()
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    static std::optional<json> previous;
+    if (!loRunning && !pipelinePending)
+    {
+        const auto current = odometryParameters();
+        if (previous && *previous != current)
+            guiState->Changed();
+        previous = current;
+    }
+    else
+        previous.reset();
+    const auto before = guiState->Target();
+    guiConnection->Poll();
+    if (before != guiState->Target() && !loRunning && !pipelinePending)
+        previous = odometryParameters();
+#endif
     if (pipelinePending)
     {
         pipelinePending = false;
@@ -2338,6 +2481,19 @@ void display()
 
     view_kbd_shortcuts();
 
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState->Reserved())
+    {
+        // Rendering and camera input above remain live during snapshot transfer.
+        takeDroppedFiles();
+        ImGui::TextUnformatted("Processing data reserved");
+        end3DAndDrawLabels();
+        if (compass_ruler)
+            drawMiniCompassWithRuler();
+        rlImGuiEnd();
+        return;
+    }
+#endif
     // Drag and drop: a Mandeye data folder, or any file in one, is processed like "Load & process scanning".
     const auto dropped = takeDroppedFiles();
     if (!dropped.empty() && !loRunning && !pipelinePending)
@@ -2911,7 +3067,14 @@ int main(int argc, char* argv[])
             InitTaskbarProgress();
 #endif
 
+#ifdef HDMAPPING_GUI_BRIDGE
+            connectOdometry();
+#endif
             mainLoop(confirm_close);
+#ifdef HDMAPPING_GUI_BRIDGE
+            SetWindowState(FLAG_WINDOW_HIDDEN);
+            guiConnection->Close();
+#endif
             if (pipelineThread.joinable())
                 pipelineThread.join();
 

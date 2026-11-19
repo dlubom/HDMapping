@@ -58,7 +58,8 @@ public:
         GroundControlPoints& gcps,
         ControlPoints& cps,
         int num_edge_extended_before,
-        int num_edge_extended_after);
+        int num_edge_extended_after,
+        void (*cache_edited)() = nullptr);
     void Render(
         PointClouds& point_clouds_container,
         int index_loop_closure_source,

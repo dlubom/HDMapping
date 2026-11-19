@@ -53,31 +53,40 @@ func (s *Scheduler) check() error {
 	return s.err
 }
 func (s *Scheduler) Submit(ctx context.Context, req SubmitRequest) (JobRecord, error) {
-	return s.submit(ctx, req, false)
+	return s.submit(ctx, req, false, nil)
 }
 
 // SubmitForPreparation validates even pre-captured inputs through Executor.Prepare.
 // Untrusted input can enter the journal in preparing but cannot enter the queue.
 func (s *Scheduler) SubmitForPreparation(ctx context.Context, req SubmitRequest) (JobRecord, error) {
-	return s.submit(ctx, req, true)
+	return s.submit(ctx, req, true, nil)
 }
 
-func (s *Scheduler) submit(ctx context.Context, req SubmitRequest, prepare bool) (JobRecord, error) {
+// SubmitWithReservation pins the exact live input before its job ID becomes observable.
+func (s *Scheduler) SubmitWithReservation(ctx context.Context, req SubmitRequest, reserve func(JobRecord) error) (JobRecord, error) {
+	return s.submit(ctx, req, true, reserve)
+}
+func (s *Scheduler) submit(ctx context.Context, req SubmitRequest, prepare bool, reserve func(JobRecord) error) (JobRecord, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.check(); err != nil {
+		s.mu.Unlock()
 		return JobRecord{}, err
 	}
-	j, err := s.store.submit(ctx, req, prepare)
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+	j, err := s.store.submit(ctx, req, prepare, reserve)
 	if err != nil {
 		return JobRecord{}, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.notify()
 	s.pump()
 	if s.err != nil {
 		return j, s.err
 	}
-	return s.store.Get(ctx, j.ID)
+	return s.store.Get(context.Background(), j.ID)
 }
 func (s *Scheduler) Get(ctx context.Context, id JobID) (JobRecord, error) {
 	return s.store.Get(ctx, id)
@@ -126,7 +135,10 @@ func (s *Scheduler) Cancel(ctx context.Context, id JobID) (JobRecord, error) {
 	}
 	s.notify()
 	s.pump()
-	return clone(j), s.err
+	if s.err != nil {
+		return j, s.err
+	}
+	return s.store.Get(context.Background(), id)
 }
 
 // ReportProgress records observable engine progress without inferring percentages.
@@ -153,6 +165,12 @@ func (s *Scheduler) ReportProgress(ctx context.Context, id JobID, p ProgressEven
 
 // Wait observes terminal state without polling. Its context only cancels waiting.
 func (s *Scheduler) Wait(ctx context.Context, id JobID) (JobRecord, error) {
+	return s.WaitForSource(ctx, id, nil)
+}
+
+// WaitForSource also interrupts an admitted, unstarted capture immediately
+// when its GUI disappears. Active captures observe their own transfer outcome.
+func (s *Scheduler) WaitForSource(ctx context.Context, id JobID, sourceDone <-chan struct{}) (JobRecord, error) {
 	for {
 		s.mu.Lock()
 		j, err := s.store.Get(ctx, id)
@@ -169,6 +187,17 @@ func (s *Scheduler) Wait(ctx context.Context, id JobID) (JobRecord, error) {
 		case <-ctx.Done():
 			return JobRecord{}, ctx.Err()
 		case <-changed:
+		case <-sourceDone:
+			sourceDone = nil
+			s.mu.Lock()
+			j, err := s.store.Get(ctx, id)
+			if err == nil && j.Status == Preparing && s.active[id] == nil {
+				s.finish(j, Publication{}, ErrSourceLost)
+			}
+			s.mu.Unlock()
+			if err != nil {
+				return JobRecord{}, err
+			}
 		}
 	}
 }
@@ -277,6 +306,9 @@ func (s *Scheduler) finish(j JobRecord, result Publication, runErr error) {
 		j.Error = &JobError{Code: "interrupted", Message: "scheduler closed before publication"}
 	case j.Status == Cancelling:
 		j.Status = Cancelled
+	case errors.Is(runErr, ErrSourceLost):
+		j.Status = Interrupted
+		j.Error = &JobError{Code: "interrupted", Message: runErr.Error()}
 	default:
 		j.Status = Failed
 		if runErr == nil {
@@ -343,4 +375,8 @@ func (s *Scheduler) Close() error {
 	s.notify()
 	close(s.done)
 	return s.err
+}
+
+func (s *Scheduler) RecordGUIApply(ctx context.Context, id JobID, status string) error {
+	return s.store.RecordGUIApply(ctx, id, status)
 }

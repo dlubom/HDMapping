@@ -37,6 +37,11 @@ add_executable(
 
 target_compile_definitions(lidar_odometry_step_1 PRIVATE WITH_GUI=1)
 target_apply_hdmapping_profiler(lidar_odometry_step_1)
+if(BUILD_WITH_MCP)
+    target_sources(lidar_odometry_step_1 PRIVATE odometry_capture.cpp)
+    target_compile_definitions(lidar_odometry_step_1 PRIVATE HDMAPPING_GUI_BRIDGE)
+    target_link_libraries(lidar_odometry_step_1 PRIVATE processing_gui_state)
+endif()
 
 # lidar_odometry_gui.cpp is raylib-based (ported off GLUT; the GLUT build is kept as
 # apps/lidar_odometry_step_1_legacy): <Core/raylib_utils.hpp> (core_raylib_utils) replaces

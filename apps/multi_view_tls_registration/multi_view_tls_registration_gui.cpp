@@ -105,6 +105,15 @@
 #include "../lidar_odometry_step_1/lidar_odometry_utils.h"
 #include "bow_loop_closure_detector.h"
 #include "multi_view_tls_registration.h"
+#include "step2_solver_selection.h"
+
+#ifdef HDMAPPING_GUI_STATE
+#include "step2_state_parameters.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#include <HDMapping/Processing/SessionSnapshot.h>
+#include <HDMapping/SessionPaths.h>
+#endif
 
 #include <HDMapping/HDMAPPING_ConfigureInfo.hpp>
 
@@ -985,12 +994,6 @@ bool gnssWithOffset = false;
 bool tumSubtractFirstPose = false;
 
 // radio button selectors
-static int NDTnomSelection = 0;
-static int NDTpeSelection = 0;
-static int NDT3dSelection = 0;
-static int ICPnomSelection = 0;
-static int ICPpeSelection = 0;
-static int ICP3dSelection = 0;
 static int RPFnomSelection = 0;
 static int RPFpeSelection = 0;
 static int RPF3dSelection = 0;
@@ -1135,13 +1138,36 @@ bool isGizmoDragging()
     return gizmo_drag_first_index >= 0;
 }
 
-#ifdef HDMAPPING_SNAPSHOT_PROBE
+#if defined(HDMAPPING_SNAPSHOT_PROBE) || defined(HDMAPPING_GUI_STATE)
 const auto session_owner = std::make_shared<Session>();
 Session& session = *session_owner;
 #else
 Session session;
 #endif
 PointClouds::PointCloudDimensions session_dims;
+#ifdef HDMAPPING_GUI_STATE
+namespace proc = HDMapping::Processing;
+static proc::GuiStateBridge* state_bridge = nullptr;
+static std::string state_path;
+#endif
+
+// Bulk geometry edits may replace points or trajectories while preserving all sizes and poses.
+static void markBulkEdit()
+{
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge)
+        state_bridge->Changed();
+#endif
+}
+
+static void openedStep2Session([[maybe_unused]] const std::string& path)
+{
+#ifdef HDMAPPING_GUI_STATE
+    state_path = path;
+    if (state_bridge)
+        state_bridge->Open();
+#endif
+}
 
 // Writes the in-progress drag poses into the scans and ends the drag.
 void commitGizmoDrag()
@@ -1178,6 +1204,8 @@ void commitGizmoDrag()
 bool session_loaded = false;
 std::vector<std::string> geoids;
 std::string selected_geoid_model;
+static double angle_diff = 5.0;
+static bool skip_ts_0 = true;
 
 // these functions performs experiment from paper
 //@article
@@ -1240,6 +1268,11 @@ void draw_section_preview();
 
 void ndt_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.ndt);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::InputFloat3("Bucket size (x,y,z) [m]", tls_registration.ndt.bucket_size);
     if (tls_registration.ndt.bucket_size[0] < 0.01)
         tls_registration.ndt.bucket_size[0] = 0.01f;
@@ -1262,32 +1295,24 @@ void ndt_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &NDTnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &NDTnomSelection, 1);
-
-    tls_registration.ndt.is_gauss_newton = (NDTnomSelection == 0);
-    tls_registration.ndt.is_levenberg_marguardt = (NDTnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &NDTpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &NDTpeSelection, 1);
-
-    tls_registration.ndt.is_cw = (NDTpeSelection == 0);
-    tls_registration.ndt.is_wc = (NDTpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &NDT3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &NDT3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &NDT3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.ndt.is_tait_bryan_angles = (NDT3dSelection == 0);
-    tls_registration.ndt.is_quaternion = (NDT3dSelection == 1);
-    tls_registration.ndt.is_rodrigues = (NDT3dSelection == 2);
+    selection.write(tls_registration.ndt);
 
     if (ImGui::Button("Optimization"))
     {
@@ -1296,6 +1321,7 @@ void ndt_gui()
         double mui = 0.0;
         // ndt.optimize(point_clouds_container.point_clouds, rms_initial, rms_final, mui);
         // spdlog::info("mui: " << mui << " rms_initial: " << rms_initial << " rms_final: " << rms_final << std::endl;
+        markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, false, tls_registration.compute_mean_and_cov_for_bucket);
     }
 
@@ -1305,6 +1331,7 @@ void ndt_gui()
         double rms_final = 0.0;
         double mui = 0.0;
 
+        markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, true, tls_registration.compute_mean_and_cov_for_bucket);
     }
     if (ImGui::IsItemHovered())
@@ -1324,12 +1351,14 @@ void ndt_gui()
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
     {
+        markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_left_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
     }
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
     {
+        markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_right_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
     }
@@ -1385,6 +1414,11 @@ void ndt_gui()
 
 void icp_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.icp);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::PushItemWidth(ImGuiNumberWidth);
     ImGui::InputFloat("Search radius", &tls_registration.icp.search_radius, 0.01f, 0.1f);
     if (tls_registration.icp.search_radius < 0.01f)
@@ -1407,46 +1441,47 @@ void icp_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &ICPnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &ICPnomSelection, 1);
-
-    tls_registration.icp.is_gauss_newton = (ICPnomSelection == 0);
-    tls_registration.icp.is_levenberg_marguardt = (ICPnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &ICPpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &ICPpeSelection, 1);
-
-    tls_registration.icp.is_cw = (ICPpeSelection == 0);
-    tls_registration.icp.is_wc = (ICPpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &ICP3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &ICP3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &ICP3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.icp.is_tait_bryan_angles = (ICP3dSelection == 0);
-    tls_registration.icp.is_quaternion = (ICP3dSelection == 1);
-    tls_registration.icp.is_rodrigues = (ICP3dSelection == 2);
+    selection.write(tls_registration.icp);
 
     if (ImGui::Button("Optimization point to point source to target"))
+    {
+        markBulkEdit();
         tls_registration.icp.optimization_point_to_point_source_to_target(session.point_clouds_container);
+    }
 
     ImGui::Separator();
 
     ImGui::Text("Optimization source to target Lie-algebra:");
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
+    {
+        markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_left_jacobian(session.point_clouds_container);
+    }
 
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
+    {
+        markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_right_jacobian(session.point_clouds_container);
+    }
 
     ImGui::Separator();
 
@@ -1512,28 +1547,46 @@ void rpf_gui()
     ImGui::Separator();
     ImGui::Text("Optimize point to projection onto plane source to target:");
     if (ImGui::Button("Basic Jacobian"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target(
             session.point_clouds_container);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra left Jacobian"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_left_jacobian(
             session.point_clouds_container);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra right Jacobian"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_right_jacobian(
             session.point_clouds_container);
+    }
 
     ImGui::Separator();
 
     ImGui::Text("Optimize source to target:");
     if (ImGui::Button("point to plane (using dot product)"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_plane_source_to_target(session.point_clouds_container);
+    }
     ImGui::SameLine();
     if (ImGui::Button("distance point to plane"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_distance_point_to_plane_source_to_target(session.point_clouds_container);
+    }
     ImGui::SameLine();
     if (ImGui::Button("plane to plane"))
+    {
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_plane_to_plane_source_to_target(session.point_clouds_container);
+    }
 }
 
 void pca_gui()
@@ -2007,6 +2060,7 @@ namespace
             return;
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
+        markBulkEdit();
 
         bow_state.detecting = true;
         {
@@ -2428,7 +2482,8 @@ void loop_closure_gui()
             session.ground_control_points,
             session.control_points,
             num_edge_extended_before,
-            num_edge_extended_after);
+            num_edge_extended_after,
+            markBulkEdit);
 
         new_loop_closure_index = (prev_index_active_edge != session.pose_graph_loop_closure.index_active_edge);
     }
@@ -2551,8 +2606,6 @@ void lio_segments_gui()
 
         ImGui::Text("Fuse IMU inclination: ");
         ImGui::SameLine();
-
-        static double angle_diff = 5.0;
 
         if (ImGui::Button("Set those that satisfy acceptable angle"))
         {
@@ -3029,6 +3082,7 @@ void loadSession(const std::string& session_file_name)
 {
     spdlog::info("Session file: '{}'", session_file_name);
 
+    markBulkEdit();
     if (session.load(
             fs::path(session_file_name).string(),
             tls_registration.is_decimate,
@@ -3037,6 +3091,7 @@ void loadSession(const std::string& session_file_name)
             tls_registration.bucket_z,
             tls_registration.calculate_offset))
     {
+        openedStep2Session(session_file_name);
         session_loaded = true;
         index_begin = 0;
         index_end = session.point_clouds_container.point_clouds.size() - 1;
@@ -3152,7 +3207,11 @@ std::string saveSession(std::string output_file_name = "")
         const std::string poses_file_name = (dir / (stem + "_poses.mrp")).string();
 
         exportInMemoryPointClouds(dir, false);
-        session.save(output_file_name, poses_file_name, initial_poses_file_name, false);
+        [[maybe_unused]] bool saved = session.save(output_file_name, poses_file_name, initial_poses_file_name, false);
+#ifdef HDMAPPING_GUI_STATE
+        if (saved)
+            state_path = output_file_name;
+#endif
         writeGnssTumToSessionFile(output_file_name, tls_registration.gnss, tls_registration.tum);
         spdlog::info("Saving result to: '{}'", poses_file_name);
         session.point_clouds_container.save_poses(poses_file_name, false);
@@ -3186,6 +3245,7 @@ std::string saveSession(std::string output_file_name = "")
 // session folder) and does its own in-memory fill.
 void finalizeScanSession(const std::string& sourceDir, bool fillInSession)
 {
+    openedStep2Session(sourceDir);
     session_loaded = true;
     index_begin = 0;
     index_end = session.point_clouds_container.point_clouds.size() - 1;
@@ -3784,6 +3844,7 @@ void settings_gui()
             {
                 session.working_directory = fs::path(input_file_name).parent_path().string();
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load(
                         session.working_directory.c_str(),
                         input_file_name.c_str(),
@@ -3797,7 +3858,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(input_file_name);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::SameLine();
@@ -3822,6 +3886,7 @@ void settings_gui()
             {
                 session.working_directory = fs::path(input_file_name).parent_path().string();
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load_eth(
                         session.working_directory.c_str(),
                         input_file_name.c_str(),
@@ -3834,7 +3899,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(input_file_name);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::Text("ETH dataset: ");
@@ -3857,6 +3925,7 @@ void settings_gui()
                 for (size_t i = 0; i < input_file_names.size(); i++)
                     spdlog::info("{}", input_file_names[i]);
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load_3DTK_tls(
                         input_file_names,
                         tls_registration.is_decimate,
@@ -3868,7 +3937,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(session.working_directory);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::Text("3DTK dataset (18: the campus of the Jacobs University Bremen)");
@@ -5447,6 +5519,27 @@ void display()
     frame_mvp_3d = MatrixMultiply(app_state.camera.frameView3D, app_state.camera.frameProj3D);
 
     showAxes();
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge && state_bridge->Reserved())
+    {
+        // Some editor panels write back to scans even on idle frames. During a pin
+        // draw only from the scan cache, with the usual camera matrices and input.
+        scan_renderer.draw(
+            session.point_clouds_container.point_clouds,
+            static_cast<float>(app_state.point_size),
+            scanColorModeFromScheme(csPointCloud),
+            static_cast<float>(session_dims.z_min),
+            static_cast<float>(session_dims.z_max));
+        raylib_widgets::end3DMatrixStack(io.DisplaySize.x, io.DisplaySize.y);
+        rlImGuiBegin();
+        view_kbd_shortcuts();
+        ImGui::Begin("Processing");
+        ImGui::TextUnformatted("Session reserved for processing. Camera controls are available.");
+        ImGui::End();
+        rlImGuiEnd();
+        return;
+    }
+#endif
     drawIntersectionGrids(session.point_clouds_container, session_dims);
 
     // renderLoopClosure() hides every scan except the current source/target
@@ -5980,7 +6073,6 @@ void display()
                 ImGui::Separator();
                 if (ImGui::BeginMenu("Save all marked scans"))
                 {
-                    static bool skip_ts_0 = true;
                     ImGui::Checkbox("Skip points with zero ts", &skip_ts_0);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Invalid points with zero timestamp will be skipped during export");
@@ -6260,6 +6352,7 @@ void display()
                         if (input_file_names.size() > 0)
                         {
                             Eigen::Vector3d out_offset(0.0, 0.0, 0.0);
+                            markBulkEdit();
                             if (!tls_registration.gnss.load_data_from_gnss_and_convert_to_92(input_file_names, out_offset, gnssWithOffset))
                             {
                                 spdlog::error("Error loading GNSS files!");
@@ -6282,6 +6375,7 @@ void display()
 
                         if (input_file_names.size() > 0)
                         {
+                            markBulkEdit();
                             if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
                             {
                                 spdlog::error("Error loading GNSS files!");
@@ -6299,6 +6393,7 @@ void display()
 
                         if (input_file_names.size() > 0)
                         {
+                            markBulkEdit();
                             if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
                             {
                                 spdlog::error("Error loading GNSS files!");
@@ -6319,6 +6414,7 @@ void display()
 
                         if (input_file_names.size() > 0)
                         {
+                            markBulkEdit();
                             if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
                                 spdlog::error("Error loading NMEA files!");
                         }
@@ -6336,6 +6432,7 @@ void display()
 
                         if (input_file_names.size() > 0)
                         {
+                            markBulkEdit();
                             if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
                                 spdlog::error("Error loading NMEA files!");
                         }
@@ -6482,6 +6579,7 @@ void display()
 
                         if (input_file_names.size() > 0)
                         {
+                            markBulkEdit();
                             if (!tls_registration.tum.load_data_from_tum(input_file_names, tumSubtractFirstPose))
                             {
                                 spdlog::error("Error loading TUM trajectory files!");
@@ -7389,6 +7487,18 @@ void mouse(int glut_button, int state, int x, int y)
 
     if (!io.WantCaptureMouse)
     {
+#ifdef HDMAPPING_GUI_STATE
+        if (state_bridge && state_bridge->Reserved())
+        {
+            if (state == GLUT_DOWN)
+                app_state.mouse_buttons |= 1 << glut_button;
+            else if (state == GLUT_UP)
+                app_state.mouse_buttons = 0;
+            app_state.mouse_old_x = x;
+            app_state.mouse_old_y = y;
+            return;
+        }
+#endif
         if (glut_button == GLUT_LEFT_BUTTON && state == GLUT_DOWN && !io.KeyCtrl && !io.KeyShift &&
             translate_tool.step != TranslateTool::Step::Idle && translate_tool.step != TranslateTool::Step::Ready)
         {
@@ -7741,6 +7851,249 @@ static void captureSessionProbe(const fs::path& destination)
 }
 #endif
 
+#ifdef HDMAPPING_GUI_STATE
+// Read editor inputs at the GUI dispatch boundary. Core panels edit poses,
+// constraints and control points directly, including from keyboard shortcuts.
+// Bulk point and trajectory arrays are tracked at their editing call sites.
+static nlohmann::json step2EditorInputs()
+{
+    using nlohmann::json;
+    const auto& clouds = session.point_clouds_container;
+    const auto& graph = session.pose_graph_loop_closure;
+    const auto& rpf = tls_registration.registration_plane_feature;
+    const auto& pgs = tls_registration.pose_graph_slam;
+    const auto& gnss = tls_registration.gnss;
+    const auto& bow = bow_state.params;
+    json inputs = describeStep2Parameters(tls_registration);
+    inputs["range"] = { index_begin, index_end, manipulate_only_marked_gizmo, angle_diff };
+    inputs["endpoints"] = { index_loop_closure_source, index_loop_closure_target, num_edge_extended_before, num_edge_extended_after };
+    inputs["import"] = { tls_registration.calculate_offset, tls_registration.is_decimate, fillInSession, session.load_cache_mode };
+    inputs["decimation"] = { tls_registration.bucket_x, tls_registration.bucket_y, tls_registration.bucket_z };
+    inputs["trajectory_export"] = { skip_ts_0,
+                                    tls_registration.is_trajectory_export_downsampling,
+                                    tls_registration.curve_consecutive_distance_meters,
+                                    tls_registration.not_curve_consecutive_distance_meters };
+    inputs["plane_features"] = { rpf.search_radius,     rpf.number_of_threads, rpf.number_of_iterations, rpf.is_adaptive_robust_kernel,
+                                 rpf.is_fix_first_node, RPFnomSelection,       RPFpeSelection,           RPF3dSelection };
+    inputs["graph_solver"] = { pgs.search_radius,
+                               pgs.number_of_threads,
+                               pgs.number_of_iterations_pair_wise_matching,
+                               pgs.overlap_threshold,
+                               pgs.is_adaptive_robust_kernel,
+                               pgs.is_fix_first_node,
+                               PGSnomSelection,
+                               PGSpeSelection,
+                               PGS3dSelection,
+                               PGSpwmtSelection };
+    inputs["manual_graph"] = { graph.index_active_edge,
+                               graph.search_radious,
+                               graph.icp_all_edges_start_radius,
+                               graph.keep_initial_trajectory_curvature,
+                               graph.use_gnss_correspondences };
+    inputs["motion_sigmas"] = { graph.motion_model_w_px_1_sigma_m,   graph.motion_model_w_py_1_sigma_m,
+                                graph.motion_model_w_pz_1_sigma_m,   graph.motion_model_w_om_1_sigma_deg,
+                                graph.motion_model_w_fi_1_sigma_deg, graph.motion_model_w_ka_1_sigma_deg };
+    inputs["gnss"] = { gnssWithOffset,
+                       selected_geoid_model,
+                       gnss.WGS84ReferenceLatitude,
+                       gnss.WGS84ReferenceLongitude,
+                       gnss.geoidSeparation,
+                       gnss.setWGS84ReferenceFromFirstPose,
+                       gnss.gnss_poses.size() };
+    inputs["tum"] = { tumSubtractFirstPose, tls_registration.tum.version };
+    inputs["bow"] = { bow.min_arc_gap_m, bow.max_xy_dist_m,     bow.min_bow_score,           bow.min_inliers,
+                      bow.orb_features,  bow.max_image_size_px, bow_state.selected_candidate };
+    inputs["offset"] = { clouds.offset.x(), clouds.offset.y(), clouds.offset.z() };
+    inputs["offset_to_apply"] = { clouds.offset_to_apply.x(), clouds.offset_to_apply.y(), clouds.offset_to_apply.z() };
+    inputs["sections"] = { clouds.xz_intersection, clouds.yz_intersection, clouds.xy_intersection, clouds.intersection_width };
+    inputs["picking"] = { observation_picking.picking_plane_height,
+                          observation_picking.picking_plane_threshold,
+                          session.ground_control_points.default_lidar_height_above_ground };
+    for (const auto& dir : bow_state.camera_dirs)
+        inputs["camera_dirs"].push_back(dir.data());
+    {
+        std::lock_guard lock(bow_state.results_mutex);
+        inputs["bow_results"] = bow_state.results.size();
+    }
+    // Group pose matrices in contiguous storage. Comparing lightweight scan
+    // metadata never traverses the points or serializes them per frame.
+    std::vector<std::uint8_t> poses;
+    poses.reserve(32 * sizeof(double) * clouds.point_clouds.size());
+    for (const auto& scan : clouds.point_clouds)
+    {
+        for (const auto* matrix : { scan.m_pose.data(), scan.m_initial_pose.data() })
+        {
+            const auto* data = reinterpret_cast<const std::uint8_t*>(matrix);
+            poses.insert(poses.end(), data, data + 16 * sizeof(double));
+        }
+        inputs["scans"].push_back(
+            { scan.file_name,
+              scan.points_local.size(),
+              scan.normal_vectors_local.size(),
+              scan.local_trajectory.size(),
+              scan.visible,
+              scan.gizmo,
+              scan.fuse_inclination_from_IMU,
+              scan.fixed_x,
+              scan.fixed_y,
+              scan.fixed_z,
+              scan.fixed_om,
+              scan.fixed_fi,
+              scan.fixed_ka });
+    }
+    inputs["poses"] = json::binary(std::move(poses));
+    for (const auto& edge : graph.edges)
+    {
+        const auto& p = edge.relative_pose_tb;
+        const auto& w = edge.relative_pose_tb_weights;
+        inputs["edges"].push_back(
+            { edge.index_from,
+              edge.index_to,
+              p.px,
+              p.py,
+              p.pz,
+              p.om,
+              p.fi,
+              p.ka,
+              w.px,
+              w.py,
+              w.pz,
+              w.om,
+              w.fi,
+              w.ka,
+              edge.is_fixed_px,
+              edge.is_fixed_py,
+              edge.is_fixed_pz,
+              edge.is_fixed_om,
+              edge.is_fixed_fi,
+              edge.is_fixed_ka });
+    }
+    for (const auto& p : session.control_points.cps)
+        inputs["cp"].push_back(
+            { p.name,
+              p.x_source_local,
+              p.y_source_local,
+              p.z_source_local,
+              p.x_target_global,
+              p.y_target_global,
+              p.z_target_global,
+              p.sigma_x,
+              p.sigma_y,
+              p.sigma_z,
+              p.index_to_pose,
+              p.is_z_0 });
+    for (const auto& p : session.ground_control_points.gpcs)
+        inputs["gcp"].push_back(
+            { p.name,
+              p.x,
+              p.y,
+              p.z,
+              p.sigma_x,
+              p.sigma_y,
+              p.sigma_z,
+              p.lidar_height_above_ground,
+              p.index_to_node_inner,
+              p.index_to_node_outer });
+    auto observation = [](const auto& points)
+    {
+        json values = json::array();
+        for (const auto& [index, p] : points)
+            values.push_back({ index, p.x(), p.y(), p.z() });
+        return values;
+    };
+    inputs["current_observation"] = observation(observation_picking.current_observation);
+    for (const auto& o : observation_picking.observations)
+        inputs["observations"].push_back(observation(o));
+    for (const auto& i : observation_picking.intersections)
+        inputs["intersections"].push_back({ i.translation, i.rotation, i.width_length_height });
+    return inputs;
+}
+
+static nlohmann::json step2CaptureParameters()
+{
+    auto parameters = describeStep2Parameters(tls_registration);
+    auto selected = nlohmann::json::array();
+    const auto& scans = session.point_clouds_container.point_clouds;
+    for (std::size_t i = 0; i < scans.size(); ++i)
+        if (scans[i].visible)
+            selected.push_back(i);
+    parameters["visible_scans"] = std::move(selected);
+    parameters["range"] = { index_begin, index_end };
+    return parameters;
+}
+
+static proc::StateSummary describeStep2()
+{
+    return { {},
+             step2CaptureParameters(),
+             { { "kind", "session" },
+               { "path", state_path },
+               { "scan_count", session.point_clouds_container.point_clouds.size() },
+               { "operations", { "step2.set_parameters" } } } };
+}
+
+static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
+{
+    if (request.operation != "step2.set_parameters")
+        return proc::OperationError{ "unknown_operation", "Unknown Step 2 state operation", {} };
+    if (!request.scope.empty())
+        return proc::OperationError{ "invalid_scope", "Step 2 registration settings apply to the whole session", {} };
+    if (auto error = updateStep2Parameters(tls_registration, request.parameters))
+        return *error;
+    return describeStep2();
+}
+
+static std::optional<proc::OperationError> applyStep2Result(const proc::ArtifactManifest& artifact)
+{
+    if (bow_state.detecting.load())
+        return proc::OperationError{ "state_busy", "Image loop closure detection is reading this session", {} };
+    auto snapshot = proc::ReadSnapshot(artifact.snapshot);
+    if (auto* error = std::get_if<proc::OperationError>(&snapshot))
+        return *error;
+    const auto& source = std::get<proc::SnapshotContents>(snapshot);
+    Session loaded{};
+    if (source.kind != "native_session" || !loaded.load_published(source.entry))
+        return proc::OperationError{ "invalid_result", "The result could not be opened as a published session", {} };
+    nlohmann::json settings = nlohmann::json::object();
+    for (const auto* solver : { "ndt", "icp" })
+        if (source.parameters.contains(solver))
+            settings[solver] = source.parameters.at(solver);
+    if (!settings.empty())
+        if (auto error = updateStep2Parameters(tls_registration, settings))
+            return error;
+    // Session has a user-declared destructor and its assignment copies. Transfer the
+    // large scan buffers independently so applying a result does not duplicate them.
+    auto scans = std::move(loaded.point_clouds_container.point_clouds);
+    session = loaded;
+    session.point_clouds_container.point_clouds = std::move(scans);
+    session_file_name = sessionPathText(source.entry);
+    state_path = session_file_name;
+    readGnssTumFromSessionFile(session_file_name, tls_registration.gnss, tls_registration.tum);
+    session_loaded = true;
+    session_total_number_of_points = 0;
+    for (const auto& scan : session.point_clouds_container.point_clouds)
+        session_total_number_of_points += scan.points_local.size();
+    index_begin = 0;
+    index_end = static_cast<int>(session.point_clouds_container.point_clouds.size()) - 1;
+    index_loop_closure_source = index_loop_closure_target = 0;
+    gizmo_drag_first_index = -1;
+    gizmo_drag_preview_poses.clear();
+    auto unavailable = [](const auto& point)
+    {
+        return point.first < 0 || point.first > index_end;
+    };
+    for (auto& observation : observation_picking.observations)
+        std::erase_if(observation, unavailable);
+    std::erase_if(observation_picking.current_observation, unavailable);
+    bow_loop_closure_clear_preview();
+    bow_state.results.clear();
+    session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+    scan_renderer.rebuildAll(session.point_clouds_container.point_clouds);
+    SetWindowTitle((winTitle + " - " + truncPath(session_file_name)).c_str());
+    return {};
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     bool export_requested = false;
@@ -7810,11 +8163,37 @@ int main(int argc, char* argv[])
             return exportSessionToDirectory(input_arguments.front(), export_directory, same_as_gui);
         }
 
+#ifdef HDMAPPING_GUI_STATE
+        // The GUI has historically selected camera<-world when its registration panels open.
+        tls_registration.ndt.is_cw = tls_registration.icp.is_cw = true;
+        tls_registration.ndt.is_wc = tls_registration.icp.is_wc = false;
+#endif
+
         // search for available geoid models in the system and populate the menu
         geoids = GNSS::get_available_geoids();
 
         initGL(&argc, argv, winTitle, display, mouse);
 
+#ifdef HDMAPPING_GUI_STATE
+        proc::GuiStateBridge bridge(
+            { describeStep2,
+              mutateStep2,
+              [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
+              {
+                  if (session.point_clouds_container.point_clouds.empty() || bow_state.detecting.load())
+                      return {};
+                  return std::make_unique<proc::SessionCaptureSource>(
+                      session_owner,
+                      [target]
+                      {
+                          return target;
+                      },
+                      step2CaptureParameters());
+              },
+              applyStep2Result });
+        state_bridge = &bridge;
+        proc::GuiStateConnection connection(bridge, "multi_view_tls_registration_step_2");
+#endif
         if (argc > 1)
         {
             for (int i = 1; i < argc; i++)
@@ -7836,8 +8215,22 @@ int main(int argc, char* argv[])
         // every frame (mirroring glutMotionFunc -- motion() itself only acts
         // when app_state.mouse_buttons is set, so this is safe unconditionally), wheel()
         // when GetMouseWheelMove() is nonzero, and display() once per frame.
+#ifdef HDMAPPING_GUI_STATE
+        auto last_inputs = step2EditorInputs();
+        auto last_target = bridge.Target();
+#endif
         while (!WindowShouldClose())
         {
+#ifdef HDMAPPING_GUI_STATE
+            auto inputs = step2EditorInputs();
+            if (last_target == bridge.Target() && inputs != last_inputs)
+                bridge.Changed();
+            connection.Poll();
+            if (last_target != bridge.Target())
+                inputs = step2EditorInputs();
+            last_inputs = std::move(inputs);
+            last_target = bridge.Target();
+#endif
 #ifdef HDMAPPING_SNAPSHOT_PROBE
             if (session_loaded && IsKeyPressed(KEY_F9))
             {
@@ -7882,7 +8275,10 @@ int main(int argc, char* argv[])
                     paths.reserve(dropped_files.count);
                     for (unsigned int i = 0; i < dropped_files.count; i++)
                         paths.emplace_back(dropped_files.paths[i]);
-                    loadDroppedFiles(paths);
+#ifdef HDMAPPING_GUI_STATE
+                    if (!bridge.Reserved())
+#endif
+                        loadDroppedFiles(paths);
                 }
                 UnloadDroppedFiles(dropped_files);
             }
@@ -7892,6 +8288,11 @@ int main(int argc, char* argv[])
             EndDrawing();
         }
 
+#ifdef HDMAPPING_GUI_STATE
+        SetWindowState(FLAG_WINDOW_HIDDEN);
+        connection.Close();
+        state_bridge = nullptr;
+#endif
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
         if (bow_state.montage_tex_valid)

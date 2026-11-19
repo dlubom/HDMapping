@@ -476,11 +476,27 @@ namespace HDMapping::Processing
 
     RunResult ReadPublishedResult(const fs::path& destination)
     {
+        return ReadPublishedGeneration(destination, {});
+    }
+
+    RunResult ReadPublishedGeneration(const fs::path& destination, const std::string& artifact_id)
+    {
         try
         {
-            const auto final = destination_path(destination);
-            const auto id = current_id(final);
-            auto [artifact, contents] = read_artifact(final / named(result_prefix, id), id);
+            // Reading is also valid inside a completed worker directory containing its own result.json receipt.
+            const auto final = location(destination);
+            const auto current = current_id(final);
+            const auto& id = artifact_id.empty() ? current : artifact_id;
+            if (!valid_id(id))
+            {
+                throw std::invalid_argument("Invalid published generation ID");
+            }
+            const auto generation = final / named(result_prefix, id);
+            if (fs::symlink_status(generation).type() != fs::file_type::directory)
+            {
+                throw std::runtime_error("Published generation is missing or is not an owned directory");
+            }
+            auto [artifact, contents] = read_artifact(generation, id);
             ValidateNativeSessionReferences(contents, artifact);
             return artifact;
         } catch (const std::exception& error)

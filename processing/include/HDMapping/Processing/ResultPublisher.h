@@ -23,6 +23,9 @@ namespace HDMapping::Processing
     //! Resolve the current committed result. The returned generation remains readable after replacement.
     RunResult ReadPublishedResult(const std::filesystem::path& destination);
 
+    //! Resolve the immutable generation identified by a worker receipt, including after a newer publication.
+    RunResult ReadPublishedGeneration(const std::filesystem::path& destination, const std::string& artifact_id);
+
     //! Copy a published session and its inputs into a relocatable result at a new destination.
     RunResult ExportComplete(const ArtifactManifest& source, const std::filesystem::path& destination);
 } // namespace HDMapping::Processing

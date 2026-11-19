@@ -43,6 +43,11 @@
 
 #endif
 
+#ifdef HDMAPPING_GUI_BRIDGE
+#include "project_capture.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#endif
 #include "multi_session_factor_graph.h"
 #include "raylib_utils.h"
 
@@ -151,6 +156,7 @@ int index_loop_closure_target = -1;
 int first_session_index = -1;
 int second_session_index = -1;
 double search_radius = 0.3;
+int nr_iter = 100;
 bool loaded_sessions = false;
 bool optimized = false;
 bool gizmo_all_sessions = false;
@@ -219,6 +225,24 @@ bool gui_xy_grid_01x01 = false;
 TaitBryanPose motion_model_weights = { 0.01, 0.01, 0.01, 0.1, 0.1, 0.1 };
 ///////////////////////////////////////////////////////////////////////////////////
 
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace proc = HDMapping::Processing;
+namespace
+{
+    using json = nlohmann::json;
+    std::unique_ptr<proc::GuiStateBridge> guiState;
+    std::unique_ptr<proc::GuiStateConnection> guiConnection;
+} // namespace
+#endif
+
+static void markProjectChanged()
+{
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState)
+        guiState->Changed();
+#endif
+}
+
 void ndt_gui()
 {
     static bool compute_mean_and_cov_for_bucket = false;
@@ -254,6 +278,7 @@ void ndt_gui()
             double mui = 0.0;
 
             ndt.optimize(sessions, false, compute_mean_and_cov_for_bucket);
+            markProjectChanged();
         }
         ImGui::End();
     }
@@ -544,6 +569,7 @@ bool ground_truth_icp_source_target(std::vector<Eigen::Vector3d>& source_out, st
 // active edge's two scans, via ground_truth_icp_source_target() when applicable.
 void icp_active_edge(float search_radius, int number_of_iterations = 30)
 {
+    markProjectChanged();
     std::cout << "Iterative Closest Point" << std::endl;
     if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
         sessions[edges[index_active_edge].index_session_to].is_ground_truth)
@@ -611,6 +637,7 @@ void loop_closure_gui()
                 optimize(sessions, edges, motion_model_weights);
             }
             optimized = true;
+            markProjectChanged();
         }
 
         ImGui::Checkbox("update_rotation_center", &update_rotation_center);
@@ -848,6 +875,7 @@ void loop_closure_gui()
                 {
                     if (ImGui::Button("ICP"))
                     {
+                        markProjectChanged();
                         std::cout << "Iterative Closest Point" << std::endl;
                         if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
                             sessions[edges[index_active_edge].index_session_to].is_ground_truth)
@@ -1284,10 +1312,8 @@ void save_trajectories(
     }
 }
 
-bool save_project_settings(const std::string& file_name, const ProjectSettings& _project_settings)
+static nlohmann::json projectSettingsJson(const ProjectSettings& _project_settings)
 {
-    std::cout << "saving file: '" << file_name << "'" << std::endl;
-
     nlohmann::json jj;
 
     nlohmann::json jsession_file_names;
@@ -1329,6 +1355,13 @@ bool save_project_settings(const std::string& file_name, const ProjectSettings& 
     }
     jj["loop_closure_edges"] = jloop_closure_edges;
 
+    return jj;
+}
+
+bool save_project_settings(const std::string& file_name, const ProjectSettings& _project_settings)
+{
+    std::cout << "saving file: '" << file_name << "'\n";
+    const auto jj = projectSettingsJson(_project_settings);
     std::ofstream fs(file_name);
     if (!fs.good())
         return false;
@@ -1358,6 +1391,7 @@ void update_timestamp_offset()
 
 bool revert(std::vector<Session>& sessions)
 {
+    markProjectChanged();
     for (auto& session : sessions)
     {
         for (auto& pc : session.point_clouds_container.point_clouds)
@@ -1368,6 +1402,7 @@ bool revert(std::vector<Session>& sessions)
 
 bool revert_to_initial(std::vector<Session>& sessions)
 {
+    markProjectChanged();
     for (auto& session : sessions)
     {
         for (auto& pc : session.point_clouds_container.point_clouds)
@@ -1475,21 +1510,21 @@ bool loadProject(const std::string& file_name, ProjectSettings& _project_setting
         nlohmann::json data = nlohmann::json::parse(fs);
         fs.close();
 
-        _project_settings.session_file_names.clear();
+        ProjectSettings loaded;
+        std::vector<Edge> loaded_edges;
 
         std::cout << "Contained sessions:\n";
 
         for (const auto& fn_json : data["session_file_names"])
         {
             const std::string fn = fn_json["session_file_name"];
-            _project_settings.session_file_names.push_back(fn);
+            loaded.session_file_names.push_back(fn);
             std::cout << "'" << fn << "'";
             if (!fs::exists(fn))
                 std::cout << "  (WARNING: session file does not exist! Please manually adapt path)";
             std::cout << "\n";
         }
 
-        edges.clear();
         for (const auto& edge_json : data["loop_closure_edges"])
         {
             Edge edge;
@@ -1515,9 +1550,11 @@ bool loadProject(const std::string& file_name, ProjectSettings& _project_setting
             edge.relative_pose_tb_weights.pz = edge_json["w_pz"];
             edge.index_session_from = edge_json["index_session_from"];
             edge.index_session_to = edge_json["index_session_to"];
-            edges.push_back(edge);
+            loaded_edges.push_back(edge);
         }
 
+        _project_settings = std::move(loaded);
+        edges = std::move(loaded_edges);
         std::cout << "Found " << edges.size() << "edges\nOpening done\n";
     } catch (std::exception& e)
     {
@@ -1525,6 +1562,10 @@ bool loadProject(const std::string& file_name, ProjectSettings& _project_setting
         return false;
     }
 
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState)
+        guiState->Open();
+#endif
     project_file_name = file_name;
     std::string newTitle = winTitle + " - " + truncPath(file_name);
     SetWindowTitle(newTitle.c_str());
@@ -1714,6 +1755,7 @@ void appendSession(const std::string& ps)
 // Reorders (ground truth first), recolors and re-uploads the loaded sessions.
 void finishLoadingSessions()
 {
+    markProjectChanged();
     // reorder
     std::vector<Session> sessions_reorder;
     std::vector<std::string> session_file_names_reordered;
@@ -1787,6 +1829,7 @@ void loadSessions()
 
 void generate_loop_closures(const std::vector<Session>& sessions, std::vector<Edge>& edges)
 {
+    markProjectChanged();
     edges.clear();
     // Implementation for generating loop closures
 
@@ -1852,6 +1895,7 @@ void generate_loop_closures(const std::vector<Session>& sessions, std::vector<Ed
 
 void icp_all_edges(std::vector<Session>& sessions, std::vector<Edge>& edges, float sr)
 {
+    markProjectChanged();
     std::cout << "icp_all_edges" << std::endl;
 
     int number_of_iterations = 10;
@@ -1967,6 +2011,7 @@ void settings_gui()
         ImGui::SameLine();
         if (ImGui::Button("Set to origin"))
         {
+            markProjectChanged();
             bool is_first_gt = false;
 
             if (sessions.size() > 0)
@@ -2328,7 +2373,6 @@ void settings_gui()
 
                 if (!is_loop_closure_gui)
                 {
-                    static int nr_iter = 100;
                     ImGui::SetNextItemWidth(ImGuiNumberWidth);
                     ImGui::InputInt("Number of iterations", &nr_iter);
                     if (nr_iter < 1)
@@ -2354,6 +2398,7 @@ void settings_gui()
                             optimize(sessions, edges, motion_model_weights);
                         }
                         optimized = true;
+                        markProjectChanged();
                     }
 
                     // if (optimized)
@@ -2390,8 +2435,128 @@ void settings_gui()
     ImGui::End();
 }
 
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace
+{
+    json projectParameters()
+    {
+        auto selection = json::array();
+        for (size_t i = 0; i < sessions.size(); ++i)
+            if (sessions[i].visible)
+                selection.push_back(i);
+        return { { "visible_sessions", std::move(selection) },
+                 { "sections",
+                   { { "xz", gui_xz_intersection },
+                     { "yz", gui_yz_intersection },
+                     { "xy", gui_xy_intersection },
+                     { "width", gui_intersection_width } } },
+                 { "graph_iterations", nr_iter },
+                 { "ndt_threads", ndt.number_of_threads },
+                 { "ndt_iterations", ndt.number_of_iterations },
+                 { "ndt_bucket_size", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+                 { "icp_search_radius", search_radius },
+                 { "decimate", is_decimate },
+                 { "load_buckets", { bucket_x, bucket_y, bucket_z } },
+                 { "time_offset", time_stamp_offset },
+                 { "motion_weights",
+                   { motion_model_weights.px,
+                     motion_model_weights.py,
+                     motion_model_weights.pz,
+                     motion_model_weights.om,
+                     motion_model_weights.fi,
+                     motion_model_weights.ka } },
+                 { "edge_range",
+                   { index_loop_closure_source, index_loop_closure_target, num_edge_extended_before, num_edge_extended_after } },
+                 { "active_edge", index_active_edge },
+                 { "ground_truth", index_gt } };
+    }
+
+    proc::StateSummary describeProject()
+    {
+        auto children = json::array();
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+            children.push_back(
+                { { "index", i },
+                  { "ground_truth", sessions[i].is_ground_truth },
+                  { "visible", sessions[i].visible },
+                  { "scans", sessions[i].point_clouds_container.point_clouds.size() } });
+        return { {},
+                 projectParameters(),
+                 { { "step", 3 }, { "path", project_file_name }, { "sessions", std::move(children) }, { "edges", edges.size() } } };
+    }
+
+    proc::MutationResult mutateProject(const proc::OperationRequest& request)
+    {
+        if (request.operation != "step3.set_parameters" || !request.scope.empty() || request.parameters.empty())
+            return proc::OperationError{ "invalid_request", "Expected project parameters and an empty scope", json::object() };
+        auto iterations = ndt.number_of_iterations;
+        auto threads = ndt.number_of_threads;
+        auto radius = search_radius;
+        std::array<float, 3> buckets{ ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] };
+        for (const auto& [key, value] : request.parameters.items())
+        {
+            if ((key == "ndt_threads" || key == "ndt_iterations") && value.is_number_integer() && value >= 1 &&
+                value <= std::numeric_limits<int>::max())
+                (key == "ndt_threads" ? threads : iterations) = value.get<int>();
+            else if (key == "icp_search_radius" && value.is_number() && value >= 0.01 && std::isfinite(value.get<double>()))
+                radius = value.get<double>();
+            else if (key == "ndt_bucket_size" && value.is_array() && value.size() == 3)
+            {
+                for (size_t i = 0; i < 3; ++i)
+                {
+                    if (!value[i].is_number() || value[i] < 0.01 || value[i] > std::numeric_limits<float>::max())
+                        return proc::OperationError{ "invalid_parameters", "Invalid NDT bucket size", json::object() };
+                    buckets[i] = value[i].get<float>();
+                }
+            }
+            else
+                return proc::OperationError{ "invalid_parameters", "Invalid project parameter: " + key, json::object() };
+        }
+        ndt.number_of_iterations = iterations;
+        ndt.number_of_threads = threads;
+        search_radius = radius;
+        std::copy(buckets.begin(), buckets.end(), ndt.bucket_size);
+        return describeProject();
+    }
+
+    void connectProject()
+    {
+        guiState = std::make_unique<proc::GuiStateBridge>(proc::GuiStateCallbacks{
+            describeProject,
+            mutateProject,
+            [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
+            {
+                if (sessions.size() != project_settings.session_file_names.size() || !session_drag_preview_poses.empty())
+                    return {};
+                return std::make_unique<ProjectCapture>(
+                    std::move(target), sessions, projectSettingsJson(project_settings), projectParameters());
+            },
+            [](const proc::ArtifactManifest&) -> std::optional<proc::OperationError>
+            {
+                return proc::OperationError{ "incompatible_result",
+                                             "A published registration session cannot replace a multi-session project",
+                                             json::object() };
+            } });
+        guiConnection = std::make_unique<proc::GuiStateConnection>(*guiState, "multi_session_registration_step_3");
+    }
+} // namespace
+#endif
+
 void display()
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    static std::optional<json> previous;
+    const auto observed = []
+    {
+        return json::array({ projectParameters(), project_settings.session_file_names, edges.size(), loaded_sessions });
+    };
+    const auto current = observed();
+    if (previous && *previous != current)
+        guiState->Changed();
+    const auto before = guiState->Target();
+    guiConnection->Poll();
+    previous = before == guiState->Target() ? current : observed();
+#endif
     syncSessionRenderers(sessions);
 
     ImGuiIO& io = ImGui::GetIO();
@@ -2856,6 +3021,23 @@ void display()
     rlImGuiBegin();
 
     ShowMainDockSpace();
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState->Reserved())
+    {
+        if (IsFileDropped())
+        {
+            auto dropped = LoadDroppedFiles();
+            UnloadDroppedFiles(dropped);
+        }
+        view_kbd_shortcuts();
+        ImGui::TextUnformatted("Processing data reserved");
+        end3DAndDrawLabels();
+        if (compass_ruler)
+            drawMiniCompassWithRuler();
+        rlImGuiEnd();
+        return;
+    }
+#endif
 
     if (!is_loop_closure_gui)
     {
@@ -2869,6 +3051,7 @@ void display()
         // sees a pose change and rebuilds that session's GPU buffers.
         auto commit_session_poses = [](size_t i, const std::vector<Eigen::Affine3d>& candidate_poses)
         {
+            markProjectChanged();
             for (size_t j = 0; j < candidate_poses.size(); j++)
             {
                 auto& pc = sessions[i].point_clouds_container.point_clouds[j];
@@ -3046,7 +3229,14 @@ void display()
 
             const Eigen::Affine3d& m_src =
                 sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.at(index_src).m_pose;
-            edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_src.inverse() * m_g);
+            const auto updated = pose_tait_bryan_from_affine_matrix(m_src.inverse() * m_g);
+#ifdef HDMAPPING_GUI_BRIDGE
+            const auto& previous = edges[index_active_edge].relative_pose_tb;
+            if (previous.px != updated.px || previous.py != updated.py || previous.pz != updated.pz || previous.om != updated.om ||
+                previous.fi != updated.fi || previous.ka != updated.ka)
+                guiState->Changed();
+#endif
+            edges[index_active_edge].relative_pose_tb = updated;
         }
     }
 
@@ -4013,7 +4203,11 @@ void mouse(int glut_button, int state, int x, int y)
             !manipulate_active_edge)
         {
             // if (s_loop_closure_gui)
-            if ((sessions.size() > 0) && (number_visible_sessions > 0) && update_rotation_center)
+            if ((sessions.size() > 0) && (number_visible_sessions > 0) && update_rotation_center
+#ifdef HDMAPPING_GUI_BRIDGE
+                && !guiState->Reserved()
+#endif
+            )
             {
                 getClosestTrajectoriesPoint(
                     sessions,
@@ -4136,7 +4330,14 @@ int main(int argc, char* argv[])
         if (added)
             loadSessions();
 
+#ifdef HDMAPPING_GUI_BRIDGE
+        connectProject();
+#endif
         mainLoop();
+#ifdef HDMAPPING_GUI_BRIDGE
+        SetWindowState(FLAG_WINDOW_HIDDEN);
+        guiConnection->Close();
+#endif
 
         releaseSessionRenderers();
         shutdownGL();

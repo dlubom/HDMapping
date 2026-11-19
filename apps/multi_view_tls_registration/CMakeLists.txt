@@ -106,8 +106,14 @@ if (MSVC)
     target_compile_options(multi_view_tls_registration_step_2 PRIVATE /bigobj)
 endif()
 
+if(BUILD_WITH_MCP)
+    target_sources(multi_view_tls_registration_step_2 PRIVATE step2_state_parameters.cpp)
+    target_link_libraries(multi_view_tls_registration_step_2 PRIVATE processing_gui_state processing_session_snapshot)
+    target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE HDMAPPING_GUI_STATE)
+endif()
+
 if(BUILD_WITH_MCP AND BUILD_TESTING)
-    target_link_libraries(multi_view_tls_registration_step_2 PRIVATE processing_session_snapshot)
+    target_sources(processing_state_test PRIVATE step2_state_parameters.cpp step2_state_parameters_test.cpp)
     target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE HDMAPPING_SNAPSHOT_PROBE)
 endif()
 
