@@ -66,7 +66,7 @@ namespace HDMapping::Processing
 #ifdef _WIN32
             name.replace_extension();
 #endif
-            const auto binary = name.native();
+            const auto& binary = name.native();
             const auto suffix = fs::path(gui).native();
             if (!binary.ends_with(suffix))
                 throw std::runtime_error("Unrecognized GUI executable name");
