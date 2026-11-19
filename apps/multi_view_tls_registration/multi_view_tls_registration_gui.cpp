@@ -8080,7 +8080,8 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     gizmo_drag_preview_poses.clear();
     auto unavailable = [](const auto& point)
     {
-        return point.first < 0 || point.first > index_end;
+        const int scan_index = point.first;
+        return scan_index < 0 || scan_index > index_end;
     };
     for (auto& observation : observation_picking.observations)
         std::erase_if(observation, unavailable);
