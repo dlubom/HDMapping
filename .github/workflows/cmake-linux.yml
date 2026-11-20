@@ -94,8 +94,8 @@ jobs:
       run: |
         cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
           -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=address-undefined
-        cmake --build build-asan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test hdmapping_worker processing-check-controls --parallel 2
-        ctest --test-dir build-asan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration)' --output-on-failure
+        cmake --build build-asan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test processing_constraints_test hdmapping_worker processing-check-controls --parallel 2
+        ctest --test-dir build-asan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration|constraints)' --output-on-failure
         printf '{"type":"describe"}\n' | build-asan/bin/hdmapping_worker
 
     - name: Verify TSan separately
@@ -105,5 +105,5 @@ jobs:
         # in spdlog's lazy default logger initialization.
         cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
           -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=thread -DTBB_SANITIZE=thread -DSPDLOG_SANITIZE_THREAD=ON
-        cmake --build build-tsan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test processing-check-controls --parallel 2
-        ctest --test-dir build-tsan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration)' --output-on-failure
+        cmake --build build-tsan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test processing_constraints_test processing-check-controls --parallel 2
+        ctest --test-dir build-tsan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration|constraints)' --output-on-failure

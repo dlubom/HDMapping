@@ -1,4 +1,5 @@
 #include "step2_operations.h"
+#include "step2_constraint_operations.h"
 
 #include "step2_result.h"
 #include "step2_solver_selection.h"
@@ -266,6 +267,7 @@ namespace HDMapping::Processing
             output["registration"] = { { "algorithm", variant }, { "scan_indices", ordered } };
             if (diagnostic)
                 output["registration"]["metric"] = metric;
+            state.parameters.erase("constraints_result");
             state.parameters.update(output);
             auto result = PublishStep2Result(*state.session, request.target, std::move(state.parameters), state.tracks, context);
             if (diagnostic && std::holds_alternative<ArtifactManifest>(result))
@@ -277,6 +279,39 @@ namespace HDMapping::Processing
         } catch (const std::exception& error)
         {
             return failure("registration_failed", error.what());
+        }
+    }
+
+    RunResult ExecuteStep2Constraints(const OperationRequest& request, const SnapshotRef& snapshot, RunContext& context)
+    {
+        if (request.target != snapshot.target)
+            return failure("revision_conflict", "Constraint request and snapshot must name the same opening and revision");
+        if (context.stop.stop_requested())
+            return failure("cancelled", "Step 2 constraint job cancelled");
+        try
+        {
+            report(context, "read_session");
+            auto loaded = LoadSessionSnapshot(snapshot, context.stop);
+            if (const auto* error = std::get_if<OperationError>(&loaded))
+                return *error;
+            auto& state = std::get<SessionSnapshot>(loaded);
+            state.parameters.erase("registration");
+            if (request.operation == constraint_icp_operation || request.operation == optimize_graph_operation)
+            {
+                if (auto error = RunStep2Graph(*state.session, request, state.parameters, state.tracks, context))
+                    return *error;
+            }
+            else
+            {
+                if (auto error = EditStep2Constraints(*state.session, request))
+                    return *error;
+                state.parameters["constraints_result"] = { { "operation", request.operation } };
+            }
+            state.parameters["constraints_result"]["active_edges"] = DescribeActiveConstraints(*state.session);
+            return PublishStep2Result(*state.session, request.target, std::move(state.parameters), state.tracks, context);
+        } catch (const std::exception& error)
+        {
+            return failure("constraint_operation_failed", error.what());
         }
     }
 } // namespace HDMapping::Processing

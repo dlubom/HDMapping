@@ -108,7 +108,7 @@ endif()
 
 if(BUILD_WITH_MCP)
     target_sources(multi_view_tls_registration_step_2 PRIVATE step2_state_parameters.cpp)
-    target_link_libraries(multi_view_tls_registration_step_2 PRIVATE processing_gui_state processing_session_snapshot)
+    target_link_libraries(multi_view_tls_registration_step_2 PRIVATE processing_gui_state processing_constraints)
     target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE HDMAPPING_GUI_STATE)
 endif()
 

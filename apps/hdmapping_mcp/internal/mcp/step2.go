@@ -48,6 +48,6 @@ func addStep2Tools(server *sdk.Server, call func(context.Context, string, any, a
 			err = call(ctx, "jobs.submit", request, &record)
 			return nil, summarizeJob(record), err
 		})
-	addOperationCatalog(server, call, "step2", "List Step 2 registration variants, scan scope, settings, defaults and units.")
-	return []string{"register_scans", "describe_step2_operations"}
+	addOperationCatalog(server, call, "step2", "List Step 2 registration and graph optimization scope, settings, defaults and units.")
+	return append([]string{"register_scans", "describe_step2_operations"}, addConstraintTools(server, call)...)
 }

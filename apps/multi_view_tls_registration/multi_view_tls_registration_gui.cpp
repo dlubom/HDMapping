@@ -108,6 +108,7 @@
 #include "step2_solver_selection.h"
 
 #ifdef HDMAPPING_GUI_STATE
+#include "step2_constraint_operations.h"
 #include "step2_operations.h"
 #include "step2_state_parameters.h"
 #include <HDMapping/Processing/GuiStateBridge.h>
@@ -1148,7 +1149,8 @@ namespace proc = HDMapping::Processing;
 static proc::GuiStateBridge* state_bridge = nullptr;
 static std::string state_path;
 static std::string registration_result_path;
-static std::optional<std::pair<std::string, bool>> registration_request;
+static std::optional<std::pair<proc::OperationRequest, bool>> registration_request;
+static std::string constraint_result_path;
 static nlohmann::json registration_job = nlohmann::json::object();
 static std::string registration_error;
 static bool registration_in_flight = false;
@@ -1161,13 +1163,70 @@ static bool registrationActive()
         status == "cancelling" || registration_job.value("gui_apply_status", std::string{}) == "pending";
 }
 
-static void submitRegistration(std::string algorithm, bool changes_poses = true)
+static void submitStep2Job(std::string_view operation, nlohmann::json scope, nlohmann::json parameters, bool mutate)
 {
     if (registrationActive())
         return;
     registration_job = nlohmann::json::object();
     registration_error.clear();
-    registration_request.emplace(std::move(algorithm), changes_poses);
+    registration_request.emplace(proc::OperationRequest{ std::string(operation), {}, std::move(scope), std::move(parameters) }, mutate);
+}
+
+static void submitRegistration(std::string algorithm, bool changes_poses = true)
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
+        indices.push_back(i);
+    if (indices.size() < 2)
+    {
+        registration_error = "Registration requires at least two scans";
+        return;
+    }
+    submitStep2Job(
+        proc::register_scans_operation,
+        { { "scan_indices", std::move(indices) } },
+        { { "algorithm", std::move(algorithm) } },
+        changes_poses);
+}
+
+static nlohmann::json allActiveEdgeIndices()
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < session.pose_graph_loop_closure.edges.size(); ++i)
+        indices.push_back(i);
+    return indices;
+}
+
+static void submitGraphOptimization()
+{
+    submitStep2Job(proc::optimize_graph_operation, { { "edge_indices", allActiveEdgeIndices() } }, nlohmann::json::object(), true);
+}
+
+static void submitConstraintIcp(double radius, int iterations, bool all)
+{
+    const auto indices = all ? allActiveEdgeIndices() : nlohmann::json::array({ session.pose_graph_loop_closure.index_active_edge });
+    submitStep2Job(
+        proc::constraint_icp_operation,
+        { { "edge_indices", indices } },
+        { { "radius_m", radius },
+          { "iterations", iterations },
+          { "coarse_to_fine", all },
+          { "extend_before", num_edge_extended_before },
+          { "extend_after", num_edge_extended_after } },
+        true);
+}
+
+static bool editManualConstraint(std::string operation, nlohmann::json scope, nlohmann::json parameters)
+{
+    if (state_bridge->Reserved())
+        return false;
+    if (const auto error =
+            proc::EditStep2Constraints(session, { std::move(operation), state_bridge->Target(), std::move(scope), std::move(parameters) }))
+    {
+        registration_error = error->message;
+        return false;
+    }
+    return true;
 }
 
 static void pollRegistration(proc::GuiStateConnection& connection)
@@ -1187,28 +1246,19 @@ static void pollRegistration(proc::GuiStateConnection& connection)
     if (registration_request)
     {
         static std::uint64_t sequence = 0;
-        const auto& [algorithm, changes_poses] = *registration_request;
+        const auto& [request, mutate] = *registration_request;
         const auto target = state_bridge->Target();
-        auto indices = json::array();
-        for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
-            indices.push_back(i);
-        if (indices.size() < 2)
-        {
-            registration_error = "Registration requires at least two scans";
-            registration_request.reset();
-            return;
-        }
-        const json operation{ { "operation", proc::register_scans_operation },
+        const json operation{ { "operation", request.operation },
                               { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
-                              { "scope", { { "scan_indices", std::move(indices) } } },
-                              { "parameters", { { "algorithm", algorithm } } } };
+                              { "scope", request.scope },
+                              { "parameters", request.parameters } };
         registration_in_flight = connection.RequestJob(
             "jobs.submit",
-            { { "request_key", target.state_id + "-register-" + std::to_string(++sequence) },
+            { { "request_key", target.state_id + "-step2-" + std::to_string(++sequence) },
               { "operation", operation },
               { "capture_source", target.state_id },
               { "source", "gui" },
-              { "access", changes_poses ? "mutate" : "read" } });
+              { "access", mutate ? "mutate" : "read" } });
         registration_request.reset();
     }
     else if (!registration_in_flight && registrationActive() && std::chrono::steady_clock::now() >= next_registration_poll)
@@ -1222,7 +1272,7 @@ static void registrationJobGui(proc::GuiStateConnection& connection)
 {
     if (!registrationActive() && registration_job.empty() && registration_error.empty())
         return;
-    ImGui::Begin("Scan registration", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("Step 2 processing", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     const auto status = registration_job.value("status", std::string{});
     const auto apply = registration_job.value("gui_apply_status", std::string{});
     const auto id = registration_job.value("job_id", std::string{});
@@ -1273,6 +1323,7 @@ static void openedStep2Session([[maybe_unused]] const std::string& path)
 #ifdef HDMAPPING_GUI_STATE
     state_path = path;
     registration_result_path.clear();
+    constraint_result_path.clear();
     if (state_bridge)
         state_bridge->Open();
 #endif
@@ -2634,6 +2685,23 @@ void loop_closure_gui()
 
         int prev_index_active_edge = session.pose_graph_loop_closure.index_active_edge;
         session.pose_graph_loop_closure.edge_hotkeys = !bow_preview_takes_edge_hotkeys();
+#ifdef HDMAPPING_GUI_STATE
+        const ManualPoseGraphLoopClosure::Actions graph_actions{
+            [](int from, int to)
+            {
+                return editManualConstraint("constraints.add", nlohmann::json::object(), { { "index_from", from }, { "index_to", to } });
+            },
+            [](int edge)
+            {
+                return editManualConstraint("constraints.remove", { { "edge_index", edge } }, nlohmann::json::object());
+            },
+            submitGraphOptimization,
+            submitConstraintIcp,
+        };
+        const auto* actions = &graph_actions;
+#else
+        const ManualPoseGraphLoopClosure::Actions* actions = nullptr;
+#endif
         session.pose_graph_loop_closure.Gui(
             session.point_clouds_container,
             index_loop_closure_source,
@@ -2645,7 +2713,8 @@ void loop_closure_gui()
             session.control_points,
             num_edge_extended_before,
             num_edge_extended_after,
-            markBulkEdit);
+            markBulkEdit,
+            actions);
 
         new_loop_closure_index = (prev_index_active_edge != session.pose_graph_loop_closure.index_active_edge);
     }
@@ -7009,8 +7078,12 @@ void display()
             ImGui::BeginDisabled(loop_closure.icp_all_edges_run.running);
             if (ImGui::Button("Compute Pose Graph SLAM"))
             {
+#ifdef HDMAPPING_GUI_STATE
+                submitGraphOptimization();
+#else
                 loop_closure.compute_pose_graph_slam(
                     session.point_clouds_container, tls_registration.gnss, session.ground_control_points, session.control_points);
+#endif
             }
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -8189,6 +8262,7 @@ static nlohmann::json step2CaptureParameters()
             selected.push_back(i);
     parameters["visible_scans"] = std::move(selected);
     parameters["range"] = { index_begin, index_end };
+    parameters["manual_graph"] = proc::DescribeManualGraphSettings(session.pose_graph_loop_closure);
     return parameters;
 }
 
@@ -8199,14 +8273,31 @@ static proc::StateSummary describeStep2()
              { { "kind", "session" },
                { "path", state_path },
                { "registration_result_path", registration_result_path },
+               { "constraint_result_path", constraint_result_path },
+               { "active_edges", proc::DescribeActiveConstraints(session) },
                { "scan_count", session.point_clouds_container.point_clouds.size() },
-               { "operations", { "step2.set_parameters", proc::register_scans_operation } } } };
+               { "operations",
+                 { "step2.set_parameters",
+                   proc::register_scans_operation,
+                   proc::list_constraints_operation,
+                   "constraints.add",
+                   "constraints.update",
+                   "constraints.remove",
+                   "constraints.replace",
+                   proc::constraint_icp_operation,
+                   proc::optimize_graph_operation } } } };
 }
 
 static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
 {
     if (request.operation != "step2.set_parameters")
-        return proc::OperationError{ "unknown_operation", "Unknown Step 2 state operation", {} };
+    {
+        if (request.operation == proc::list_constraints_operation || !proc::IsStep2ConstraintOperation(request.operation))
+            return proc::OperationError{ "unknown_operation", "Unknown Step 2 mutation", {} };
+        if (auto error = proc::EditStep2Constraints(session, request))
+            return *error;
+        return describeStep2();
+    }
     if (!request.scope.empty())
         return proc::OperationError{ "invalid_scope", "Step 2 registration settings apply to the whole session", {} };
     if (auto error = updateStep2Parameters(tls_registration, request.parameters))
@@ -8222,17 +8313,43 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
-    if (source.kind == "native_session" && source.parameters.contains("registration"))
+    const auto constraintResult = source.parameters.find("constraints_result");
+    const bool graph_job = constraintResult != source.parameters.end();
+    if (source.kind == "native_session" && (graph_job || source.parameters.contains("registration")))
     {
         Session poses{};
         auto& live = session.point_clouds_container.point_clouds;
         if (!poses.load_snapshot_metadata(source.entry) || poses.point_clouds_container.point_clouds.size() != live.size())
             return proc::OperationError{ "invalid_result", "Registered poses do not match the live session", {} };
-        nlohmann::json settings = nlohmann::json::object();
-        for (const auto* solver : { "ndt", "icp", "plane_features" })
-            settings[solver] = source.parameters.at(solver);
-        if (auto error = updateStep2Parameters(tls_registration, settings))
-            return error;
+        if (graph_job)
+        {
+            auto& graph = session.pose_graph_loop_closure;
+            const bool optimized = constraintResult->at("operation") == proc::optimize_graph_operation;
+            if (optimized)
+                if (auto error = proc::UpdateManualGraphSettings(graph, source.parameters.at("manual_graph")))
+                    return error;
+            if (constraintResult->at("operation") == proc::constraint_icp_operation)
+            {
+                const auto failed = constraintResult->at("failed_edge_indices").get<std::vector<int>>();
+                graph.icp_failed_edges = failed;
+                if (constraintResult->at("edge_indices").size() == graph.edges.size())
+                    graph.icp_all_edges_count = graph.edges.size();
+            }
+            graph.edges = std::move(poses.pose_graph_loop_closure.edges);
+            graph.gizmo = false;
+            constraint_result_path = sessionPathText(source.entry);
+            if (!optimized)
+                return {};
+        }
+        else
+        {
+            nlohmann::json settings = nlohmann::json::object();
+            for (const auto* solver : { "ndt", "icp", "plane_features" })
+                settings[solver] = source.parameters.at(solver);
+            if (auto error = updateStep2Parameters(tls_registration, settings))
+                return error;
+            registration_result_path = sessionPathText(source.entry);
+        }
         for (std::size_t i = 0; i < live.size(); ++i)
         {
             auto& scan = live[i];
@@ -8245,7 +8362,6 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
             scan.gui_rotation[1] = static_cast<float>(scan.pose.fi * RAD_TO_DEG);
             scan.gui_rotation[2] = static_cast<float>(scan.pose.ka * RAD_TO_DEG);
         }
-        registration_result_path = sessionPathText(source.entry);
         session_dims = session.point_clouds_container.compute_point_cloud_dimension();
         return {};
     }
@@ -8267,6 +8383,7 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     session_file_name = sessionPathText(source.entry);
     state_path = session_file_name;
     registration_result_path.clear();
+    constraint_result_path.clear();
     readGnssTumFromSessionFile(session_file_name, tls_registration.gnss, tls_registration.tum);
     session_loaded = true;
     session_total_number_of_points = 0;

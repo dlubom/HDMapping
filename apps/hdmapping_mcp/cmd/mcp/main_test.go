@@ -95,8 +95,19 @@ func TestStdioProduct(t *testing.T) {
 	var step2 struct {
 		Operations []struct{ ID string }
 	}
-	if err := json.Unmarshal(rawCatalog, &step2); err != nil || len(step2.Operations) != 1 || step2.Operations[0].ID != "step2.register_scans" {
+	if err := json.Unmarshal(rawCatalog, &step2); err != nil || len(step2.Operations) != 2 || step2.Operations[0].ID != "step2.register_scans" || step2.Operations[1].ID != "step2.optimize_graph" {
 		t.Fatalf("unexpected Step 2 catalog: %s (%v)", rawCatalog, err)
+	}
+
+	constraintCatalog, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_constraints_operations", Arguments: map[string]any{}})
+	if err != nil || constraintCatalog.IsError {
+		t.Fatalf("call constraints catalog: %v (%v)", err, constraintCatalog)
+	}
+	for _, name := range []string{"constraints.list", "constraints.add", "constraints.update", "constraints.remove", "constraints.replace", "constraints.run_icp", "step2.optimize_graph"} {
+		invalid, err := client.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: map[string]any{}})
+		if err != nil || !invalid.IsError {
+			t.Fatalf("%s must reject a missing target: %v (%v)", name, err, invalid)
+		}
 	}
 
 	if shipped {
