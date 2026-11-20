@@ -8324,11 +8324,12 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
         if (graph_job)
         {
             auto& graph = session.pose_graph_loop_closure;
-            const bool optimized = constraintResult->at("operation") == proc::optimize_graph_operation;
+            const auto& operation = constraintResult->at("operation").get_ref<const std::string&>();
+            const bool optimized = operation == proc::optimize_graph_operation;
             if (optimized)
                 if (auto error = proc::UpdateManualGraphSettings(graph, source.parameters.at("manual_graph")))
                     return error;
-            if (constraintResult->at("operation") == proc::constraint_icp_operation)
+            if (operation == proc::constraint_icp_operation)
             {
                 const auto failed = constraintResult->at("failed_edge_indices").get<std::vector<int>>();
                 graph.icp_failed_edges = failed;
