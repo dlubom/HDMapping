@@ -34,5 +34,7 @@ namespace HDMapping::Processing
     std::optional<OperationError> ValidateSnapshot(const SnapshotRef& snapshot, std::stop_token stop = {});
 
     //! Read the verified entry, parameters and external references for a domain loader.
-    CaptureResult ReadSnapshot(const SnapshotRef& snapshot, std::stop_token stop = {});
+    //! If requested, return the inventory of verified owned files.
+    CaptureResult ReadSnapshot(
+        const SnapshotRef& snapshot, std::stop_token stop = {}, std::vector<std::filesystem::path>* owned_files = nullptr);
 } // namespace HDMapping::Processing

@@ -4,10 +4,10 @@
 #include <cmath>
 #include <limits>
 
+using nlohmann::json;
+
 namespace
 {
-    using nlohmann::json;
-
     template<typename Solver>
     json solverSettings(const Solver& solver)
     {
@@ -65,7 +65,10 @@ nlohmann::json describeStep2Parameters(const TLSRegistration& registration)
     auto i = solverSettings(registration.icp);
     i["search_radius"] = registration.icp.search_radius;
     i["is_adaptive_robust_kernel"] = registration.icp.is_adaptive_robust_kernel;
-    return { { "ndt", std::move(n) }, { "icp", std::move(i) } };
+    auto plane = solverSettings(registration.registration_plane_feature);
+    plane["search_radius"] = registration.registration_plane_feature.search_radius;
+    plane["is_adaptive_robust_kernel"] = registration.registration_plane_feature.is_adaptive_robust_kernel;
+    return { { "ndt", std::move(n) }, { "icp", std::move(i) }, { "plane_features", std::move(plane) } };
 }
 
 std::optional<HDMapping::Processing::OperationError> updateStep2Parameters(TLSRegistration& registration, const nlohmann::json& patch)
@@ -87,12 +90,18 @@ std::optional<HDMapping::Processing::OperationError> updateStep2Parameters(TLSRe
     }
     const auto& n = next.at("ndt");
     const auto& i = next.at("icp");
+    const auto& plane = next.at("plane_features");
+    const auto validRadius = [](const json& solver)
+    {
+        const auto& radius = solver.at("search_radius");
+        return finiteNumber(radius) && radius >= 0.01f && radius <= 2 && solver.at("is_adaptive_robust_kernel").is_boolean();
+    };
     const auto& bucket = n.at("bucket_size");
-    if (!validSolver(n) || !validSolver(i) || !bucket.is_array() || bucket.size() != 3 || !n.at("is_generalized").is_boolean() ||
-        !n.at("compute_mean_and_cov_for_bucket").is_boolean() || !positiveInteger(n.at("num_extended_points")) ||
-        !finiteNumber(n.at("sigma_r")) || !finiteNumber(n.at("sigma_polar_angle")) || !finiteNumber(n.at("sigma_azimuthal_angle")) ||
-        !finiteNumber(i.at("search_radius")) || i.at("search_radius") < 0.01f || i.at("search_radius") > 2 ||
-        !i.at("is_adaptive_robust_kernel").is_boolean())
+    if (!validSolver(n) || !validSolver(i) || !validSolver(plane) || !bucket.is_array() || bucket.size() != 3 ||
+        !n.at("is_generalized").is_boolean() || !n.at("compute_mean_and_cov_for_bucket").is_boolean() ||
+        !positiveInteger(n.at("num_extended_points")) || (!finiteNumber(n.at("sigma_r")) || n.at("sigma_r") < 0) ||
+        (!finiteNumber(n.at("sigma_polar_angle")) || n.at("sigma_polar_angle") < 0) ||
+        (!finiteNumber(n.at("sigma_azimuthal_angle")) || n.at("sigma_azimuthal_angle") < 0) || !validRadius(i) || !validRadius(plane))
         return invalid;
     for (const auto& dimension : bucket)
         if (!finiteNumber(dimension) || dimension < 0.01f || dimension > std::numeric_limits<float>::max())
@@ -109,5 +118,8 @@ std::optional<HDMapping::Processing::OperationError> updateStep2Parameters(TLSRe
     registration.compute_mean_and_cov_for_bucket = n.at("compute_mean_and_cov_for_bucket");
     registration.icp.search_radius = i.at("search_radius");
     registration.icp.is_adaptive_robust_kernel = i.at("is_adaptive_robust_kernel");
+    applySolver(registration.registration_plane_feature, plane);
+    registration.registration_plane_feature.search_radius = plane.at("search_radius");
+    registration.registration_plane_feature.is_adaptive_robust_kernel = plane.at("is_adaptive_robust_kernel");
     return {};
 }

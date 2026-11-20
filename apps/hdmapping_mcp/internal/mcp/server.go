@@ -57,6 +57,7 @@ func NewWithCoordinator(version string, call func(context.Context, string, any, 
 				return nil, out, err
 			})
 		capabilities = append(capabilities, addStep1Tools(server, call)...)
+		capabilities = append(capabilities, addStep2Tools(server, call)...)
 	}
 	sdk.AddTool(server, &sdk.Tool{
 		Name:        "server_info",

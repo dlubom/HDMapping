@@ -363,7 +363,7 @@ namespace HDMapping::Processing
         }
     }
 
-    CaptureResult ReadSnapshot(const SnapshotRef& snapshot, std::stop_token stop)
+    CaptureResult ReadSnapshot(const SnapshotRef& snapshot, std::stop_token stop, std::vector<fs::path>* owned_files)
     {
         try
         {
@@ -403,6 +403,14 @@ namespace HDMapping::Processing
             }
             check_stop(stop);
             contents.entry = root / contents.entry;
+            if (owned_files)
+            {
+                std::vector<fs::path> paths;
+                paths.reserve(files.size());
+                for (const auto& name : files.items())
+                    paths.push_back(root / read_path(name.key()));
+                *owned_files = std::move(paths);
+            }
             return contents;
         } catch (const Cancelled&)
         {

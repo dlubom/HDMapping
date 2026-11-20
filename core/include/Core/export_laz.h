@@ -19,6 +19,8 @@ namespace fs = std::filesystem;
 class LazWriter
 {
 public:
+    static constexpr double coordinate_scale = 0.0001;
+
     LazWriter() = default;
     ~LazWriter()
     {
@@ -32,8 +34,6 @@ public:
     //! with_rgb writes LAS point format 3 (format 1 + rgb) instead of format 1.
     bool open(const std::string& filename, double offset_x, double offset_y, double offset_z, bool with_rgb = false)
     {
-        constexpr double scale = 0.0001;
-
         if (laszip_create(&writer_))
         {
             fprintf(stderr, "DLL ERROR: creating laszip writer\n");
@@ -56,9 +56,9 @@ public:
         header->number_of_point_records = 0;
         header->number_of_points_by_return[0] = 0;
         header->number_of_points_by_return[1] = 0;
-        header->x_scale_factor = scale;
-        header->y_scale_factor = scale;
-        header->z_scale_factor = scale;
+        header->x_scale_factor = coordinate_scale;
+        header->y_scale_factor = coordinate_scale;
+        header->z_scale_factor = coordinate_scale;
         header->x_offset = offset_x;
         header->y_offset = offset_y;
         header->z_offset = offset_z;
@@ -91,17 +91,36 @@ public:
         unsigned short point_source_id = 0,
         const uint8_t* rgb = nullptr)
     {
+        std::array<std::uint16_t, 3> rgb16{};
+        if (rgb)
+        {
+            // 8-bit -> 16-bit LAS convention (value * 256), matching the readers' value / 256.
+            for (std::size_t channel = 0; channel < rgb16.size(); ++channel)
+                rgb16[channel] = static_cast<std::uint16_t>(static_cast<unsigned>(rgb[channel]) * 256);
+        }
+        return writePointWithGpsTime(
+            position, intensity, timestamp * 1e9, offset_x, offset_y, offset_z, point_source_id, rgb ? rgb16.data() : nullptr);
+    }
+
+    //! Write GPS time and RGB channels as represented in an existing LAS record.
+    bool writePointWithGpsTime(
+        const Eigen::Vector3d& position,
+        unsigned short intensity,
+        double gps_time,
+        double offset_x,
+        double offset_y,
+        double offset_z,
+        unsigned short point_source_id = 0,
+        const std::uint16_t* rgb = nullptr)
+    {
         point_->intensity = intensity;
         if (rgb)
         {
-            // 8-bit -> 16-bit LAS convention (value * 256), matching the readers' value / 256
-            point_->rgb[0] = static_cast<laszip_U16>(rgb[0]) << 8;
-            point_->rgb[1] = static_cast<laszip_U16>(rgb[1]) << 8;
-            point_->rgb[2] = static_cast<laszip_U16>(rgb[2]) << 8;
+            std::copy_n(rgb, 3, point_->rgb);
         }
         point_->return_number = 1;
         point_->number_of_returns = 1;
-        point_->gps_time = timestamp * 1e9;
+        point_->gps_time = gps_time;
         point_->point_source_ID = point_source_id;
 
         laszip_F64 coordinates[3];

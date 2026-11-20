@@ -84,6 +84,21 @@ func TestStdioProduct(t *testing.T) {
 	if catalogErr != nil || catalogResult.IsError {
 		t.Fatalf("call Step 1 catalog: %v (%v)", catalogErr, catalogResult)
 	}
+	step2Catalog, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_step2_operations", Arguments: map[string]any{}})
+	if err != nil || step2Catalog.IsError {
+		t.Fatalf("call Step 2 catalog: %v (%v)", err, step2Catalog)
+	}
+	rawCatalog, err := json.Marshal(step2Catalog.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var step2 struct {
+		Operations []struct{ ID string }
+	}
+	if err := json.Unmarshal(rawCatalog, &step2); err != nil || len(step2.Operations) != 1 || step2.Operations[0].ID != "step2.register_scans" {
+		t.Fatalf("unexpected Step 2 catalog: %s (%v)", rawCatalog, err)
+	}
+
 	if shipped {
 		input := map[string]any{"request_key": "empty-step1", "recording": map[string]string{"directory": t.TempDir()}}
 		operation, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "step1_odometry", Arguments: input})

@@ -6,6 +6,10 @@ namespace HDMapping::Processing
 {
     inline constexpr std::string_view native_session_kind = "native_session";
 
+    //! Preserve the Step 2 reference tracks and their ENU origin through capture and publication.
+    nlohmann::json ReadNativeSessionTracks(const std::filesystem::path& entry);
+    void WriteNativeSessionTracks(const std::filesystem::path& entry, const nlohmann::json& tracks);
+
     //! Verify that native MJS paths, including implicit trajectories, agree with the inventory.
     void ValidateNativeSessionReferences(const SnapshotContents& contents, const ArtifactManifest& manifest);
 

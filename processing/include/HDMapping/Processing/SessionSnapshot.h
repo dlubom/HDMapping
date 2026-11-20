@@ -13,7 +13,11 @@ namespace HDMapping::Processing
     class SessionCaptureSource final : public CaptureSource
     {
     public:
-        SessionCaptureSource(std::shared_ptr<const Session> session, std::function<TargetRef()> target, nlohmann::json parameters);
+        SessionCaptureSource(
+            std::shared_ptr<const Session> session,
+            std::function<TargetRef()> target,
+            nlohmann::json parameters,
+            nlohmann::json tracks = nlohmann::json::object());
 
         TargetRef Target() const override;
         CaptureResult Materialize(const std::filesystem::path& directory, RunContext& context) override;
@@ -22,14 +26,16 @@ namespace HDMapping::Processing
         std::shared_ptr<const Session> session_;
         std::function<TargetRef()> target_;
         nlohmann::json parameters_;
+        nlohmann::json tracks_;
     };
 
     struct SessionSnapshot
     {
         std::unique_ptr<Session> session;
         nlohmann::json parameters;
+        nlohmann::json tracks;
     };
 
-    //! Restore native session metadata and the exact processing data held in memory at capture.
-    std::variant<SessionSnapshot, OperationError> LoadSessionSnapshot(const SnapshotRef& snapshot);
+    //! Restore a captured session, or read a native session with verified inventory references.
+    std::variant<SessionSnapshot, OperationError> LoadSessionSnapshot(const SnapshotRef& snapshot, std::stop_token stop = {});
 } // namespace HDMapping::Processing

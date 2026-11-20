@@ -96,8 +96,6 @@ public:
         gizmo = false;
     }
 
-    ~PointCloud() = default;
-
     GridParameters rgd_params;
     std::vector<PointBucketIndexPair> index_pairs;
     std::vector<Bucket> buckets;

@@ -79,6 +79,30 @@ namespace HDMapping::Processing
         }
     } // namespace
 
+    json ReadNativeSessionTracks(const fs::path& entry)
+    {
+        auto metadata = read_metadata(entry);
+        auto tracks = json::object();
+        for (const auto* key : { "enu_origin", "gnss_measurements", "tum_trajectory" })
+            if (auto field = metadata.find(key); field != metadata.end())
+                tracks[key] = std::move(*field);
+        return tracks;
+    }
+
+    void WriteNativeSessionTracks(const fs::path& entry, const json& tracks)
+    {
+        if (tracks.empty())
+            return;
+        auto metadata = read_metadata(entry);
+        for (const auto* key : { "enu_origin", "gnss_measurements", "tum_trajectory" })
+            if (const auto field = tracks.find(key); field != tracks.end())
+                metadata[key] = *field;
+        std::ofstream output(entry, std::ios::binary);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << metadata;
+        output.close();
+    }
+
     void ValidateNativeSessionReferences(const SnapshotContents& contents, const ArtifactManifest& manifest)
     {
         if (contents.kind != native_session_kind)

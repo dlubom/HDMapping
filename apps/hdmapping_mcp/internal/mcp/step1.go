@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,17 +37,28 @@ type step1Job struct {
 	GUIApplyStatus string             `json:"gui_apply_status"`
 }
 
-type step1Catalog struct {
+type operationCatalog struct {
 	Operations []map[string]any `json:"operations"`
 }
 
-func addStep1Tools(server *sdk.Server, call func(context.Context, string, any, any) error) []string {
-	sdk.AddTool(server, &sdk.Tool{Name: "describe_step1_operations", Description: "List Step 1 scope and parameter schemas, including the native defaults.", Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
-		func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, step1Catalog, error) {
-			var result step1Catalog
-			err := call(ctx, "operations.describe", nil, &result.Operations)
+func addOperationCatalog(server *sdk.Server, call func(context.Context, string, any, any) error, family, description string) {
+	sdk.AddTool(server, &sdk.Tool{Name: "describe_" + family + "_operations", Description: description, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
+		func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, operationCatalog, error) {
+			var all []map[string]any
+			err := call(ctx, "operations.describe", nil, &all)
+			result := operationCatalog{Operations: make([]map[string]any, 0)}
+			for _, operation := range all {
+				id, _ := operation["id"].(string)
+				if strings.HasPrefix(id, family+".") {
+					result.Operations = append(result.Operations, operation)
+				}
+			}
 			return nil, result, err
 		})
+}
+
+func addStep1Tools(server *sdk.Server, call func(context.Context, string, any, any) error) []string {
+	addOperationCatalog(server, call, "step1", "List Step 1 scope and parameter schemas, including the native defaults.")
 	operations := []struct {
 		name, description string
 		access            jobs.Access

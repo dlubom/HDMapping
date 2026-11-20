@@ -22,6 +22,7 @@ target_include_directories(processing_result SYSTEM PRIVATE
 target_compile_definitions(processing_result PRIVATE WITH_GUI=0)
 target_link_libraries(processing_result PUBLIC processing_ops)
 hdmapping_processing_target(processing_result)
+target_link_libraries(processing_session_snapshot PUBLIC processing_result)
 list(APPEND _runtime_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp)
 
 set(_step1_dir "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1")
@@ -50,13 +51,29 @@ if(MSVC)
     target_compile_options(processing_step1_engine PRIVATE /bigobj)
 endif()
 
+set(_step2_dir "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration")
+set(_step2_sources "${_step2_dir}/step2_operations.cpp" "${_step2_dir}/step2_result.cpp" "${_step2_dir}/step2_state_parameters.cpp")
+add_library(processing_step2 STATIC ${_step2_sources})
+target_include_directories(processing_step2 PUBLIC "${_step2_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(processing_step2 SYSTEM PRIVATE
+    "${PROJECT_SOURCE_DIR}/shared/include" "${THIRDPARTY_DIRECTORY}" "${THIRDPARTY_DIRECTORY}/observation_equations/codes"
+    "${LASZIP_INCLUDE_DIR}/LASzip/include")
+target_compile_definitions(processing_step2 PRIVATE WITH_GUI=0)
+target_link_libraries(processing_step2 PUBLIC processing_session_snapshot processing_result PRIVATE core_no_gui unordered_dense::unordered_dense)
+hdmapping_processing_target(processing_step2)
+if(MSVC)
+    target_compile_definitions(processing_step2 PRIVATE _USE_MATH_DEFINES)
+    target_compile_options(processing_step2 PRIVATE /bigobj)
+endif()
+list(APPEND _runtime_sources ${_step2_sources})
+
 set(_step1_sources src/Operation.cpp "${_step1_dir}/step1_operations.cpp"
     "${_step1_dir}/step1_parameters.cpp" "${_step1_dir}/recording_capture.cpp" "${_step1_dir}/odometry_capture.cpp")
 add_library(processing_step1 STATIC ${_step1_sources})
 target_include_directories(processing_step1 PUBLIC "${_step1_dir}")
 target_include_directories(processing_step1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(processing_step1 SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/json/include")
-target_link_libraries(processing_step1 PUBLIC processing_result processing_step1_engine)
+target_link_libraries(processing_step1 PUBLIC processing_result processing_step1_engine processing_step2)
 hdmapping_processing_target(processing_step1)
 if(MSVC)
     target_compile_options(processing_step1 PRIVATE /bigobj)
@@ -73,8 +90,7 @@ list(APPEND _runtime_sources ${_gui_sources})
 
 set(_gui_capture_sources
     "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp")
-list(APPEND _runtime_sources "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp"
-    "${PROJECT_SOURCE_DIR}/apps/multi_view_tls_registration/step2_state_parameters.cpp")
+list(APPEND _runtime_sources ${_gui_capture_sources})
 
 if(BUILD_TESTING)
     add_executable(processing_state_test
@@ -133,6 +149,17 @@ if(BUILD_TESTING)
     add_test(NAME processing-step1 COMMAND processing_step1_test)
     set_tests_properties(processing-step1 PROPERTIES LABELS processing-step1 TIMEOUT 90)
     list(APPEND _runtime_sources tests/step1_operations_test.cpp)
+
+    add_executable(processing_step2_registration_test tests/step2_registration_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_step2_registration_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_link_libraries(processing_step2_registration_test PRIVATE processing_step1)
+    hdmapping_processing_target(processing_step2_registration_test)
+    if(MSVC)
+        target_compile_options(processing_step2_registration_test PRIVATE /bigobj)
+    endif()
+    add_test(NAME processing-step2-registration COMMAND processing_step2_registration_test)
+    set_tests_properties(processing-step2-registration PROPERTIES LABELS processing-step2-registration TIMEOUT 90)
+    list(APPEND _runtime_sources tests/step2_registration_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

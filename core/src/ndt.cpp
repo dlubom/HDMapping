@@ -1985,7 +1985,11 @@ void ndt_jobi(
 #endif
 }
 
-bool NDT::optimize(std::vector<PointCloud>& point_clouds, bool compute_only_mahalanobis_distance, bool compute_mean_and_cov_for_bucket)
+bool NDT::optimize(
+    std::vector<PointCloud>& point_clouds,
+    bool compute_only_mahalanobis_distance,
+    bool compute_mean_and_cov_for_bucket,
+    double* mean_mahalanobis)
 {
     auto start = std::chrono::system_clock::now();
 
@@ -2301,6 +2305,10 @@ bool NDT::optimize(std::vector<PointCloud>& point_clouds, bool compute_only_maha
         buckets_external.clear();
         std::cout << "cleaning finished" << std::endl;
 
+        // An empty correspondence set has no RMS and would keep the LM retry loop from advancing.
+        if (sum == 0 || (compute_only_mahalanobis_distance && md_sum == 0))
+            return false;
+
         rms /= sum;
         std::cout << "rms " << rms << std::endl;
 
@@ -2309,6 +2317,8 @@ bool NDT::optimize(std::vector<PointCloud>& point_clouds, bool compute_only_maha
 
         if (compute_only_mahalanobis_distance)
         {
+            if (mean_mahalanobis)
+                *mean_mahalanobis = md;
             return true;
         }
 #else
@@ -3739,7 +3749,7 @@ bool NDT::optimize_lie_algebra_left_jacobian(std::vector<PointCloud>& point_clou
     is_rodrigues = false;
     is_lie_algebra_left_jacobian = false;
     is_lie_algebra_right_jacobian = false;
-    return true;
+    return res;
 }
 
 bool NDT::optimize_lie_algebra_right_jacobian(std::vector<PointCloud>& point_clouds, bool compute_mean_and_cov_for_bucket)
@@ -3757,7 +3767,7 @@ bool NDT::optimize_lie_algebra_right_jacobian(std::vector<PointCloud>& point_clo
     is_rodrigues = false;
     is_lie_algebra_left_jacobian = false;
     is_lie_algebra_right_jacobian = false;
-    return true;
+    return res;
 }
 
 bool NDT::compute_cov_mean(

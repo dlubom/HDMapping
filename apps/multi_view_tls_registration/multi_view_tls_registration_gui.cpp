@@ -108,6 +108,7 @@
 #include "step2_solver_selection.h"
 
 #ifdef HDMAPPING_GUI_STATE
+#include "step2_operations.h"
 #include "step2_state_parameters.h"
 #include <HDMapping/Processing/GuiStateBridge.h>
 #include <HDMapping/Processing/GuiStateConnection.h>
@@ -994,9 +995,6 @@ bool gnssWithOffset = false;
 bool tumSubtractFirstPose = false;
 
 // radio button selectors
-static int RPFnomSelection = 0;
-static int RPFpeSelection = 0;
-static int RPF3dSelection = 0;
 static int PGSnomSelection = 0;
 static int PGSpeSelection = 0;
 static int PGS3dSelection = 0;
@@ -1149,6 +1147,116 @@ PointClouds::PointCloudDimensions session_dims;
 namespace proc = HDMapping::Processing;
 static proc::GuiStateBridge* state_bridge = nullptr;
 static std::string state_path;
+static std::string registration_result_path;
+static std::optional<std::pair<std::string, bool>> registration_request;
+static nlohmann::json registration_job = nlohmann::json::object();
+static std::string registration_error;
+static bool registration_in_flight = false;
+static std::chrono::steady_clock::time_point next_registration_poll;
+
+static bool registrationActive()
+{
+    const auto status = registration_job.value("status", std::string{});
+    return registration_request || registration_in_flight || status == "preparing" || status == "queued" || status == "running" ||
+        status == "cancelling" || registration_job.value("gui_apply_status", std::string{}) == "pending";
+}
+
+static void submitRegistration(std::string algorithm, bool changes_poses = true)
+{
+    if (registrationActive())
+        return;
+    registration_job = nlohmann::json::object();
+    registration_error.clear();
+    registration_request.emplace(std::move(algorithm), changes_poses);
+}
+
+static void pollRegistration(proc::GuiStateConnection& connection)
+{
+    using nlohmann::json;
+    if (auto reply = connection.TakeJobReply())
+    {
+        registration_in_flight = false;
+        if (const auto* error = std::get_if<proc::OperationError>(&*reply))
+            registration_error = error->message;
+        else
+        {
+            registration_error.clear();
+            registration_job = std::get<json>(std::move(*reply));
+        }
+    }
+    if (registration_request)
+    {
+        static std::uint64_t sequence = 0;
+        const auto& [algorithm, changes_poses] = *registration_request;
+        const auto target = state_bridge->Target();
+        auto indices = json::array();
+        for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
+            indices.push_back(i);
+        if (indices.size() < 2)
+        {
+            registration_error = "Registration requires at least two scans";
+            registration_request.reset();
+            return;
+        }
+        const json operation{ { "operation", proc::register_scans_operation },
+                              { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                              { "scope", { { "scan_indices", std::move(indices) } } },
+                              { "parameters", { { "algorithm", algorithm } } } };
+        registration_in_flight = connection.RequestJob(
+            "jobs.submit",
+            { { "request_key", target.state_id + "-register-" + std::to_string(++sequence) },
+              { "operation", operation },
+              { "capture_source", target.state_id },
+              { "source", "gui" },
+              { "access", changes_poses ? "mutate" : "read" } });
+        registration_request.reset();
+    }
+    else if (!registration_in_flight && registrationActive() && std::chrono::steady_clock::now() >= next_registration_poll)
+    {
+        registration_in_flight = connection.RequestJob("jobs.get", registration_job.at("job_id"));
+        next_registration_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    }
+}
+
+static void registrationJobGui(proc::GuiStateConnection& connection)
+{
+    if (!registrationActive() && registration_job.empty() && registration_error.empty())
+        return;
+    ImGui::Begin("Scan registration", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    const auto status = registration_job.value("status", std::string{});
+    const auto apply = registration_job.value("gui_apply_status", std::string{});
+    const auto id = registration_job.value("job_id", std::string{});
+    ImGui::TextUnformatted(status.empty() ? (registration_error.empty() ? "Submitting" : "Failed") : status.c_str());
+    if (!id.empty())
+        ImGui::Text("Job %s", id.c_str());
+    if (registration_job.contains("progress"))
+    {
+        const auto& progress = registration_job.at("progress");
+        const auto stage = progress.value("stage", std::string{});
+        const auto message = progress.value("message", std::string{});
+        if (!stage.empty())
+            ImGui::TextUnformatted(stage.c_str());
+        if (!message.empty())
+            ImGui::TextWrapped("%s", message.c_str());
+    }
+    if (!apply.empty() && apply != "not_requested")
+        ImGui::Text("Workspace update: %s", apply.c_str());
+    if (registration_job.contains("error"))
+        ImGui::TextWrapped("%s", registration_job.at("error").value("message", std::string{}).c_str());
+    if (!registration_error.empty())
+        ImGui::TextWrapped("%s", registration_error.c_str());
+    if (!registration_in_flight && (status == "preparing" || status == "queued" || status == "running") && ImGui::Button("Cancel job"))
+        registration_in_flight = connection.RequestJob("jobs.cancel", id);
+    if (!registrationActive() && ImGui::Button("Dismiss"))
+    {
+        registration_error.clear();
+        registration_job = nlohmann::json::object();
+    }
+    ImGui::End();
+}
+
+static proc::GuiStateConnection* registration_connection = nullptr;
+
 #endif
 
 // Bulk geometry edits may replace points or trajectories while preserving all sizes and poses.
@@ -1164,6 +1272,7 @@ static void openedStep2Session([[maybe_unused]] const std::string& path)
 {
 #ifdef HDMAPPING_GUI_STATE
     state_path = path;
+    registration_result_path.clear();
     if (state_bridge)
         state_bridge->Open();
 #endif
@@ -1316,6 +1425,9 @@ void ndt_gui()
 
     if (ImGui::Button("Optimization"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt");
+#else
         double rms_initial = 0.0;
         double rms_final = 0.0;
         double mui = 0.0;
@@ -1323,16 +1435,21 @@ void ndt_gui()
         // spdlog::info("mui: " << mui << " rms_initial: " << rms_initial << " rms_final: " << rms_final << std::endl;
         markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, false, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
 
     if (ImGui::Button("Compute mean Mahalanobis distance"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_mahalanobis", false);
+#else
         double rms_initial = 0.0;
         double rms_final = 0.0;
         double mui = 0.0;
 
         markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, true, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
     if (ImGui::IsItemHovered())
     {
@@ -1351,16 +1468,24 @@ void ndt_gui()
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_lie_left");
+#else
         markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_left_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_lie_right");
+#else
         markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_right_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
 
     ImGui::Separator();
@@ -1462,8 +1587,12 @@ void icp_gui()
 
     if (ImGui::Button("Optimization point to point source to target"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp");
+#else
         markBulkEdit();
         tls_registration.icp.optimization_point_to_point_source_to_target(session.point_clouds_container);
+#endif
     }
 
     ImGui::Separator();
@@ -1472,29 +1601,46 @@ void icp_gui()
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_lie_left");
+#else
         markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_left_jacobian(session.point_clouds_container);
+#endif
     }
 
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_lie_right");
+#else
         markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_right_jacobian(session.point_clouds_container);
+#endif
     }
 
     ImGui::Separator();
 
     if (ImGui::Button("Compute RMS (optimization_point_to_point_source_to_target)"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_rms", false);
+#else
         double rms = 0.0;
         tls_registration.icp.optimization_point_to_point_source_to_target_compute_rms(session.point_clouds_container, rms);
         spdlog::info("RMS (optimization_point_to_point_source_to_target): {}", rms);
+#endif
     }
 }
 
 void rpf_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.registration_plane_feature);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::PushItemWidth(ImGuiNumberWidth);
     ImGui::InputFloat("Search radius", &tls_registration.registration_plane_feature.search_radius, 0.01, 2.0);
     if (tls_registration.registration_plane_feature.search_radius < 0.01)
@@ -1517,54 +1663,58 @@ void rpf_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &RPFnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &RPFnomSelection, 1);
-
-    tls_registration.registration_plane_feature.is_gauss_newton = (RPFnomSelection == 0);
-    tls_registration.registration_plane_feature.is_levenberg_marguardt = (RPFnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &RPFpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &RPFpeSelection, 1);
-
-    tls_registration.registration_plane_feature.is_cw = (RPFpeSelection == 0);
-    tls_registration.registration_plane_feature.is_wc = (RPFpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &RPF3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &RPF3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &RPF3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.registration_plane_feature.is_tait_bryan_angles = (RPF3dSelection == 0);
-    tls_registration.registration_plane_feature.is_quaternion = (RPF3dSelection == 1);
-    tls_registration.registration_plane_feature.is_rodrigues = (RPF3dSelection == 2);
+    selection.write(tls_registration.registration_plane_feature);
 
     ImGui::Separator();
     ImGui::Text("Optimize point to projection onto plane source to target:");
     if (ImGui::Button("Basic Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target(
             session.point_clouds_container);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra left Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection_lie_left");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_left_jacobian(
             session.point_clouds_container);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra right Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection_lie_right");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_right_jacobian(
             session.point_clouds_container);
+#endif
     }
 
     ImGui::Separator();
@@ -1572,20 +1722,32 @@ void rpf_gui()
     ImGui::Text("Optimize source to target:");
     if (ImGui::Button("point to plane (using dot product)"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_point");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_plane_source_to_target(session.point_clouds_container);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("distance point to plane"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_distance");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_distance_point_to_plane_source_to_target(session.point_clouds_container);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("plane to plane"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_to_plane");
+#else
         markBulkEdit();
         tls_registration.registration_plane_feature.optimize_plane_to_plane_source_to_target(session.point_clouds_container);
+#endif
     }
 }
 
@@ -2925,6 +3087,56 @@ void lio_segments_gui()
 // All three keys are optional: an older session without them just loads with
 // empty GNSS/TUM tracks and the from-first-pose origin behaviour, as before.
 // -----------------------------------------------------------------------------
+static nlohmann::json gnssTumSessionData(const GNSS& gnss, const TUM& tum)
+{
+    auto data = nlohmann::json::object();
+    nlohmann::json jorigin;
+    jorigin["latitude"] = gnss.WGS84ReferenceLatitude;
+    jorigin["longitude"] = gnss.WGS84ReferenceLongitude;
+    jorigin["geoid_separation"] = gnss.geoidSeparation;
+    jorigin["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
+    data["enu_origin"] = jorigin;
+
+    nlohmann::json jgnss = nlohmann::json::array();
+    for (const auto& p : gnss.gnss_poses)
+    {
+        jgnss.push_back(
+            { { "timestamp", p.timestamp },
+              { "lat", p.lat },
+              { "lon", p.lon },
+              { "h_wgs84", p.h_wgs84 },
+              { "undulation", p.undulation },
+              { "alt", p.alt },
+              { "hdop", p.hdop },
+              { "satelites_tracked", p.satelites_tracked },
+              { "height", p.height },
+              { "age", p.age },
+              { "time", p.time },
+              { "fix_quality", p.fix_quality },
+              { "enu_x", p.enu_x },
+              { "enu_y", p.enu_y },
+              { "enu_z", p.enu_z },
+              { "dist_xy_along", p.dist_xy_along } });
+    }
+    data["gnss_measurements"] = jgnss;
+
+    nlohmann::json jtum = nlohmann::json::array();
+    for (const auto& p : tum.tum_poses)
+    {
+        jtum.push_back(
+            { { "timestamp", p.timestamp },
+              { "x", p.x },
+              { "y", p.y },
+              { "z", p.z },
+              { "qx", p.qx },
+              { "qy", p.qy },
+              { "qz", p.qz },
+              { "qw", p.qw } });
+    }
+    data["tum_trajectory"] = jtum;
+    return data;
+}
+
 static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss, const TUM& tum)
 {
     try
@@ -2940,50 +3152,7 @@ static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss,
             data = nlohmann::json::parse(fin);
         }
 
-        nlohmann::json jorigin;
-        jorigin["latitude"] = gnss.WGS84ReferenceLatitude;
-        jorigin["longitude"] = gnss.WGS84ReferenceLongitude;
-        jorigin["geoid_separation"] = gnss.geoidSeparation;
-        jorigin["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
-        data["enu_origin"] = jorigin;
-
-        nlohmann::json jgnss = nlohmann::json::array();
-        for (const auto& p : gnss.gnss_poses)
-        {
-            jgnss.push_back(
-                { { "timestamp", p.timestamp },
-                  { "lat", p.lat },
-                  { "lon", p.lon },
-                  { "h_wgs84", p.h_wgs84 },
-                  { "undulation", p.undulation },
-                  { "alt", p.alt },
-                  { "hdop", p.hdop },
-                  { "satelites_tracked", p.satelites_tracked },
-                  { "height", p.height },
-                  { "age", p.age },
-                  { "time", p.time },
-                  { "fix_quality", p.fix_quality },
-                  { "enu_x", p.enu_x },
-                  { "enu_y", p.enu_y },
-                  { "enu_z", p.enu_z },
-                  { "dist_xy_along", p.dist_xy_along } });
-        }
-        data["gnss_measurements"] = jgnss;
-
-        nlohmann::json jtum = nlohmann::json::array();
-        for (const auto& p : tum.tum_poses)
-        {
-            jtum.push_back(
-                { { "timestamp", p.timestamp },
-                  { "x", p.x },
-                  { "y", p.y },
-                  { "z", p.z },
-                  { "qx", p.qx },
-                  { "qy", p.qy },
-                  { "qz", p.qz },
-                  { "qw", p.qw } });
-        }
-        data["tum_trajectory"] = jtum;
+        data.update(gnssTumSessionData(gnss, tum));
 
         std::ofstream fout(path);
         if (!fout.good())
@@ -5536,6 +5705,7 @@ void display()
         ImGui::Begin("Processing");
         ImGui::TextUnformatted("Session reserved for processing. Camera controls are available.");
         ImGui::End();
+        registrationJobGui(*registration_connection);
         rlImGuiEnd();
         return;
     }
@@ -5609,6 +5779,9 @@ void display()
     // draw list only actually hits the GPU once, at rlImGuiEnd() near the
     // end of this function).
     rlImGuiBegin();
+#ifdef HDMAPPING_GUI_STATE
+    registrationJobGui(*registration_connection);
+#endif
 
     ShowMainDockSpace();
 
@@ -7860,7 +8033,6 @@ static nlohmann::json step2EditorInputs()
     using nlohmann::json;
     const auto& clouds = session.point_clouds_container;
     const auto& graph = session.pose_graph_loop_closure;
-    const auto& rpf = tls_registration.registration_plane_feature;
     const auto& pgs = tls_registration.pose_graph_slam;
     const auto& gnss = tls_registration.gnss;
     const auto& bow = bow_state.params;
@@ -7873,8 +8045,6 @@ static nlohmann::json step2EditorInputs()
                                     tls_registration.is_trajectory_export_downsampling,
                                     tls_registration.curve_consecutive_distance_meters,
                                     tls_registration.not_curve_consecutive_distance_meters };
-    inputs["plane_features"] = { rpf.search_radius,     rpf.number_of_threads, rpf.number_of_iterations, rpf.is_adaptive_robust_kernel,
-                                 rpf.is_fix_first_node, RPFnomSelection,       RPFpeSelection,           RPF3dSelection };
     inputs["graph_solver"] = { pgs.search_radius,
                                pgs.number_of_threads,
                                pgs.number_of_iterations_pair_wise_matching,
@@ -8028,8 +8198,9 @@ static proc::StateSummary describeStep2()
              step2CaptureParameters(),
              { { "kind", "session" },
                { "path", state_path },
+               { "registration_result_path", registration_result_path },
                { "scan_count", session.point_clouds_container.point_clouds.size() },
-               { "operations", { "step2.set_parameters" } } } };
+               { "operations", { "step2.set_parameters", proc::register_scans_operation } } } };
 }
 
 static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
@@ -8051,6 +8222,33 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
+    if (source.kind == "native_session" && source.parameters.contains("registration"))
+    {
+        Session poses{};
+        auto& live = session.point_clouds_container.point_clouds;
+        if (!poses.load_snapshot_metadata(source.entry) || poses.point_clouds_container.point_clouds.size() != live.size())
+            return proc::OperationError{ "invalid_result", "Registered poses do not match the live session", {} };
+        nlohmann::json settings = nlohmann::json::object();
+        for (const auto* solver : { "ndt", "icp", "plane_features" })
+            settings[solver] = source.parameters.at(solver);
+        if (auto error = updateStep2Parameters(tls_registration, settings))
+            return error;
+        for (std::size_t i = 0; i < live.size(); ++i)
+        {
+            auto& scan = live[i];
+            scan.m_pose = poses.point_clouds_container.point_clouds[i].m_pose;
+            scan.pose = pose_tait_bryan_from_affine_matrix(scan.m_pose);
+            scan.gui_translation[0] = static_cast<float>(scan.pose.px);
+            scan.gui_translation[1] = static_cast<float>(scan.pose.py);
+            scan.gui_translation[2] = static_cast<float>(scan.pose.pz);
+            scan.gui_rotation[0] = static_cast<float>(scan.pose.om * RAD_TO_DEG);
+            scan.gui_rotation[1] = static_cast<float>(scan.pose.fi * RAD_TO_DEG);
+            scan.gui_rotation[2] = static_cast<float>(scan.pose.ka * RAD_TO_DEG);
+        }
+        registration_result_path = sessionPathText(source.entry);
+        session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+        return {};
+    }
     Session loaded{};
     if (source.kind != "native_session" || !loaded.load_published(source.entry))
         return proc::OperationError{ "invalid_result", "The result could not be opened as a published session", {} };
@@ -8068,6 +8266,7 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     session.point_clouds_container.point_clouds = std::move(scans);
     session_file_name = sessionPathText(source.entry);
     state_path = session_file_name;
+    registration_result_path.clear();
     readGnssTumFromSessionFile(session_file_name, tls_registration.gnss, tls_registration.tum);
     session_loaded = true;
     session_total_number_of_points = 0;
@@ -8166,8 +8365,8 @@ int main(int argc, char* argv[])
 
 #ifdef HDMAPPING_GUI_STATE
         // The GUI has historically selected camera<-world when its registration panels open.
-        tls_registration.ndt.is_cw = tls_registration.icp.is_cw = true;
-        tls_registration.ndt.is_wc = tls_registration.icp.is_wc = false;
+        tls_registration.registration_plane_feature.is_cw = tls_registration.ndt.is_cw = tls_registration.icp.is_cw = true;
+        tls_registration.registration_plane_feature.is_wc = tls_registration.ndt.is_wc = tls_registration.icp.is_wc = false;
 #endif
 
         // search for available geoid models in the system and populate the menu
@@ -8189,11 +8388,13 @@ int main(int argc, char* argv[])
                       {
                           return target;
                       },
-                      step2CaptureParameters());
+                      step2CaptureParameters(),
+                      gnssTumSessionData(tls_registration.gnss, tls_registration.tum));
               },
               applyStep2Result });
         state_bridge = &bridge;
         proc::GuiStateConnection connection(bridge, "multi_view_tls_registration_step_2");
+        registration_connection = &connection;
 #endif
         if (argc > 1)
         {
@@ -8227,6 +8428,7 @@ int main(int argc, char* argv[])
             if (last_target == bridge.Target() && inputs != last_inputs)
                 bridge.Changed();
             connection.Poll();
+            pollRegistration(connection);
             if (last_target != bridge.Target())
                 inputs = step2EditorInputs();
             last_inputs = std::move(inputs);
@@ -8292,6 +8494,7 @@ int main(int argc, char* argv[])
 #ifdef HDMAPPING_GUI_STATE
         SetWindowState(FLAG_WINDOW_HIDDEN);
         connection.Close();
+        registration_connection = nullptr;
         state_bridge = nullptr;
 #endif
         if (bow_state.detect_thread.joinable())

@@ -50,6 +50,8 @@ TEST_CASE("Step 1 provides seven callable operations")
     std::set<std::string> ids;
     for (const auto& entry : proc::DescribeOperations())
     {
+        if (!entry.id.starts_with("step1."))
+            continue;
         CHECK(ids.insert(entry.id).second);
         CHECK(entry.parameters_schema.at("type") == "object");
         CHECK(entry.scope_schema.at("type") == "object");

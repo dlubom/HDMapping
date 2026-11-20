@@ -2,6 +2,7 @@
 
 #include <Core/session.h>
 
+#include "NativeSessionResult.h"
 #include "SessionSnapshotPaths.h"
 
 #include <array>
@@ -199,10 +200,12 @@ namespace HDMapping::Processing
         }
     } // namespace
 
-    SessionCaptureSource::SessionCaptureSource(std::shared_ptr<const Session> session, std::function<TargetRef()> target, json parameters)
+    SessionCaptureSource::SessionCaptureSource(
+        std::shared_ptr<const Session> session, std::function<TargetRef()> target, json parameters, json tracks)
         : session_(std::move(session))
         , target_(std::move(target))
         , parameters_(std::move(parameters))
+        , tracks_(std::move(tracks))
     {
     }
 
@@ -281,12 +284,14 @@ namespace HDMapping::Processing
         {
             return OperationError{ "snapshot_capture_failed", "Could not write native session metadata", json::object() };
         }
+        WriteNativeSessionTracks(directory / SessionSnapshotPaths::entry, tracks_);
         return SnapshotContents{ std::string(SessionSnapshotPaths::kind), SessionSnapshotPaths::entry, parameters_, {} };
     }
 
-    std::variant<SessionSnapshot, OperationError> LoadSessionSnapshot(const SnapshotRef& snapshot)
+    std::variant<SessionSnapshot, OperationError> LoadSessionSnapshot(const SnapshotRef& snapshot, std::stop_token stop)
     {
-        auto verified = ReadSnapshot(snapshot);
+        ArtifactManifest inventory;
+        auto verified = ReadSnapshot(snapshot, stop, &inventory.files);
         if (auto* failure = std::get_if<OperationError>(&verified))
         {
             return std::move(*failure);
@@ -294,6 +299,14 @@ namespace HDMapping::Processing
         auto& stored = std::get<SnapshotContents>(verified);
         try
         {
+            if (stored.kind == native_session_kind)
+            {
+                ValidateNativeSessionReferences(stored, inventory);
+                auto session = std::make_unique<Session>();
+                if (!session->load_published(stored.entry) || session->point_clouds_container.point_clouds.empty())
+                    throw std::runtime_error("Could not open the published session");
+                return SessionSnapshot{ std::move(session), std::move(stored.parameters), ReadNativeSessionTracks(stored.entry) };
+            }
             if (stored.kind != SessionSnapshotPaths::kind || stored.entry.filename() != SessionSnapshotPaths::entry)
             {
                 throw std::runtime_error("Expected a session snapshot");
@@ -311,6 +324,8 @@ namespace HDMapping::Processing
             }
             for (std::size_t i = 0; i < scans.size(); ++i)
             {
+                if (stop.stop_requested())
+                    return OperationError{ "cancelled", "Snapshot loading cancelled", json::object() };
                 const auto path = root / SessionSnapshotPaths::cloud(i);
                 if (scans[i].file_name != path.filename().string())
                 {
@@ -318,7 +333,7 @@ namespace HDMapping::Processing
                 }
                 read_cloud(path, scans[i]);
             }
-            return SessionSnapshot{ std::move(session), std::move(stored.parameters) };
+            return SessionSnapshot{ std::move(session), std::move(stored.parameters), ReadNativeSessionTracks(stored.entry) };
         } catch (const std::exception& failure)
         {
             return OperationError{ "invalid_snapshot", failure.what(), json::object() };
