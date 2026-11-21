@@ -59,6 +59,7 @@
 #include <Core/structures.h>
 #include <Core/transformations.h>
 #include <Core/tum.h>
+#include <HDMapping/SessionPaths.h>
 #include <RaylibWidgets/WindowFit.h>
 
 #ifdef _WIN32
@@ -117,7 +118,6 @@
 #include <HDMapping/Processing/GuiStateBridge.h>
 #include <HDMapping/Processing/GuiStateConnection.h>
 #include <HDMapping/Processing/SessionSnapshot.h>
-#include <HDMapping/SessionPaths.h>
 #endif
 
 #include <HDMapping/HDMAPPING_ConfigureInfo.hpp>
