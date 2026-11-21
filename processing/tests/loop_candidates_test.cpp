@@ -73,6 +73,11 @@ namespace
 
 TEST_CASE("BoW detection publishes a scored revisit separately from the active graph")
 {
+#ifdef HDMAPPING_LOOP_CANDIDATES_TSAN
+    // The distro OpenCV parallel backend crosses into the instrumented debug oneTBB runtime.
+    // Keep that external backend serial while TSan checks the operation and the snapshot code.
+    cv::setNumThreads(0);
+#endif
     LoopFixture fixture;
     SessionCaptureSource source(
         fixture.session,

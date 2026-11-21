@@ -216,6 +216,11 @@ if(BUILD_TESTING)
     hdmapping_processing_target(processing_loop_candidates_test)
     add_test(NAME processing-loop-candidates COMMAND processing_loop_candidates_test)
     set_tests_properties(processing-loop-candidates PROPERTIES LABELS processing-loop-candidates TIMEOUT 90)
+    if(_processing_sanitizer STREQUAL "thread")
+        target_compile_definitions(processing_loop_candidates_test PRIVATE HDMAPPING_LOOP_CANDIDATES_TSAN)
+        set_property(TEST processing-loop-candidates APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "TSAN_OPTIONS=string_append: suppressions=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/loop_candidates_tsan.supp\"")
+    endif()
     list(APPEND _runtime_sources tests/loop_candidates_test.cpp)
 endif()
 
