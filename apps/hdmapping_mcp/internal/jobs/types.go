@@ -76,6 +76,9 @@ type Step1Recording struct {
 	TOML      string `json:"toml,omitempty" jsonschema:"Absolute path to an optional Step 1 TOML file"`
 }
 
+// DetectLoopCandidates publishes a report that can be presented in a live Step 2 editor.
+const DetectLoopCandidates = "constraints.detect_candidates"
+
 // SubmitRequest describes one heavy job. Access controls exclusive reservation,
 // independently of its source. Exactly one input is specified: a durable Snapshot,
 // a live CaptureSource reserved until Prepare returns, or a raw Step 1 Recording.

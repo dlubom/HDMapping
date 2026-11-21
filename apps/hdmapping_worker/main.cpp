@@ -1,3 +1,5 @@
+#include "step2_loop_candidate_operations.h"
+
 #include <HDMapping/Processing/RuntimeProtocol.h>
 
 #include "recording_capture.h"
@@ -103,11 +105,17 @@ namespace
     }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     using namespace HDMapping::Processing;
     try
     {
+        if (argc == 2 && std::string_view(argv[1]) == "--check-bow-vocabulary")
+        {
+            CheckLoopCandidateVocabulary();
+            std::cout << "PASS: bundled ORB vocabulary transformed a descriptor\n";
+            return 0;
+        }
         const auto protocol = open_protocol_output();
         std::cin.tie(nullptr);
         ServeWorker(

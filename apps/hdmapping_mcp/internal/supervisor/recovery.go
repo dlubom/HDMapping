@@ -102,7 +102,7 @@ func (s *Supervisor) Recover(ctx context.Context, store *jobs.Store) error {
 				recovered, err = store.Get(ctx, job.ID)
 				if err == nil && recovered.Status == jobs.Completed {
 					status := "unconfirmed"
-					if job.Request.Access == jobs.AccessRead {
+					if job.Request.Access == jobs.AccessRead && job.Request.Operation.Operation != jobs.DetectLoopCandidates {
 						status = "not_requested"
 					}
 					err = store.RecordGUIApply(ctx, job.ID, status)
@@ -110,6 +110,9 @@ func (s *Supervisor) Recover(ctx context.Context, store *jobs.Store) error {
 			}
 			if err != nil {
 				return fmt.Errorf("recover job %s: %w", job.ID, err)
+			}
+			if job.Request.Operation.Operation == jobs.DetectLoopCandidates {
+				s.discardCameraCapture(job.ID)
 			}
 			after = job.ID
 		}

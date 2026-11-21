@@ -150,3 +150,54 @@ func TestGetJobPreservesWorkerErrorDetails(t *testing.T) {
 		t.Fatalf("get_job lost the structured worker error: %s (%v)", data, err)
 	}
 }
+
+func TestDetectCandidatesSubmitsReadJobForLiveRevision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	target := jobs.TargetRef{StateID: "opening", Revision: 7}
+	srv := NewWithCoordinator("1.2.3", func(_ context.Context, method string, in, out any) error {
+		request, ok := in.(jobs.SubmitRequest)
+		if !ok || method != "jobs.submit" || request.Access != jobs.AccessRead ||
+			request.CaptureSource != target.StateID || request.Operation.Target != target ||
+			request.Operation.Operation != jobs.DetectLoopCandidates || string(request.Operation.Scope) != `{"scan_indices":[0,2]}` {
+			return fmt.Errorf("unexpected request %s, %+v", method, in)
+		}
+		*out.(*jobs.JobRecord) = jobs.JobRecord{ID: "candidates-job", Request: request, Status: jobs.Preparing, GUIApplyStatus: "pending"}
+		return nil
+	})
+	serverTransport, clientTransport := sdk.NewInMemoryTransports()
+	session, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := sdk.NewClient(&sdk.Implementation{Name: "contract-test", Version: "1"}, nil).Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	result, err := client.CallTool(ctx, &sdk.CallToolParams{Name: jobs.DetectLoopCandidates, Arguments: map[string]any{
+		"target": target, "request_key": "detect", "scope": map[string][]int{"scan_indices": {0, 2}},
+		"parameters": map[string][]string{"camera_dirs": {"/cameras/0"}},
+	}})
+	if err != nil || result.IsError {
+		t.Fatalf("candidate tool failed: %v (%v)", err, result)
+	}
+	data, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response constraintResponse
+	if err := json.Unmarshal(data, &response); err != nil || response.Job == nil ||
+		response.Job.ID != "candidates-job" || response.Job.Target != target || response.Job.GUIApplyStatus != "pending" {
+		t.Fatalf("missing candidate job: %s (%v)", data, err)
+	}
+}

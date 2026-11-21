@@ -2,6 +2,7 @@
 """Check MCP ON/OFF in an installed or packaged product after relocation."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -64,9 +65,21 @@ def main():
         relocated = Path(temporary) / "przeniesiona instalacja żółć"
         staging.rename(relocated)
         executable = relocated / relative_executable
+        vocabulary = executable.with_name("hdmapping-orb-mur.fbow")
+        sha256 = hashlib.sha256()
+        with vocabulary.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                sha256.update(block)
+        digest = sha256.hexdigest()
+        if digest != "310cdf3581b5dd5becfabd75823606e315b1f049f70e51fa23be05021dc4b107":
+            raise RuntimeError(f"Unexpected bundled BoW vocabulary: {vocabulary}")
+        print(f"PASS: relocated BoW vocabulary {digest}", flush=True)
         if args.mcp == "ON":
             if not executable.is_file():
                 raise RuntimeError(f"Installed MCP is missing: {executable}")
+            prefix = executable.name.removesuffix("hdmapping_mcp" + suffix)
+            worker_name = prefix + "hdmapping_worker" + suffix
+            run([executable.with_name(worker_name), "--check-bow-vocabulary"], cwd=temporary)
             test = contracts[0]
             command = test["command"][:]
             properties = {prop["name"]: prop["value"] for prop in test["properties"]}

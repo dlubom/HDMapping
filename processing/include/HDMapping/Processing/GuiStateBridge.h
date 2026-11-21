@@ -20,6 +20,8 @@ namespace HDMapping::Processing
         std::function<std::optional<OperationError>(const ArtifactManifest&)> ApplyResult;
         //! Pin operation-specific inputs on the window thread when supported by this application.
         std::function<std::unique_ptr<CaptureSource>(const OperationRequest&)> PinOperationCapture = {};
+        //! Present a verified read-only result without advancing the workspace revision.
+        std::function<std::optional<OperationError>(const ArtifactManifest&)> PresentLoopCandidates = {};
     };
 
     using GuiResponse = std::variant<nlohmann::json, OperationError>;

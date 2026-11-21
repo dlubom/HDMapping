@@ -2,6 +2,7 @@ add_executable(hdmapping_worker main.cpp)
 target_compile_definitions(hdmapping_worker PRIVATE HDMAPPING_WORKER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(hdmapping_worker PRIVATE processing_step1)
 hdmapping_processing_target(hdmapping_worker)
+add_dependencies(hdmapping_worker hdmapping_bow_vocabulary)
 hdmapping_install_app(hdmapping_worker)
 
 if(WIN32)

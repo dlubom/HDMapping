@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -119,7 +120,8 @@ namespace bow_loop_closure
         const std::vector<CameraFrame>& frames,
         const std::vector<std::vector<int>>& chunk_frames,
         const DetectorParams& params,
-        fbow::Vocabulary& vocabulary);
+        fbow::Vocabulary& vocabulary,
+        std::stop_token stop = {});
 
     // Re-runs ORB detect + ratio-test match + RANSAC for one candidate's frame
     // pair (independent of detectCandidates' internal per-run cache) and draws the

@@ -39,7 +39,7 @@ namespace HDMapping::Processing
             return path;
         }
 
-        RunResult read_result(const json& params, const TargetRef& expected, bool accepts_odometry)
+        RunResult read_result(const json& params, const TargetRef& expected, bool accepts_odometry, bool accepts_candidates)
         {
             const auto path = required_path(params.at("manifest_path"));
             if (path.filename() != "result.json" || fs::file_size(path) > 1024 * 1024)
@@ -86,13 +86,15 @@ namespace HDMapping::Processing
             };
             const auto snapshot = normalize_inventory(manifest);
             // The Step 1 adapter validates and restores its private prepared snapshot before changing the opening.
-            if (accepts_odometry && snapshot.parent_path() == root / "prepared" && snapshot.filename() == "snapshot.json")
+            const bool prepared = accepts_odometry && snapshot.parent_path() == root / "prepared";
+            const bool candidates = accepts_candidates && snapshot.parent_path() == root / "loop-candidates";
+            if ((prepared || candidates) && snapshot.filename() == "snapshot.json")
             {
                 const auto target = parse_target(manifest.at("target"));
                 const auto snapshot_target = parse_target(manifest.at("snapshot").at("target"));
                 const auto id = manifest.at("artifact_id").get<std::string>();
                 if (target != expected || snapshot_target != expected || id.empty() || !manifest.at("dependencies").empty())
-                    return error("invalid_published_result", "Invalid prepared odometry receipt");
+                    return error("invalid_published_result", "Invalid private result receipt");
                 std::vector<fs::path> files;
                 for (const auto& file : manifest.at("files"))
                     files.push_back(sessionPathFromText(file.get_ref<const std::string&>()));
@@ -287,12 +289,20 @@ namespace HDMapping::Processing
                     return error("state_busy", "A conflicting reservation is active");
                 }
             }
-            auto result = read_result(params, target, static_cast<bool>(callbacks_.PinOperationCapture));
+            const bool presents_candidates = static_cast<bool>(callbacks_.PresentLoopCandidates);
+            auto result = read_result(params, target, static_cast<bool>(callbacks_.PinOperationCapture), presents_candidates);
             if (const auto* failure = std::get_if<OperationError>(&result))
             {
                 return *failure;
             }
-            if (auto failure = callbacks_.ApplyResult(std::get<ArtifactManifest>(result)))
+            const auto& artifact = std::get<ArtifactManifest>(result);
+            if (presents_candidates && artifact.snapshot.manifest_path.parent_path().filename() == "loop-candidates")
+            {
+                if (auto failure = callbacks_.PresentLoopCandidates(artifact))
+                    return *failure;
+                return json::object();
+            }
+            if (auto failure = callbacks_.ApplyResult(artifact))
             {
                 return *failure;
             }

@@ -297,7 +297,8 @@ func (s *Store) submit(ctx context.Context, req SubmitRequest, prepare bool, res
 		return JobRecord{}, fmt.Errorf("job ID: %w", err)
 	}
 	j := JobRecord{ID: JobID(hex.EncodeToString(id[:])), Request: req, Status: Preparing, GUIApplyStatus: "not_requested"}
-	if req.Access == AccessMutate && (req.Source == SourceGUI || req.CaptureSource != "") {
+	if (req.Access == AccessMutate && (req.Source == SourceGUI || req.CaptureSource != "")) ||
+		(req.Access == AccessRead && req.CaptureSource != "" && req.Operation.Operation == DetectLoopCandidates) {
 		j.GUIApplyStatus = "pending"
 	}
 	if req.Snapshot != nil && !prepare {

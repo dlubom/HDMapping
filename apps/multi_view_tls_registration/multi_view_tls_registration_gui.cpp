@@ -113,6 +113,7 @@
 #ifdef HDMAPPING_GUI_STATE
 #include "step2_constraint_operations.h"
 #include "step2_georeference_operations.h"
+#include "step2_loop_candidate_operations.h"
 #include "step2_operations.h"
 #include "step2_state_parameters.h"
 #include <HDMapping/Processing/GuiStateBridge.h>
@@ -2244,14 +2245,8 @@ void observation_picking_gui()
 }
 
 // ── Automatic image-based (fbow) loop closure detection ─────────────────────
-// Candidates are only ever surfaced for manual review here (montage preview +
-// per-row "Add edge") -- never auto-added to the pose graph -- per
-// BOW_PLACE_RECOGNITION_HANDOFF.md's documented false-positive risk on
-// repetitive scenes. Detection itself runs on a background thread (ORB
-// extraction over hundreds of frames must not block the render loop); it only
-// reads session.point_clouds_container (poses/timestamps), never mutates it,
-// mirroring TrajectoryViewer.cpp's imgViewThread pattern for its own
-// background image work.
+// The legacy path runs in-process. With MCP enabled the button submits a durable read job,
+// and the editor accepts its candidates only for the matching opening and revision.
 namespace
 {
     struct BowLoopClosureState
@@ -2261,7 +2256,15 @@ namespace
         bow_loop_closure::DetectorParams params;
 
         std::atomic<bool> detecting{ false };
+#ifdef HDMAPPING_GUI_STATE
+        bool awaiting_job = false;
+        proc::TargetRef result_target;
+        std::filesystem::path report_path;
+        std::map<std::pair<int, int>, nlohmann::json> candidate_edges;
+        bow_loop_closure::DetectorParams preview_params;
+#else
         std::thread detect_thread;
+#endif
 
         std::mutex results_mutex;
         std::vector<bow_loop_closure::Candidate> results;
@@ -2276,15 +2279,44 @@ namespace
         bool montage_tex_valid = false;
     };
     BowLoopClosureState bow_state;
+    const bow_loop_closure::DetectorParams& montageParameters();
+    void bow_loop_closure_clear_preview();
 
     void bow_loop_closure_start_detection()
     {
         if (bow_state.detecting.load())
             return;
+#ifdef HDMAPPING_GUI_STATE
+        if (registrationActive())
+            return;
+#else
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
-        markBulkEdit();
+#endif
 
+        std::vector<std::string> camera_dirs;
+#ifndef HDMAPPING_GUI_STATE
+        std::vector<std::string> camera_names;
+#endif
+        for (const auto& dir : bow_state.camera_dirs)
+        {
+            if (dir[0] == '\0')
+                continue;
+            camera_dirs.emplace_back(dir.data());
+#ifndef HDMAPPING_GUI_STATE
+            auto path = sessionPathFromText(camera_dirs.back());
+            if (!path.has_filename())
+                path = path.parent_path(); // ".../cam_front/"
+            camera_names.push_back(sessionPathText(path.filename()));
+#endif
+        }
+        if (camera_dirs.empty())
+        {
+            bow_state.status = "Select at least one camera folder";
+            return;
+        }
+        const auto params = bow_state.params;
+        bow_loop_closure_clear_preview();
         bow_state.detecting = true;
         {
             std::lock_guard<std::mutex> lk(bow_state.results_mutex);
@@ -2292,21 +2324,33 @@ namespace
             bow_state.results.clear();
             bow_state.selected_candidate = -1;
         }
-
-        std::vector<std::string> camera_dirs;
-        std::vector<std::string> camera_names;
-        for (const auto& dir : bow_state.camera_dirs)
+#ifdef HDMAPPING_GUI_STATE
+        auto indices = nlohmann::json::array();
+        for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
+            indices.push_back(i);
+        if (indices.size() < 2)
         {
-            if (dir[0] == '\0')
-                continue;
-            camera_dirs.emplace_back(dir.data());
-            std::filesystem::path path(camera_dirs.back());
-            if (!path.has_filename())
-                path = path.parent_path(); // ".../cam_front/"
-            camera_names.push_back(path.filename().string());
+            bow_state.status = "Loop detection requires at least two scans";
+            bow_state.detecting = false;
+            return;
         }
-        bow_loop_closure::DetectorParams params = bow_state.params;
-
+        for (auto& path : camera_dirs)
+            path = sessionPathText(std::filesystem::absolute(sessionPathFromText(path)));
+        bow_state.candidate_edges.clear();
+        bow_state.report_path.clear();
+        bow_state.awaiting_job = true;
+        submitStep2Job(
+            proc::detect_candidates_operation,
+            { { "scan_indices", std::move(indices) } },
+            { { "camera_dirs", camera_dirs },
+              { "min_arc_gap_m", params.min_arc_gap_m },
+              { "max_xy_dist_m", params.max_xy_dist_m },
+              { "min_bow_score", params.min_bow_score },
+              { "min_inliers", params.min_inliers },
+              { "orb_features", params.orb_features },
+              { "max_image_size_px", params.max_image_size_px } },
+            false);
+#else
         bow_state.detect_thread = std::thread(
             [camera_dirs, camera_names, params]()
             {
@@ -2341,6 +2385,7 @@ namespace
                 bow_state.status = status;
                 bow_state.detecting = false;
             });
+#endif
     }
 
     // Uploads `mat` (BGR, as cv::imread/drawMatches produce) as the montage
@@ -2366,7 +2411,7 @@ namespace
     {
         bow_state.selected_candidate = row;
         std::lock_guard<std::mutex> lk(bow_state.results_mutex);
-        cv::Mat montage = bow_loop_closure::buildCandidateMontage(results[row], bow_state.frames, bow_state.params);
+        cv::Mat montage = bow_loop_closure::buildCandidateMontage(results[row], bow_state.frames, montageParameters());
         bow_loop_closure_upload_montage(montage);
     }
 
@@ -2376,6 +2421,130 @@ namespace
         if (bow_state.montage_tex_valid)
             UnloadTexture(bow_state.montage_tex);
         bow_state.montage_tex_valid = false;
+    }
+
+#ifdef HDMAPPING_GUI_STATE
+    std::optional<proc::OperationError> presentLoopCandidates(const proc::ArtifactManifest& artifact)
+    {
+        using nlohmann::json;
+        try
+        {
+            std::vector<std::filesystem::path> files;
+            const auto result = proc::ReadSnapshot(artifact.snapshot, {}, &files);
+            if (const auto* error = std::get_if<proc::OperationError>(&result))
+                return *error;
+            const auto& contents = std::get<proc::SnapshotContents>(result);
+            if (contents.kind != proc::loop_candidates_kind || artifact.artifact_id != "loop-candidates")
+                throw std::runtime_error("Unexpected loop candidate report");
+            std::ifstream input(contents.entry);
+            const auto report = json::parse(input);
+            const auto& settings = report.at("settings");
+            bow_loop_closure::DetectorParams params;
+            params.orb_features = settings.at("orb_features").get<int>();
+            params.max_image_size_px = settings.at("max_image_size_px").get<int>();
+
+            const auto cameraCount = report.at("camera_count").get<std::size_t>();
+            std::vector<std::string> names;
+            for (std::size_t camera = 0; camera < cameraCount; ++camera)
+                names.push_back("camera " + std::to_string(camera));
+            std::vector<bow_loop_closure::CameraFrame> frames;
+            std::vector<bow_loop_closure::Candidate> candidates;
+            std::map<std::pair<int, int>, json> edges;
+            const auto frameIndex = [&](const json& frame)
+            {
+                const auto path = contents.entry.parent_path() / sessionPathFromText(frame.at("file").get<std::string>());
+                if (std::ranges::find(files, path) == files.end())
+                    throw std::runtime_error("Candidate frame is absent from the report inventory");
+                const int camera = frame.at("camera_index").get<int>();
+                if (camera < 0 || static_cast<std::size_t>(camera) >= cameraCount)
+                    throw std::runtime_error("Candidate camera index is outside the submission");
+                const int index = static_cast<int>(frames.size());
+                frames.push_back({ std::stoll(frame.at("timestamp_ns").get<std::string>()), sessionPathText(path), camera });
+                return index;
+            };
+            const auto scanCount = session.point_clouds_container.point_clouds.size();
+            for (const auto& row : report.at("candidates"))
+            {
+                const auto& edge = row.at("edge");
+                const int from = edge.at("index_from").get<int>();
+                const int to = edge.at("index_to").get<int>();
+                if (from < 0 || to <= from || static_cast<std::size_t>(to) >= scanCount)
+                    throw std::runtime_error("Candidate endpoints are outside the session");
+                candidates.push_back(
+                    { from,
+                      to,
+                      frameIndex(row.at("frame_from")),
+                      frameIndex(row.at("frame_to")),
+                      row.at("xy_dist_m").get<double>(),
+                      row.at("arc_gap_m").get<double>(),
+                      row.at("bow_score").get<double>(),
+                      row.at("inliers").get<int>() });
+                edges.emplace(std::pair{ from, to }, edge);
+            }
+            bow_loop_closure_clear_preview();
+            bow_state.camera_names = std::move(names);
+            bow_state.frames = std::move(frames);
+            bow_state.results = std::move(candidates);
+            bow_state.candidate_edges = std::move(edges);
+            bow_state.preview_params = params;
+            bow_state.result_target = artifact.target;
+            bow_state.report_path = contents.entry;
+            bow_state.status = std::to_string(bow_state.results.size()) + " candidates found";
+            return {};
+        } catch (const std::exception& error)
+        {
+            return proc::OperationError{ "invalid_result", error.what(), nlohmann::json::object() };
+        }
+    }
+
+    void finishLoopCandidateJob()
+    {
+        if (!bow_state.awaiting_job || registrationActive())
+            return;
+        bow_state.awaiting_job = false;
+        bow_state.detecting = false;
+        const auto applied = registration_job.value("gui_apply_status", std::string{});
+        if (applied == "applied")
+            return;
+        if (registration_job.value("status", std::string{}) == "completed")
+            bow_state.status = "Candidate report saved. Workspace update: " + applied;
+        else
+        {
+            bow_state.status = registration_job.value("error", nlohmann::json::object()).value("message", registration_error);
+            if (bow_state.status.empty())
+                bow_state.status = registration_job.value("status", std::string("Detection failed"));
+        }
+    }
+
+    bool currentLoopCandidates()
+    {
+        return state_bridge->Target() == bow_state.result_target && !state_bridge->Reserved();
+    }
+
+    void retainLoopCandidatesAfterEditorChange()
+    {
+        state_bridge->Changed();
+        bow_state.result_target = state_bridge->Target();
+    }
+
+    bool activateLoopCandidate(const bow_loop_closure::Candidate& candidate)
+    {
+        if (!currentLoopCandidates() ||
+            !editManualConstraint(
+                "constraints.add", nlohmann::json::object(), bow_state.candidate_edges.at({ candidate.index_i, candidate.index_j })))
+            return false;
+        retainLoopCandidatesAfterEditorChange();
+        return true;
+    }
+#endif
+
+    const bow_loop_closure::DetectorParams& montageParameters()
+    {
+#ifdef HDMAPPING_GUI_STATE
+        return bow_state.preview_params;
+#else
+        return bow_state.params;
+#endif
     }
 
     // N / P step the BoW candidates instead of the manual loop closure's active edge while a candidate is
@@ -2445,6 +2614,11 @@ void bow_loop_closure_gui()
     ImGui::PopItemWidth();
 
     bool detecting = bow_state.detecting.load();
+    bool can_activate = true;
+#ifdef HDMAPPING_GUI_STATE
+    detecting = detecting || registrationActive();
+    can_activate = currentLoopCandidates();
+#endif
     ImGui::BeginDisabled(detecting || session.point_clouds_container.point_clouds.empty());
     if (ImGui::Button("Detect candidates"))
         bow_loop_closure_start_detection();
@@ -2469,6 +2643,10 @@ void bow_loop_closure_gui()
         }
     }
     ImGui::Text("%s", status_copy.c_str());
+#ifdef HDMAPPING_GUI_STATE
+    if (!results_copy.empty() && state_bridge->Target() != bow_state.result_target)
+        ImGui::TextUnformatted("Detection belongs to an earlier session revision. Run detection again to add edges.");
+#endif
 
     ImGui::Separator();
     ImGui::Text(
@@ -2508,9 +2686,15 @@ void bow_loop_closure_gui()
             c.inliers,
             results_cameras.empty() ? "" : results_cameras[row].c_str());
         ImGui::SameLine();
+        ImGui::BeginDisabled(!can_activate);
         if (ImGui::Button("Add edge"))
         {
+#ifdef HDMAPPING_GUI_STATE
+            if (!activateLoopCandidate(c))
+                bow_state.status = "Could not activate candidate: " + registration_error;
+#else
             session.pose_graph_loop_closure.add_edge(session.point_clouds_container, c.index_i, c.index_j);
+#endif
         }
         ImGui::SameLine();
         if (ImGui::Button("Preview in 3D"))
@@ -2518,7 +2702,11 @@ void bow_loop_closure_gui()
             index_loop_closure_source = c.index_i;
             index_loop_closure_target = c.index_j;
             is_loop_closure_gui = true;
+#ifdef HDMAPPING_GUI_STATE
+            retainLoopCandidatesAfterEditorChange();
+#endif
         }
+        ImGui::EndDisabled();
 
         ImGui::PopID();
     }
@@ -2526,8 +2714,23 @@ void bow_loop_closure_gui()
 
     if (!results_copy.empty())
     {
+        ImGui::BeginDisabled(!can_activate);
         if (ImGui::Button("Add all shown"))
         {
+#ifdef HDMAPPING_GUI_STATE
+            const auto added = std::erase_if(
+                bow_state.results,
+                [](const auto& candidate)
+                {
+                    if (!activateLoopCandidate(candidate))
+                        return false;
+                    bow_state.candidate_edges.erase({ candidate.index_i, candidate.index_j });
+                    return true;
+                });
+            bow_state.status = "Added " + std::to_string(added) + " edges to the pose graph";
+            if (!bow_state.results.empty())
+                bow_state.status += ". Remaining candidates: " + registration_error;
+#else
             for (const auto& c : results_copy)
                 session.pose_graph_loop_closure.add_edge(session.point_clouds_container, c.index_i, c.index_j);
             {
@@ -2535,10 +2738,12 @@ void bow_loop_closure_gui()
                 bow_state.results.clear();
                 bow_state.status = "Added " + std::to_string(results_copy.size()) + " edges to the pose graph";
             }
+#endif
             bow_loop_closure_clear_preview();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Add every candidate as a pose graph edge and clear the list");
+        ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Save all shown as montages..."))
         {
@@ -2548,7 +2753,7 @@ void bow_loop_closure_gui()
                 std::lock_guard<std::mutex> lk(bow_state.results_mutex);
                 for (const auto& c : results_copy)
                 {
-                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, bow_state.params);
+                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, montageParameters());
                     if (!m.empty())
                     {
                         std::string fn = out_dir + "/cand_" + std::to_string(c.index_i) + "_" + std::to_string(c.index_j) + ".png";
@@ -2599,7 +2804,7 @@ void bow_loop_closure_gui()
                 if (!out_file.empty())
                 {
                     std::lock_guard<std::mutex> lk(bow_state.results_mutex);
-                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, bow_state.params);
+                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, montageParameters());
                     if (!m.empty())
                         cv::imwrite(out_file, m);
                 }
@@ -2621,7 +2826,10 @@ void bow_loop_closure_gui()
                             return c.index_i == shown.index_i && c.index_j == shown.index_j;
                         });
                     if (it != results.end())
-                        next_row = static_cast<int>(results.erase(it) - results.begin());
+#ifdef HDMAPPING_GUI_STATE
+                        bow_state.candidate_edges.erase({ it->index_i, it->index_j });
+#endif
+                    next_row = static_cast<int>(results.erase(it) - results.begin());
                     remaining = results;
                 }
                 // Show the candidate that took its place, or the new last one.
@@ -8178,6 +8386,7 @@ static proc::StateSummary describeStep2()
         { "step2.set_parameters",
           proc::register_scans_operation,
           proc::list_constraints_operation,
+          proc::detect_candidates_operation,
           "constraints.add",
           "constraints.update",
           "constraints.remove",
@@ -8193,6 +8402,9 @@ static proc::StateSummary describeStep2()
                { "registration_result_path", registration_result_path },
                { "constraint_result_path", constraint_result_path },
                { "georeference_result_path", georeference_result_path },
+               { "loop_candidates_path",
+                 bow_state.result_target.state_id == state_bridge->Target().state_id ? sessionPathText(bow_state.report_path)
+                                                                                     : std::string{} },
                { "active_edges", proc::DescribeActiveConstraints(session) },
                { "control_points", proc::DescribeControlPoints(session) },
                { "ground_control_points", proc::DescribeGroundControlPoints(session) },
@@ -8232,8 +8444,6 @@ static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
 
 static std::optional<proc::OperationError> applyStep2Result(const proc::ArtifactManifest& artifact)
 {
-    if (bow_state.detecting.load())
-        return proc::OperationError{ "state_busy", "Image loop closure detection is reading this session", {} };
     auto snapshot = proc::ReadSnapshot(artifact.snapshot);
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
@@ -8465,7 +8675,7 @@ int main(int argc, char* argv[])
               mutateStep2,
               [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
               {
-                  if (session.point_clouds_container.point_clouds.empty() || bow_state.detecting.load())
+                  if (session.point_clouds_container.point_clouds.empty())
                       return {};
                   return std::make_unique<proc::SessionCaptureSource>(
                       session_owner,
@@ -8476,7 +8686,9 @@ int main(int argc, char* argv[])
                       step2CaptureParameters(),
                       HDMapping::EncodeReferenceTracks(tls_registration.gnss, tls_registration.tum));
               },
-              applyStep2Result });
+              applyStep2Result,
+              {},
+              presentLoopCandidates });
         state_bridge = &bridge;
         proc::GuiStateConnection connection(bridge, "multi_view_tls_registration_step_2");
         registration_connection = &connection;
@@ -8514,6 +8726,7 @@ int main(int argc, char* argv[])
                 bridge.Changed();
             connection.Poll();
             pollRegistration(connection);
+            finishLoopCandidateJob();
             if (last_target != bridge.Target())
                 inputs = step2EditorInputs();
             last_inputs = std::move(inputs);
@@ -8582,8 +8795,10 @@ int main(int argc, char* argv[])
         registration_connection = nullptr;
         state_bridge = nullptr;
 #endif
+#ifndef HDMAPPING_GUI_STATE
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
+#endif
         if (bow_state.montage_tex_valid)
             UnloadTexture(bow_state.montage_tex);
 

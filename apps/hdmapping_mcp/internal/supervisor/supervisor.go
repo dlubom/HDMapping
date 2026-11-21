@@ -66,7 +66,11 @@ func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.Snap
 	if reply.Type != "snapshot_validated" {
 		return jobs.SnapshotRef{}, fmt.Errorf("unexpected snapshot validation response: %s", reply.Type)
 	}
-	if isReferenceImport(job.Request.Operation.Operation) {
+	if job.Request.Operation.Operation == jobs.DetectLoopCandidates {
+		if err := s.stageCameras(ctx, job); err != nil {
+			return jobs.SnapshotRef{}, err
+		}
+	} else if isReferenceImport(job.Request.Operation.Operation) {
 		if err := s.stageReferences(ctx, job); err != nil {
 			return jobs.SnapshotRef{}, err
 		}
@@ -124,11 +128,23 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 		return jobs.Publication{}, err
 	}
 	operation := job.Request.Operation
-	if isReferenceImport(operation.Operation) {
+	cameraJob := operation.Operation == jobs.DetectLoopCandidates
+	canDiscardCapture := true
+	if cameraJob {
+		defer func() {
+			if canDiscardCapture {
+				s.discardCameraCapture(job.ID)
+			}
+		}()
+	}
+	switch {
+	case cameraJob:
+		operation, err = s.useStagedCameras(ctx, job)
+	case isReferenceImport(operation.Operation):
 		operation, err = s.useStagedReferences(ctx, job)
-		if err != nil {
-			return jobs.Publication{}, err
-		}
+	}
+	if err != nil {
+		return jobs.Publication{}, err
 	}
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return jobs.Publication{}, fmt.Errorf("create job directory: %w", err)
@@ -136,6 +152,7 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 	cmd := exec.Command(s.Coordinator, "supervise", dir)
 	cmd.Dir = dir
 	cmd.Stderr = os.Stderr
+	canDiscardCapture = false
 	reply, runErr := exchange(ctx, cmd, s.Version, command{
 		Type: "run", ID: job.ID, Operation: &operation, Snapshot: job.Snapshot,
 	}, s.reportProgress(job.ID), true)
@@ -149,6 +166,7 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 		return jobs.Publication{}, errors.Join(runErr, err)
 	}
 	defer func() { _ = lease.Close() }()
+	canDiscardCapture = true
 	published, err := readReceipt(dir, s.Version, job)
 	if err == nil {
 		// Match P02: durable publication wins a concurrent cancellation.

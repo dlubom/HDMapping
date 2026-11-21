@@ -9,10 +9,10 @@ import (
 )
 
 type constraintInput struct {
-	RequestKey string            `json:"request_key,omitempty" jsonschema:"Stable retry key. Required for snapshot operations and for ICP or optimization."`
+	RequestKey string            `json:"request_key,omitempty" jsonschema:"Stable retry key. Required for snapshot operations and durable jobs."`
 	Target     *jobs.TargetRef   `json:"target,omitempty" jsonschema:"Live Step 2 opening and exact revision. Supply either target or snapshot."`
 	Snapshot   *jobs.SnapshotRef `json:"snapshot,omitempty" jsonschema:"Durable Step 2 session snapshot and its exact target and revision."`
-	Scope      map[string]any    `json:"scope,omitempty" jsonschema:"Explicit edge_index or edge_indices where required. See the C++ operation catalog."`
+	Scope      map[string]any    `json:"scope,omitempty" jsonschema:"Explicit scan_indices, edge_index or edge_indices where required. See the C++ operation catalog."`
 	Parameters map[string]any    `json:"parameters,omitempty" jsonschema:"See describe_constraints_operations or describe_step2_operations."`
 }
 
@@ -30,7 +30,7 @@ type constraintState struct {
 }
 
 func addConstraintTools(server *sdk.Server, call func(context.Context, string, any, any) error) []string {
-	addOperationCatalog(server, call, "constraints", "List active edge contracts, explicit scopes, units and ICP settings.")
+	addOperationCatalog(server, call, "constraints", "List active edge contracts, explicit scopes, BoW and ICP settings.")
 	capabilities := []string{"describe_constraints_operations"}
 	for _, op := range []struct {
 		id, description string
@@ -41,6 +41,7 @@ func addConstraintTools(server *sdk.Server, call func(context.Context, string, a
 		{"constraints.update", "Update fields on one active edge at scope.edge_index.", false, false},
 		{"constraints.remove", "Remove one active edge at scope.edge_index.", false, false},
 		{"constraints.replace", "Replace exactly scope.edge_indices with parameters.edges. Requires the current revision.", false, false},
+		{jobs.DetectLoopCandidates, "Detect and score loop candidates from camera folders. get_job returns the result snapshot path. Open its candidates.json locally to review scores and edge payloads before activating them.", true, true},
 		{"constraints.run_icp", "Refine the active edges named by scope.edge_indices. Check get_job for completion.", false, true},
 		{"step2.optimize_graph", "Optimize one session using its motion model and the active edges named by scope.edge_indices. Check get_job for completion.", false, true},
 	} {
@@ -51,7 +52,7 @@ func addConstraintTools(server *sdk.Server, call func(context.Context, string, a
 				if (input.Target == nil) == (input.Snapshot == nil) {
 					return nil, out, errors.New("supply exactly one of target or snapshot")
 				}
-				if input.Target != nil && op.read {
+				if input.Target != nil && op.read && !op.heavy {
 					if len(input.Scope) != 0 || len(input.Parameters) != 0 {
 						return nil, out, errors.New("constraints.list takes empty scope and parameters")
 					}
