@@ -2826,10 +2826,12 @@ void bow_loop_closure_gui()
                             return c.index_i == shown.index_i && c.index_j == shown.index_j;
                         });
                     if (it != results.end())
+                    {
 #ifdef HDMAPPING_GUI_STATE
                         bow_state.candidate_edges.erase({ it->index_i, it->index_j });
 #endif
-                    next_row = static_cast<int>(results.erase(it) - results.begin());
+                        next_row = static_cast<int>(results.erase(it) - results.begin());
+                    }
                     remaining = results;
                 }
                 // Show the candidate that took its place, or the new last one.
@@ -8258,8 +8260,7 @@ static nlohmann::json step2EditorInputs()
                        gnss.setWGS84ReferenceFromFirstPose,
                        gnss.gnss_poses.size() };
     inputs["tum"] = { tumSubtractFirstPose, tls_registration.tum.version };
-    inputs["bow"] = { bow.min_arc_gap_m, bow.max_xy_dist_m,     bow.min_bow_score,           bow.min_inliers,
-                      bow.orb_features,  bow.max_image_size_px, bow_state.selected_candidate };
+    inputs["bow"] = { bow.min_arc_gap_m, bow.max_xy_dist_m, bow.min_bow_score, bow.min_inliers, bow.orb_features, bow.max_image_size_px };
     inputs["offset"] = { clouds.offset.x(), clouds.offset.y(), clouds.offset.z() };
     inputs["offset_to_apply"] = { clouds.offset_to_apply.x(), clouds.offset_to_apply.y(), clouds.offset_to_apply.z() };
     inputs["sections"] = { clouds.xz_intersection, clouds.yz_intersection, clouds.xy_intersection, clouds.intersection_width };
@@ -8268,10 +8269,6 @@ static nlohmann::json step2EditorInputs()
                           session.ground_control_points.default_lidar_height_above_ground };
     for (const auto& dir : bow_state.camera_dirs)
         inputs["camera_dirs"].push_back(dir.data());
-    {
-        std::lock_guard lock(bow_state.results_mutex);
-        inputs["bow_results"] = bow_state.results.size();
-    }
     // Group pose matrices in contiguous storage. Comparing lightweight scan
     // metadata never traverses the points or serializes them per frame.
     std::vector<std::uint8_t> poses;
