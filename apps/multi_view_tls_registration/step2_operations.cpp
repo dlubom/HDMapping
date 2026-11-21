@@ -3,6 +3,7 @@
 #include "step2_georeference_operations.h"
 
 #include "step2_result.h"
+#include "step2_segment_operations.h"
 #include "step2_solver_selection.h"
 #include "step2_state_parameters.h"
 
@@ -270,6 +271,7 @@ namespace HDMapping::Processing
                 output["registration"]["metric"] = metric;
             state.parameters.erase("constraints_result");
             state.parameters.erase("georeference_result");
+            state.parameters.erase("segment_result");
             state.parameters.update(output);
             auto result = PublishStep2Result(*state.session, request.target, std::move(state.parameters), state.tracks, context);
             if (diagnostic && std::holds_alternative<ArtifactManifest>(result))
@@ -299,6 +301,7 @@ namespace HDMapping::Processing
             auto& state = std::get<SessionSnapshot>(loaded);
             state.parameters.erase("registration");
             state.parameters.erase("georeference_result");
+            state.parameters.erase("segment_result");
             if (request.operation == constraint_icp_operation || request.operation == optimize_graph_operation)
             {
                 if (auto error = RunStep2Graph(*state.session, request, state.parameters, state.tracks, context))
@@ -334,6 +337,7 @@ namespace HDMapping::Processing
                 return *error;
             state.parameters.erase("registration");
             state.parameters.erase("constraints_result");
+            state.parameters.erase("segment_result");
             state.parameters["georeference_result"] = { { "operation", request.operation } };
             if (request.operation == "gnss.project")
                 state.parameters["georeference_result"]["projection"] = request.parameters;
@@ -341,6 +345,35 @@ namespace HDMapping::Processing
         } catch (const std::exception& error)
         {
             return failure("georeference_failed", error.what());
+        }
+    }
+
+    RunResult ExecuteStep2Segments(const OperationRequest& request, const SnapshotRef& snapshot, RunContext& context)
+    {
+        if (request.target != snapshot.target)
+            return failure("revision_conflict", "Pose edit request and snapshot must name the same opening and revision");
+        if (context.stop.stop_requested())
+            return failure("cancelled", "Step 2 pose edit cancelled");
+        try
+        {
+            report(context, "read_session");
+            auto loaded = LoadSessionSnapshot(snapshot, context.stop);
+            if (const auto* error = std::get_if<OperationError>(&loaded))
+                return *error;
+            auto& state = std::get<SessionSnapshot>(loaded);
+            auto edited = EditStep2Poses(state.session->point_clouds_container, request);
+            if (const auto* error = std::get_if<OperationError>(&edited))
+                return *error;
+            if (context.stop.stop_requested())
+                return failure("cancelled", "Step 2 pose edit cancelled");
+            state.parameters.erase("registration");
+            state.parameters.erase("constraints_result");
+            state.parameters.erase("georeference_result");
+            state.parameters["segment_result"] = { { "operation", request.operation }, { "scope", request.scope } };
+            return PublishStep2Result(*state.session, request.target, std::move(state.parameters), state.tracks, context);
+        } catch (const std::exception& error)
+        {
+            return failure("segment_operation_failed", error.what());
         }
     }
 } // namespace HDMapping::Processing

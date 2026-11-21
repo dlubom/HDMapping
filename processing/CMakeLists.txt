@@ -74,6 +74,7 @@ target_link_libraries(processing_georeference PUBLIC processing_session_snapshot
 hdmapping_processing_target(processing_georeference)
 list(APPEND _runtime_sources "${_step2_dir}/step2_georeference_operations.cpp")
 set(_step2_sources "${_step2_dir}/step2_operations.cpp" "${_step2_dir}/step2_result.cpp" "${_step2_dir}/step2_state_parameters.cpp"
+    "${_step2_dir}/step2_segment_operations.cpp"
     "${_step2_dir}/step2_loop_candidate_operations.cpp" "${_step2_dir}/bow_loop_closure_detector.cpp")
 add_library(processing_step2 STATIC ${_step2_sources})
 target_include_directories(processing_step2 PUBLIC "${_step2_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -222,6 +223,17 @@ if(BUILD_TESTING)
             "TSAN_OPTIONS=string_append: suppressions=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/loop_candidates_tsan.supp\"")
     endif()
     list(APPEND _runtime_sources tests/loop_candidates_test.cpp)
+
+    add_executable(processing_segments_test tests/segment_operations_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_segments_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_link_libraries(processing_segments_test PRIVATE processing_step1 processing_gui_state)
+    if(MSVC)
+        target_compile_options(processing_segments_test PRIVATE /bigobj)
+    endif()
+    hdmapping_processing_target(processing_segments_test)
+    add_test(NAME processing-segments COMMAND processing_segments_test)
+    set_tests_properties(processing-segments PROPERTIES LABELS processing-segments TIMEOUT 90)
+    list(APPEND _runtime_sources tests/segment_operations_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

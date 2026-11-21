@@ -104,7 +104,7 @@ func TestStdioProduct(t *testing.T) {
 		step2IDs = append(step2IDs, operation.ID)
 	}
 	slices.Sort(step2IDs)
-	if !slices.Equal(step2IDs, []string{"step2.align_reference", "step2.optimize_graph", "step2.register_scans"}) {
+	if !slices.Equal(step2IDs, []string{"step2.align_reference", "step2.edit_segment", "step2.optimize_graph", "step2.register_scans", "step2.restore_poses", "step2.transform_scope"}) {
 		t.Fatalf("unexpected Step 2 operations: %v", step2IDs)
 	}
 
@@ -112,7 +112,7 @@ func TestStdioProduct(t *testing.T) {
 	if err != nil || constraintCatalog.IsError {
 		t.Fatalf("call constraints catalog: %v (%v)", err, constraintCatalog)
 	}
-	for _, name := range []string{"constraints.list", "constraints.add", "constraints.update", "constraints.remove", "constraints.replace", "constraints.run_icp", "step2.optimize_graph"} {
+	for _, name := range []string{"step2.edit_segment", "step2.restore_poses", "step2.transform_scope", "constraints.list", "constraints.add", "constraints.update", "constraints.remove", "constraints.replace", "constraints.run_icp", "step2.optimize_graph"} {
 		invalid, err := client.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: map[string]any{}})
 		if err != nil || !invalid.IsError {
 			t.Fatalf("%s must reject a missing target: %v (%v)", name, err, invalid)

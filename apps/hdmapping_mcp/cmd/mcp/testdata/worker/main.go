@@ -54,6 +54,7 @@ func main() {
 			"cp.import", "cp.remove", "cp.update", "gcp.import", "gcp.remove", "gcp.update", "gnss.import", "gnss.project", "tum.import",
 			"step1.consistency", "step1.export", "step1.load", "step1.odometry", "step1.prepare", "step1.reference", "step1.save",
 			"step2.register_scans", "step2.optimize_graph", "step2.align_reference",
+			"step2.edit_segment", "step2.restore_poses", "step2.transform_scope",
 		} {
 			operations = append(operations, map[string]string{"id": id})
 		}

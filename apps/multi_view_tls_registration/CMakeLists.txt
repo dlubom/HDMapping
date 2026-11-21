@@ -25,6 +25,7 @@ set(SOURCES
     multi_view_tls_registration_gui.cpp multi_view_tls_registration.h
     ../lidar_odometry_step_1/lidar_odometry_utils.cpp
     bow_loop_closure_detector.h bow_loop_closure_detector.cpp
+    step2_segment_operations.h step2_segment_operations.cpp
 )
 
 # Windows: add resource file
@@ -42,6 +43,7 @@ add_dependencies(multi_view_tls_registration_step_2 hdmapping_bow_vocabulary)
 target_include_directories(
           multi_view_tls_registration_step_2
           PRIVATE include
+          ${REPOSITORY_DIRECTORY}/processing/include
           ${REPOSITORY_DIRECTORY}/core/include
           ${EIGEN3_INCLUDE_DIR}
           ${THIRDPARTY_DIRECTORY}

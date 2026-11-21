@@ -107,6 +107,7 @@
 #include "../lidar_odometry_step_1/lidar_odometry_utils.h"
 #include "bow_loop_closure_detector.h"
 #include "multi_view_tls_registration.h"
+#include "step2_segment_operations.h"
 #include "step2_solver_selection.h"
 #include <Core/reference_tracks.h>
 
@@ -1024,6 +1025,8 @@ bool is_lio_segments_gui = false;
 bool is_settings_gui = true;
 bool is_translate_gui = false;
 
+namespace proc = HDMapping::Processing;
+
 struct TranslateTool
 {
     enum class Step
@@ -1035,6 +1038,7 @@ struct TranslateTool
         Ready
     };
     Step step = Step::Idle;
+    proc::TargetRef target;
     Eigen::Vector3d origin = Eigen::Vector3d::Zero();
     Eigen::Vector3d x_point = Eigen::Vector3d::Zero();
     Eigen::Vector3d y_hint = Eigen::Vector3d::Zero();
@@ -1133,6 +1137,7 @@ bool manipulate_only_marked_gizmo = false;
 // in-progress poses live here and are drawn from the cached GPU buffers; they
 // are committed to m_pose once, when the drag ends.
 // gizmo_drag_preview_poses[k] is the preview pose of scan gizmo_drag_first_index + k.
+static proc::TargetRef gizmo_drag_target;
 int gizmo_drag_first_index = -1;
 std::vector<Eigen::Affine3d> gizmo_drag_preview_poses;
 
@@ -1149,7 +1154,6 @@ Session session;
 #endif
 PointClouds::PointCloudDimensions session_dims;
 #ifdef HDMAPPING_GUI_STATE
-namespace proc = HDMapping::Processing;
 static proc::GuiStateBridge* state_bridge = nullptr;
 static std::string state_path;
 static std::string registration_result_path;
@@ -1328,8 +1332,21 @@ static void markBulkEdit()
 #endif
 }
 
+static void clearTranslatePreview()
+{
+    if (translate_tool.step == TranslateTool::Step::Idle)
+        return;
+    translate_tool.step = TranslateTool::Step::Idle;
+    translate_tool.has_transform = false;
+    translate_tool.transform = Eigen::Affine3d::Identity();
+    SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+}
+
 static void openedStep2Session([[maybe_unused]] const std::string& path)
 {
+    gizmo_drag_first_index = -1;
+    gizmo_drag_preview_poses.clear();
+    clearTranslatePreview();
 #ifdef HDMAPPING_GUI_STATE
     state_path = path;
     registration_result_path.clear();
@@ -1340,6 +1357,71 @@ static void openedStep2Session([[maybe_unused]] const std::string& path)
 #endif
 }
 
+static nlohmann::json step2ScanScope(std::size_t first, std::size_t count)
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < count; ++i)
+        indices.push_back(first + i);
+    return { { "scan_indices", std::move(indices) } };
+}
+
+static nlohmann::json step2MatrixParameter(const char* field, const Eigen::Affine3d& pose)
+{
+    auto matrix = nlohmann::json::array();
+    for (int row = 0; row < 4; ++row)
+        matrix.push_back({ pose(row, 0), pose(row, 1), pose(row, 2), pose(row, 3) });
+    return { { field, std::move(matrix) } };
+}
+
+static proc::TargetRef currentStep2Target()
+{
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge)
+        return state_bridge->Target();
+#endif
+    return {};
+}
+
+static bool commitStep2PoseEdit(std::string_view operation, nlohmann::json scope, nlohmann::json parameters, const proc::TargetRef& target)
+{
+    auto report_error = [](const proc::OperationError& error)
+    {
+        spdlog::warn("Step 2 pose edit: {}: {}", error.code, error.message);
+#ifdef HDMAPPING_GUI_STATE
+        registration_error = error.message;
+#endif
+    };
+#ifdef HDMAPPING_GUI_STATE
+    // Plain cloud loads can precede an open MCP state.
+    if (state_bridge && !target.state_id.empty())
+    {
+        bool committed = false;
+        state_bridge->Dispatch(
+            "states.execute",
+            { { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+              { "operation", operation },
+              { "scope", scope },
+              { "parameters", parameters } },
+            [&](const proc::GuiResponse& response)
+            {
+                if (const auto* error = std::get_if<proc::OperationError>(&response))
+                    report_error(*error);
+                else
+                    committed = true;
+            });
+        return committed;
+    }
+#endif
+    auto result =
+        proc::EditStep2Poses(session.point_clouds_container, { std::string(operation), target, std::move(scope), std::move(parameters) });
+    if (const auto* error = std::get_if<proc::OperationError>(&result))
+    {
+        report_error(*error);
+        return false;
+    }
+    return true;
+}
+
 // Writes the in-progress drag poses into the scans and ends the drag.
 void commitGizmoDrag()
 {
@@ -1348,26 +1430,20 @@ void commitGizmoDrag()
         return;
     }
     auto& pcs = session.point_clouds_container.point_clouds;
-    for (size_t k = 0; k < gizmo_drag_preview_poses.size(); k++)
+    if (!gizmo_drag_preview_poses.empty())
     {
-        const size_t j = static_cast<size_t>(gizmo_drag_first_index) + k;
-        if (j >= pcs.size())
+        const auto first = static_cast<std::size_t>(gizmo_drag_first_index);
+        const auto count = gizmo_drag_preview_poses.size();
+        if (commitStep2PoseEdit(
+                proc::edit_segment_operation,
+                step2ScanScope(first, count),
+                step2MatrixParameter("anchor_pose", gizmo_drag_preview_poses.front()),
+                gizmo_drag_target))
         {
-            break;
+            // syncPoses() ran before the drag commit in this frame.
+            for (std::size_t i = first; i < first + count; ++i)
+                scan_renderer.rebuild(i, pcs[i]);
         }
-        PointCloud& pc = pcs[j];
-        pc.m_pose = gizmo_drag_preview_poses[k];
-        pc.pose = pose_tait_bryan_from_affine_matrix(pc.m_pose);
-        pc.gui_translation[0] = static_cast<float>(pc.pose.px);
-        pc.gui_translation[1] = static_cast<float>(pc.pose.py);
-        pc.gui_translation[2] = static_cast<float>(pc.pose.pz);
-        pc.gui_rotation[0] = static_cast<float>(pc.pose.om * RAD_TO_DEG);
-        pc.gui_rotation[1] = static_cast<float>(pc.pose.fi * RAD_TO_DEG);
-        pc.gui_rotation[2] = static_cast<float>(pc.pose.ka * RAD_TO_DEG);
-        // Rebuild right away: this frame's syncPoses() already ran (top of
-        // display()) and the preview is off from now on, so without this the
-        // scan is drawn once more at its pre-drag pose -- a visible jump back.
-        scan_renderer.rebuild(j, pc);
     }
     gizmo_drag_first_index = -1;
     gizmo_drag_preview_poses.clear();
@@ -1426,7 +1502,6 @@ void perform_experiment_on_linux(
     RegistrationPlaneFeature& registration_plane_feature,
     PoseGraphSLAM& pose_graph_slam);
 double compute_rms(bool initial, Session& session, ObservationPicking& observation_picking);
-void reset_poses(Session& session);
 void translate_gui();
 void draw_translate_preview();
 void measure_gui();
@@ -3021,7 +3096,11 @@ void lio_segments_gui()
             session.point_clouds_container.hide_all();
         ImGui::SameLine();
         if (ImGui::Button("Reset poses"))
-            reset_poses(session);
+            commitStep2PoseEdit(
+                proc::restore_poses_operation,
+                step2ScanScope(0, session.point_clouds_container.point_clouds.size()),
+                nlohmann::json::object(),
+                currentStep2Target());
 
         ImGui::Checkbox("Show with initial pose", &session.point_clouds_container.show_with_initial_pose);
         ImGui::SameLine();
@@ -5724,17 +5803,16 @@ void lioSegmentsGizmo()
 
             if (ImGuizmo::IsUsing())
             {
-                // Mid-drag: only update the preview chain (CPU-only); m_pose is
-                // left untouched so syncPoses() doesn't re-upload the moved scans.
-                // Each following scan keeps its offset to the previous one,
-                // taken from the still-unmodified m_pose values.
-                const size_t last = manipulate_only_marked_gizmo ? i + 1 : pcs.size();
-                gizmo_drag_first_index = static_cast<int>(i);
-                gizmo_drag_preview_poses.resize(last - i);
-                gizmo_drag_preview_poses[0] = Eigen::Affine3d(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
-                for (size_t j = i + 1; j < last; j++)
+                if (!isGizmoDragging())
                 {
-                    gizmo_drag_preview_poses[j - i] = gizmo_drag_preview_poses[j - i - 1] * (pcs[j - 1].m_pose.inverse() * pcs[j].m_pose);
+                    gizmo_drag_first_index = static_cast<int>(i);
+                    gizmo_drag_target = currentStep2Target();
+                }
+                if (gizmo_drag_target == currentStep2Target())
+                {
+                    const auto count = manipulate_only_marked_gizmo ? 1 : pcs.size() - i;
+                    const Eigen::Affine3d anchor(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
+                    gizmo_drag_preview_poses = proc::PreviewStep2Segment(session.point_clouds_container, i, count, anchor);
                 }
             }
             else
@@ -6051,7 +6129,8 @@ void display()
             // from the cached GPU buffers, so hide them from the regular draw.
             // (With "show with initial pose" the drag isn't visible anyway.)
             auto& pcs = session.point_clouds_container.point_clouds;
-            const bool drawDragPreview = isGizmoDragging() && !session.point_clouds_container.show_with_initial_pose;
+            const bool drawDragPreview =
+                isGizmoDragging() && gizmo_drag_target == currentStep2Target() && !session.point_clouds_container.show_with_initial_pose;
             std::vector<char> previewWasVisible;
             if (drawDragPreview)
             {
@@ -7584,12 +7663,9 @@ void display()
     {
         translate_gui();
     }
-    else if (translate_tool.step != TranslateTool::Step::Idle)
+    else
     {
-        translate_tool.step = TranslateTool::Step::Idle;
-        translate_tool.has_transform = false;
-        translate_tool.transform = Eigen::Affine3d::Identity();
-        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+        clearTranslatePreview();
     }
 
     if (is_section_gui)
@@ -7731,6 +7807,7 @@ void translate_gui()
 
     if (ImGui::Button("Start picking"))
     {
+        translate_tool.target = currentStep2Target();
         translate_tool.step = TranslateTool::Step::PickOrigin;
         translate_tool.has_transform = false;
         translate_tool.transform = Eigen::Affine3d::Identity();
@@ -7742,12 +7819,7 @@ void translate_gui()
     }
     ImGui::SameLine();
     if (ImGui::Button("Reset"))
-    {
-        translate_tool.step = TranslateTool::Step::Idle;
-        translate_tool.has_transform = false;
-        translate_tool.transform = Eigen::Affine3d::Identity();
-        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
-    }
+        clearTranslatePreview();
 
     const char* step_text = "Idle";
     switch (translate_tool.step)
@@ -7785,11 +7857,13 @@ void translate_gui()
     ImGui::Separator();
     ImGui::BeginDisabled(!translate_tool.has_transform);
     {
-        if (ImGui::Button("Translate"))
+        if (ImGui::Button("Translate") &&
+            commitStep2PoseEdit(
+                proc::transform_scope_operation,
+                step2ScanScope(0, session.point_clouds_container.point_clouds.size()),
+                step2MatrixParameter("transform", translate_tool.transform),
+                translate_tool.target))
         {
-            for (auto& pc : session.point_clouds_container.point_clouds)
-                pc.m_pose = translate_tool.transform * pc.m_pose;
-
             for (auto& cp : session.control_points.cps)
             {
                 Eigen::Vector3d g(cp.x_target_global, cp.y_target_global, cp.z_target_global);
@@ -7799,10 +7873,7 @@ void translate_gui()
                 cp.z_target_global = g.z();
             }
 
-            translate_tool.step = TranslateTool::Step::Idle;
-            translate_tool.has_transform = false;
-            translate_tool.transform = Eigen::Affine3d::Identity();
-            SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+            clearTranslatePreview();
         }
     }
     ImGui::EndDisabled();
@@ -8226,7 +8297,7 @@ static nlohmann::json step2EditorInputs()
     const auto& gnss = tls_registration.gnss;
     const auto& bow = bow_state.params;
     json inputs = describeStep2Parameters(tls_registration);
-    inputs["range"] = { index_begin, index_end, manipulate_only_marked_gizmo, angle_diff };
+    inputs["range"] = { index_begin, index_end, angle_diff };
     inputs["endpoints"] = { index_loop_closure_source, index_loop_closure_target, num_edge_extended_before, num_edge_extended_after };
     inputs["import"] = { tls_registration.calculate_offset, tls_registration.is_decimate, fillInSession, session.load_cache_mode };
     inputs["decimation"] = { tls_registration.bucket_x, tls_registration.bucket_y, tls_registration.bucket_z };
@@ -8286,7 +8357,6 @@ static nlohmann::json step2EditorInputs()
               scan.normal_vectors_local.size(),
               scan.local_trajectory.size(),
               scan.visible,
-              scan.gizmo,
               scan.fuse_inclination_from_IMU,
               scan.fixed_x,
               scan.fixed_y,
@@ -8392,6 +8462,8 @@ static proc::StateSummary describeStep2()
           proc::optimize_graph_operation });
     for (const auto& operation : proc::DescribeStep2Georeference())
         operations.push_back(operation.id);
+    for (const auto& operation : proc::DescribeStep2Segments())
+        operations.push_back(operation.id);
     return { {},
              step2CaptureParameters(),
              { { "kind", "session" },
@@ -8418,6 +8490,13 @@ static proc::StateSummary describeStep2()
 
 static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
 {
+    if (proc::IsStep2SegmentOperation(request.operation))
+    {
+        auto result = proc::EditStep2Poses(session.point_clouds_container, request);
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        return describeStep2();
+    }
     if (proc::IsStep2GeoreferenceOperation(request.operation))
     {
         if (auto error = proc::EditStep2Georeference(session, request))
@@ -8445,6 +8524,18 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
+    if (source.kind == "native_session" && source.parameters.contains("segment_result"))
+    {
+        const auto& edit = source.parameters.at("segment_result");
+        Session poses{};
+        if (!proc::IsStep2SegmentOperation(edit.at("operation").get_ref<const std::string&>()) ||
+            !poses.load_snapshot_metadata(source.entry))
+            return proc::OperationError{ "invalid_result", "Could not read the published Step 2 pose edit", {} };
+        auto result = proc::ApplyStep2PoseResult(session.point_clouds_container, poses.point_clouds_container, edit.at("scope"));
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        return {};
+    }
     const auto constraintResult = source.parameters.find("constraints_result");
     const bool graph_job = constraintResult != source.parameters.end();
     const auto referenceResult = source.parameters.find("georeference_result");
@@ -8569,6 +8660,7 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     index_loop_closure_source = index_loop_closure_target = 0;
     gizmo_drag_first_index = -1;
     gizmo_drag_preview_poses.clear();
+    clearTranslatePreview();
     auto unavailable = [](const auto& point)
     {
         const int scan_index = point.first;
@@ -8728,6 +8820,8 @@ int main(int argc, char* argv[])
                 inputs = step2EditorInputs();
             last_inputs = std::move(inputs);
             last_target = bridge.Target();
+            if (translate_tool.target != last_target)
+                clearTranslatePreview();
 #endif
 #ifdef HDMAPPING_SNAPSHOT_PROBE
             if (session_loaded && IsKeyPressed(KEY_F9))

@@ -48,7 +48,16 @@ func addStep2Tools(server *sdk.Server, call func(context.Context, string, any, a
 			err = call(ctx, "jobs.submit", request, &record)
 			return nil, summarizeJob(record), err
 		})
-	addOperationCatalog(server, call, "step2", "List Step 2 registration, graph optimization and reference alignment settings and units.")
+	addOperationCatalog(server, call, "step2", "List Step 2 registration, pose editing, graph optimization and reference alignment settings and units.")
 	capabilities := append([]string{"register_scans", "describe_step2_operations"}, addConstraintTools(server, call)...)
-	return append(capabilities, addGeoreferenceTools(server, call)...)
+	capabilities = append(capabilities, addGeoreferenceTools(server, call)...)
+	for _, op := range []struct{ id, description string }{
+		{"step2.edit_segment", "Set the first pose of an explicit contiguous scan segment and preserve the relative poses that follow."},
+		{"step2.transform_scope", "Left-multiply the poses of explicitly named scans by a rigid world transform."},
+		{"step2.restore_poses", "Restore the initial poses of explicitly named scans."},
+	} {
+		addStep2MutationTool(server, call, op.id, op.description, liveOrDurable)
+		capabilities = append(capabilities, op.id)
+	}
+	return capabilities
 }

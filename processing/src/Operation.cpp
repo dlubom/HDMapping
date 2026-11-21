@@ -5,6 +5,7 @@
 #include "step2_georeference_operations.h"
 #include "step2_loop_candidate_operations.h"
 #include "step2_operations.h"
+#include "step2_segment_operations.h"
 
 namespace HDMapping::Processing
 {
@@ -17,6 +18,8 @@ namespace HDMapping::Processing
         auto georeference = DescribeStep2Georeference();
         operations.insert(operations.end(), std::make_move_iterator(georeference.begin()), std::make_move_iterator(georeference.end()));
         operations.push_back(DescribeLoopCandidateDetection());
+        auto segments = DescribeStep2Segments();
+        operations.insert(operations.end(), std::make_move_iterator(segments.begin()), std::make_move_iterator(segments.end()));
         return operations;
     }
 
@@ -30,6 +33,8 @@ namespace HDMapping::Processing
             return ExecuteStep2Constraints(request, snapshot, context);
         if (IsStep2GeoreferenceOperation(request.operation))
             return ExecuteStep2Georeference(request, snapshot, context);
+        if (IsStep2SegmentOperation(request.operation))
+            return ExecuteStep2Segments(request, snapshot, context);
         return ExecuteStep1Operation(request, snapshot, context);
     }
 } // namespace HDMapping::Processing

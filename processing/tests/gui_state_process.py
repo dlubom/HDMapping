@@ -114,6 +114,40 @@ def check(binaries, directory):
         assert len(json.loads(published.read_text())["control_points"]) == 3
         assert not json.loads(session.read_text()).get("control_points")
         print("Step 2 CP captured from the live GUI and auto-applied", submitted["job_id"], flush=True)
+
+        scope = {"scan_indices": [0]}
+        anchor = [[0, -1, 0, 4], [1, 0, 0, 12], [0, 0, 1, -8], [0, 0, 0, 1]]
+        edited = call("step2.edit_segment", {"target": current, "scope": scope,
+                                           "parameters": {"anchor_pose": anchor}})["structuredContent"]["state"]["target"]
+        assert edited["revision"] == current["revision"] + 1
+        assert call("step2.restore_poses", {"target": current, "scope": scope})["isError"]
+        assert call("step2.restore_poses", {"target": edited, "scope": {"scan_indices": []}})["isError"]
+        assert call("describe_state", {"target": edited})["structuredContent"]["target"] == edited
+        translate = [[1, 0, 0, 2], [0, 1, 0, -3], [0, 0, 1, 1], [0, 0, 0, 1]]
+        transform = {"target": edited, "scope": scope, "parameters": {"transform": translate},
+                     "request_key": "gui-transform-scope"}
+        job = call("step2.transform_scope", transform)["structuredContent"]["job"]
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            result = call("get_job", {"job_id": job["job_id"]})["structuredContent"]
+            assert result["status"] not in {"failed", "cancelled", "interrupted"}, result
+            if result["status"] == "completed" and result["gui_apply_status"] != "pending":
+                assert result["gui_apply_status"] == "applied", result
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("auto-apply Step 2 segment result")
+        assert call("step2.transform_scope", transform)["structuredContent"]["job"]["job_id"] == job["job_id"]
+        manifest = Path(result["result"]["snapshot"]["manifest_path"])
+        published = manifest.parent / json.loads(manifest.read_text())["entry"]
+        poses = json.loads(published.read_text())["Session Settings"]["poses_file_name"]
+        first_pose = (published.parent / poses).read_text().splitlines()[2:5]
+        assert [list(map(float, row.split())) for row in first_pose] == [
+            [0, -1, 0, 6], [1, 0, 0, 9], [0, 0, 1, -7],
+        ], first_pose
+        applied = dict(edited, revision=edited["revision"] + 1)
+        assert call("describe_state", {"target": applied})["structuredContent"]["target"] == applied
+        print("Step 2 committed pose edit captured and auto-applied", job["job_id"], flush=True)
         assert len(ids) == 4
     finally:
         adapter.stdin.close()
