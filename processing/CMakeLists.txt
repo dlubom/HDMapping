@@ -10,6 +10,7 @@ target_link_libraries(processing_ops PRIVATE Threads::Threads)
 hdmapping_processing_target(processing_ops)
 
 add_library(processing_session_snapshot STATIC src/SessionSnapshot.cpp)
+target_include_directories(processing_session_snapshot SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/shared/include")
 target_include_directories(processing_session_snapshot SYSTEM PUBLIC "${PROJECT_SOURCE_DIR}/core/include" "${EIGEN3_INCLUDE_DIR}")
 target_compile_definitions(processing_session_snapshot PRIVATE WITH_GUI=0)
 target_link_libraries(processing_session_snapshot PUBLIC processing_ops)
@@ -74,7 +75,7 @@ target_link_libraries(processing_georeference PUBLIC processing_session_snapshot
 hdmapping_processing_target(processing_georeference)
 list(APPEND _runtime_sources "${_step2_dir}/step2_georeference_operations.cpp")
 set(_step2_sources "${_step2_dir}/step2_operations.cpp" "${_step2_dir}/step2_result.cpp" "${_step2_dir}/step2_state_parameters.cpp"
-    "${_step2_dir}/step2_segment_operations.cpp"
+    "${_step2_dir}/step2_segment_operations.cpp" "${_step2_dir}/step2_io_operations.cpp" "${_step2_dir}/step2_session_exports.cpp"
     "${_step2_dir}/step2_loop_candidate_operations.cpp" "${_step2_dir}/bow_loop_closure_detector.cpp")
 add_library(processing_step2 STATIC ${_step2_sources})
 target_include_directories(processing_step2 PUBLIC "${_step2_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -82,7 +83,7 @@ target_include_directories(processing_step2 SYSTEM PRIVATE
     "${PROJECT_SOURCE_DIR}/shared/include" "${THIRDPARTY_DIRECTORY}" "${THIRDPARTY_DIRECTORY}/observation_equations/codes"
     "${LASZIP_INCLUDE_DIR}/LASzip/include" "${FBOW_INCLUDE_DIR}" ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(processing_step2 PRIVATE WITH_GUI=0)
-target_link_libraries(processing_step2 PUBLIC processing_constraints processing_result PRIVATE processing_georeference core_no_gui unordered_dense::unordered_dense fbow ${OpenCV_LIBS} spdlog::spdlog)
+target_link_libraries(processing_step2 PUBLIC processing_constraints processing_result PRIVATE processing_georeference core_no_gui unordered_dense::unordered_dense wgs84_do_puwg92 fbow ${OpenCV_LIBS} spdlog::spdlog)
 hdmapping_processing_target(processing_step2)
 if(MSVC)
     target_compile_definitions(processing_step2 PRIVATE _USE_MATH_DEFINES)
@@ -234,6 +235,17 @@ if(BUILD_TESTING)
     add_test(NAME processing-segments COMMAND processing_segments_test)
     set_tests_properties(processing-segments PROPERTIES LABELS processing-segments TIMEOUT 90)
     list(APPEND _runtime_sources tests/segment_operations_test.cpp)
+    add_executable(processing_session_io_test tests/session_io_operations_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_session_io_test SYSTEM PRIVATE
+        "${THIRDPARTY_DIRECTORY}/doctest" "${PROJECT_SOURCE_DIR}/shared/include" "${LASZIP_INCLUDE_DIR}/LASzip/include")
+    target_link_libraries(processing_session_io_test PRIVATE processing_step1 core_no_gui)
+    if(MSVC)
+        target_compile_options(processing_session_io_test PRIVATE /bigobj)
+    endif()
+    hdmapping_processing_target(processing_session_io_test)
+    add_test(NAME processing-session-io COMMAND processing_session_io_test)
+    set_tests_properties(processing-session-io PROPERTIES LABELS processing-session-io TIMEOUT 90)
+    list(APPEND _runtime_sources tests/session_io_operations_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

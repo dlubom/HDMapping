@@ -100,6 +100,8 @@ public:
     std::vector<PointBucketIndexPair> index_pairs;
     std::vector<Bucket> buckets;
     std::string file_name;
+    //! Original name used by Step 2 exchange formats after switching to a published cache path.
+    std::string source_scan_name;
     //! Source of points skipped by the native loader, until it reads the geometry.
     std::optional<DeferredPoints> deferred_points;
     // True when file_name does not exist on disk yet (e.g. scan imported from E57);

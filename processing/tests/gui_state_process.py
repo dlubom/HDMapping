@@ -148,6 +148,36 @@ def check(binaries, directory):
         applied = dict(edited, revision=edited["revision"] + 1)
         assert call("describe_state", {"target": applied})["structuredContent"]["target"] == applied
         print("Step 2 committed pose edit captured and auto-applied", job["job_id"], flush=True)
+        def io_job(tool, key, apply="not_requested", **arguments):
+            request = {"request_key": key, **arguments}
+            reply = call(tool, request)
+            assert not reply.get("isError"), reply
+            job = reply["structuredContent"]["job_id"]
+            assert call(tool, request)["structuredContent"]["job_id"] == job
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                record = call("get_job", {"job_id": job})["structuredContent"]
+                assert record["status"] not in {"failed", "cancelled", "interrupted"}, record
+                if record["status"] == "completed" and record["gui_apply_status"] != "pending":
+                    assert record["gui_apply_status"] == apply, record
+                    document = Path(record["result"]["snapshot"]["manifest_path"])
+                    return record, document
+                time.sleep(0.1)
+            raise TimeoutError(tool)
+
+        params = {"format": "mjs", "paths": [str(session)]}
+        restore, _ = io_job("session.open", "headless-session-open", parameters=params)
+        io_job("session.open", "live-session-open", "applied", target=applied, parameters=params)
+        after_open = dict(applied, revision=applied["revision"] + 1)
+        assert call("describe_state", {"target": after_open})["structuredContent"]["target"] == after_open
+        _, saved = io_job("session.save", "live-session-save", target=after_open)
+        subprocess.run([binaries / "processing_publication_test", "--read", saved.parent.parent], check=True)
+        _, exported = io_job("export_result", "headless-session-export", snapshot=restore["result"]["snapshot"],
+                             scope={"scan_indices": [0]}, parameters={"format": "laz", "skip_zero_timestamps": False})
+        manifest = json.loads(exported.read_text())
+        assert manifest["parameters"]["scan_indices"] == [0]
+        assert (exported.parent / manifest["entry"]).read_bytes()[:4] == b"LASF"
+        print("Step 2 MCP session open, auto-apply, native save and scoped export", flush=True)
         assert len(ids) == 4
     finally:
         adapter.stdin.close()

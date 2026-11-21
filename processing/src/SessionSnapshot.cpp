@@ -1,4 +1,5 @@
 #include <HDMapping/Processing/SessionSnapshot.h>
+#include <HDMapping/SessionPaths.h>
 
 #include <Core/session.h>
 
@@ -233,6 +234,9 @@ namespace HDMapping::Processing
         output.out_folder_name = ".";
         output.out_poses_file_name = SessionSnapshotPaths::poses;
         output.point_clouds.reserve(input.point_clouds.size());
+        auto scan_names = json::array();
+        auto e57_origins = json::array();
+        bool has_e57_origin = false;
         for (const auto& scan : input.point_clouds)
         {
             const auto path = directory / SessionSnapshotPaths::cloud(output.point_clouds.size());
@@ -261,6 +265,15 @@ namespace HDMapping::Processing
             {
                 write_cloud(path, scan, scan, context.stop);
             }
+            scan_names.push_back(
+                scan.source_scan_name.empty() ? sessionPathText(sessionPathFromText(scan.file_name).filename()) : scan.source_scan_name);
+            if (!scan.e57_source_path.empty() && scan.e57_scan_index >= 0)
+            {
+                e57_origins.push_back({ { "path", scan.e57_source_path }, { "index", scan.e57_scan_index } });
+                has_e57_origin = true;
+            }
+            else
+                e57_origins.push_back(nullptr);
             auto& record = output.point_clouds.emplace_back();
             record.file_name = path.filename().string();
             record.m_pose = scan.m_pose;
@@ -285,6 +298,9 @@ namespace HDMapping::Processing
             return OperationError{ "snapshot_capture_failed", "Could not write native session metadata", json::object() };
         }
         WriteNativeSessionTracks(directory / SessionSnapshotPaths::entry, tracks_);
+        parameters_["scan_names"] = std::move(scan_names);
+        if (has_e57_origin)
+            parameters_["e57_origins"] = std::move(e57_origins);
         return SnapshotContents{ std::string(SessionSnapshotPaths::kind), SessionSnapshotPaths::entry, parameters_, {} };
     }
 

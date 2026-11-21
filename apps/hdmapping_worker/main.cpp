@@ -1,3 +1,4 @@
+#include "step2_io_operations.h"
 #include "step2_loop_candidate_operations.h"
 
 #include <HDMapping/Processing/RuntimeProtocol.h>
@@ -136,7 +137,8 @@ int main(int argc, char** argv)
                 RecordingCapture source(target, recording, toml);
                 return CaptureSnapshot(source, target.revision, context.output_directory, context);
             },
-            CaptureStep1References);
+            CaptureStep1References,
+            CaptureStep2Open);
         return 0;
     } catch (const std::exception& error)
     {

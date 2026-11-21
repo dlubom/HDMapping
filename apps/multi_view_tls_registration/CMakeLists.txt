@@ -21,7 +21,7 @@ project(multi_view_tls_registration_step_2)
 # symbols referenced in its body) -- those are dead includes left as-is, kept
 # resolvable via the include dirs below rather than editing that file.
 set(SOURCES
-    multi_view_tls_registration.cpp perform_experiment.cpp
+    multi_view_tls_registration.cpp step2_session_exports.cpp perform_experiment.cpp
     multi_view_tls_registration_gui.cpp multi_view_tls_registration.h
     ../lidar_odometry_step_1/lidar_odometry_utils.cpp
     bow_loop_closure_detector.h bow_loop_closure_detector.cpp

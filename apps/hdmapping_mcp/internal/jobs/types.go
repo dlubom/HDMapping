@@ -79,9 +79,13 @@ type Step1Recording struct {
 // DetectLoopCandidates publishes a report that can be presented in a live Step 2 editor.
 const DetectLoopCandidates = "constraints.detect_candidates"
 
+// OpenSession admits external Step 2 input before a worker publishes the session.
+const OpenSession = "session.open"
+
 // SubmitRequest describes one heavy job. Access controls exclusive reservation,
 // independently of its source. Exactly one input is specified: a durable Snapshot,
-// a live CaptureSource reserved until Prepare returns, or a raw Step 1 Recording.
+// a live CaptureSource reserved until Prepare returns, a raw Step 1 Recording,
+// or external files named by a session.open operation.
 type SubmitRequest struct {
 	RequestKey    string           `json:"request_key"`
 	Operation     OperationRequest `json:"operation"`

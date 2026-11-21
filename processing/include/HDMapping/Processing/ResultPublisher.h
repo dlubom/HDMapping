@@ -2,8 +2,12 @@
 
 #include <HDMapping/Processing/Operation.h>
 
+#include <string_view>
+
 namespace HDMapping::Processing
 {
+    inline constexpr std::string_view session_export_kind = "session_export";
+
     struct PublishOptions
     {
         bool replace = false;
@@ -11,7 +15,7 @@ namespace HDMapping::Processing
     };
 
     //! Consume a private sibling .hdmapping-result-stage-<id> built with CaptureSnapshot
-    //! (kind native_session). The id is unique for each attempt. Shared inputs must be pinned
+    //! (kind native_session or session_export). The id is unique for each attempt. Shared inputs must be pinned
     //! independently of job cleanup. Replacement compares the current artifact id.
     RunResult PublishResult(
         const std::filesystem::path& staging_directory, const std::filesystem::path& destination, const PublishOptions& options = {});

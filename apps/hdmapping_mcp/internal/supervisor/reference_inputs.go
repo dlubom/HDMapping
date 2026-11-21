@@ -22,8 +22,18 @@ type referenceFile struct {
 
 const referenceInventory = "inventory.json"
 
-func isReferenceImport(operation string) bool {
-	return operation == "gnss.import" || operation == "tum.import"
+func hasReferenceFiles(operation jobs.OperationRequest) bool {
+	switch operation.Operation {
+	case "gnss.import", "tum.import", "session.import_poses", "session.import_observations":
+		return true
+	case "export_result":
+		var options struct {
+			Format string `json:"format"`
+		}
+		return json.Unmarshal(operation.Parameters, &options) == nil && options.Format == "e57_poses"
+	default:
+		return false
+	}
 }
 
 func referencePaths(operation jobs.OperationRequest) (map[string]json.RawMessage, []string, error) {
@@ -31,11 +41,11 @@ func referencePaths(operation jobs.OperationRequest) (map[string]json.RawMessage
 	var paths []string
 	if err := json.Unmarshal(operation.Parameters, &parameters); err != nil ||
 		json.Unmarshal(parameters["paths"], &paths) != nil || len(paths) == 0 {
-		return nil, nil, &jobs.JobError{Code: "invalid_parameters", Message: "Trajectory import requires a nonempty paths array"}
+		return nil, nil, &jobs.JobError{Code: "invalid_parameters", Message: "File input requires a nonempty paths array"}
 	}
 	for _, path := range paths {
 		if !filepath.IsAbs(path) {
-			return nil, nil, &jobs.JobError{Code: "invalid_parameters", Message: "Trajectory import requires absolute local file paths"}
+			return nil, nil, &jobs.JobError{Code: "invalid_parameters", Message: "File input requires absolute local file paths"}
 		}
 	}
 	return parameters, paths, nil
@@ -120,7 +130,7 @@ func (s *Supervisor) stageReferences(ctx context.Context, job jobs.JobRecord) (e
 		return fmt.Errorf("create reference input staging directory: %w", err)
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(stage)) }()
-	s.reportProgress(job.ID)(event{Progress: &jobs.ProgressEvent{Stage: "stage_reference_input", Message: "Capture trajectory reference files"}})
+	s.reportProgress(job.ID)(event{Progress: &jobs.ProgressEvent{Stage: "stage_reference_input", Message: "Capture reference files"}})
 	inventory := make([]referenceFile, 0, len(paths))
 	for i, source := range paths {
 		out, err := os.OpenFile(filepath.Join(stage, strconv.Itoa(i)), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)

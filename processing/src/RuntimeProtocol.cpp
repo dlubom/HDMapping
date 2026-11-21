@@ -132,6 +132,16 @@ namespace HDMapping::Processing
             return { parse_target(operation.at("target")), absolute_path(recording.at("directory")), toml, capture_destination(packet) };
         }
 
+        std::pair<OperationRequest, std::filesystem::path> parse_session_open(const json& packet)
+        {
+            const auto& operation = packet.at("operation");
+            if (operation.at("operation") != "session.open" || !operation.at("scope").is_object() ||
+                !operation.at("parameters").is_object())
+                throw std::invalid_argument("Invalid session.open capture");
+            return { { "session.open", parse_target(operation.at("target")), operation.at("scope"), operation.at("parameters") },
+                     capture_destination(packet) };
+        }
+
         SnapshotRef parse_snapshot(const json& snapshot)
         {
             const auto& manifest = snapshot.at("manifest_path").get_ref<const std::string&>();
@@ -337,7 +347,8 @@ namespace HDMapping::Processing
         const std::vector<OperationDescriptor>& operations,
         const OperationExecutor& execute,
         const CaptureRecording& capture_recording,
-        const CaptureReferences& capture_references)
+        const CaptureReferences& capture_references,
+        const CaptureSessionOpen& capture_session_open)
     {
         send_packet(send, { { "type", "hello" }, { "wire", wire_version }, { "version", identity.version }, { "pid", identity.pid } });
         std::string type;
@@ -345,6 +356,7 @@ namespace HDMapping::Processing
         std::optional<SnapshotRef> snapshot;
         std::optional<RecordingCommand> recording;
         std::optional<ReferenceCommand> references;
+        std::optional<std::pair<OperationRequest, std::filesystem::path>> session_open;
         try
         {
             const auto packet = read_packet(input);
@@ -368,6 +380,10 @@ namespace HDMapping::Processing
             else if (type == "capture_step1_references" && capture_references)
             {
                 references = parse_references(*packet);
+            }
+            else if (type == "capture_step2_open" && capture_session_open)
+            {
+                session_open = parse_session_open(*packet);
             }
         } catch (const std::exception& error)
         {
@@ -418,6 +434,18 @@ namespace HDMapping::Processing
                 [&](RunContext& context)
                 {
                     return captured_snapshot(capture_references(references->base, references->files, context));
+                });
+            return;
+        }
+        if (session_open)
+        {
+            run_cancellable(
+                input,
+                send,
+                session_open->second,
+                [&](RunContext& context)
+                {
+                    return captured_snapshot(capture_session_open(session_open->first, context));
                 });
             return;
         }

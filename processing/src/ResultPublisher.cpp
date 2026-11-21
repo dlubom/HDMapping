@@ -242,9 +242,9 @@ namespace HDMapping::Processing
                 throw std::runtime_error(error->message);
             }
             auto contents = std::get<SnapshotContents>(std::move(snapshot));
-            if (contents.kind != native_session_kind)
+            if (contents.kind != native_session_kind && (contents.kind != session_export_kind || !contents.dependencies.empty()))
             {
-                throw std::runtime_error("Publication requires a native session snapshot");
+                throw std::runtime_error("Publication requires a native session or a self-contained session export");
             }
             ArtifactManifest artifact{ id, identity, std::move(ref), { path }, contents.dependencies };
             for (const auto& name : header.at("files").items())
@@ -358,8 +358,11 @@ namespace HDMapping::Processing
                 throw PublicationConflict("Publication attempt identity was already used");
             }
             auto [artifact, contents] = read_artifact(stage, id);
-            ValidateNativeSessionReferences(contents, artifact);
-            VerifyNativeSessionRead(contents.entry);
+            if (contents.kind == native_session_kind)
+            {
+                ValidateNativeSessionReferences(contents, artifact);
+                VerifyNativeSessionRead(contents.entry);
+            }
             artifact.snapshot.manifest_path = published / snapshot_manifest;
             for (auto& file : artifact.files)
             {
@@ -496,7 +499,8 @@ namespace HDMapping::Processing
                 throw std::runtime_error("Published generation is missing or is not an owned directory");
             }
             auto [artifact, contents] = read_artifact(generation, id);
-            ValidateNativeSessionReferences(contents, artifact);
+            if (contents.kind == native_session_kind)
+                ValidateNativeSessionReferences(contents, artifact);
             return artifact;
         } catch (const std::exception& error)
         {
@@ -524,6 +528,8 @@ namespace HDMapping::Processing
             {
                 throw std::invalid_argument("Export artifact does not match its published snapshot");
             }
+            if (contents.kind != native_session_kind)
+                throw std::invalid_argument("Complete export requires a native session");
             ValidateNativeSessionReferences(contents, artifact);
 
             CompleteExport export_source(artifact, contents);

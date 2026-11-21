@@ -39,6 +39,9 @@ func (s *Supervisor) Describe(ctx context.Context) (json.RawMessage, error) {
 }
 
 func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.SnapshotRef, error) {
+	if job.Request.Operation.Operation == jobs.OpenSession {
+		return s.captureInput(ctx, job, "capture_step2_open")
+	}
 	if job.Request.Recording != nil {
 		return s.captureInput(ctx, job, "capture_step1_recording")
 	}
@@ -70,7 +73,7 @@ func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.Snap
 		if err := s.stageCameras(ctx, job); err != nil {
 			return jobs.SnapshotRef{}, err
 		}
-	} else if isReferenceImport(job.Request.Operation.Operation) {
+	} else if hasReferenceFiles(job.Request.Operation) {
 		if err := s.stageReferences(ctx, job); err != nil {
 			return jobs.SnapshotRef{}, err
 		}
@@ -98,11 +101,11 @@ func (s *Supervisor) captureInput(ctx context.Context, job jobs.JobRecord, kind 
 	}
 	snapshot := reply.Snapshot
 	if reply.Type != "snapshot_captured" || snapshot == nil || snapshot.Target != job.Request.Operation.Target || !filepath.IsAbs(snapshot.ManifestPath) {
-		return jobs.SnapshotRef{}, errors.New("worker returned an invalid Step 1 input capture")
+		return jobs.SnapshotRef{}, errors.New("worker returned an invalid input capture")
 	}
 	resolved, err := filepath.EvalSymlinks(snapshot.ManifestPath)
 	if err != nil {
-		return jobs.SnapshotRef{}, fmt.Errorf("resolve captured Step 1 input manifest: %w", err)
+		return jobs.SnapshotRef{}, fmt.Errorf("resolve captured input manifest: %w", err)
 	}
 	rel, err := filepath.Rel(dir, resolved)
 	if err != nil || rel == "." || !filepath.IsLocal(rel) {
@@ -140,7 +143,7 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 	switch {
 	case cameraJob:
 		operation, err = s.useStagedCameras(ctx, job)
-	case isReferenceImport(operation.Operation):
+	case hasReferenceFiles(operation):
 		operation, err = s.useStagedReferences(ctx, job)
 	}
 	if err != nil {

@@ -59,5 +59,5 @@ func addStep2Tools(server *sdk.Server, call func(context.Context, string, any, a
 		addStep2MutationTool(server, call, op.id, op.description, liveOrDurable)
 		capabilities = append(capabilities, op.id)
 	}
-	return capabilities
+	return append(capabilities, addSessionIOTools(server, call)...)
 }

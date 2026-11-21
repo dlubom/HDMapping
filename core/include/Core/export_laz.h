@@ -444,20 +444,24 @@ inline void points_to_vector(
 //! `intersection_width` of the respective plane) to one laz file. Shared by step 2 (one session,
 //! picked via a file dialog) and step 3 (one call per session, auto-named -- see
 //! export_intersection_all_sessions() in multi_session_registration.cpp).
-inline void save_intersection(
+inline bool save_intersection(
     const Session& session,
     const std::string& output_las_name,
     bool xz_intersection,
     bool yz_intersection,
     bool xy_intersection,
-    double intersection_width)
+    double intersection_width,
+    bool include_scan_ids = false)
 {
     std::vector<Eigen::Vector3d> pointcloud;
     std::vector<unsigned short> intensity;
     std::vector<double> timestamps;
 
-    for (auto& p : session.point_clouds_container.point_clouds)
+    std::vector<unsigned short> point_source_ids;
+    const auto& scans = session.point_clouds_container.point_clouds;
+    for (std::size_t index = 0; index < scans.size(); ++index)
     {
+        const auto& p = scans[index];
         if (!p.visible)
             continue;
 
@@ -476,23 +480,23 @@ inline void save_intersection(
             if (is_inside)
             {
                 pointcloud.push_back(vp);
+                if (include_scan_ids)
+                    point_source_ids.push_back(static_cast<unsigned short>(std::min<std::size_t>(index, 65535)));
                 intensity.push_back(i < p.intensities.size() ? p.intensities[i] : 0);
                 timestamps.push_back(i < p.timestamps.size() ? p.timestamps[i] : 0.0);
             }
         }
     }
 
-    if (!exportLaz(
-            output_las_name,
-            pointcloud,
-            intensity,
-            timestamps,
-            session.point_clouds_container.offset.x(),
-            session.point_clouds_container.offset.y(),
-            session.point_clouds_container.offset.z()))
-    {
-        std::cerr << "problem with saving file: " << output_las_name << std::endl;
-    }
+    return exportLaz(
+        output_las_name,
+        pointcloud,
+        intensity,
+        timestamps,
+        session.point_clouds_container.offset.x(),
+        session.point_clouds_container.offset.y(),
+        session.point_clouds_container.offset.z(),
+        include_scan_ids ? &point_source_ids : nullptr);
 }
 
 inline bool save_all_to_las(const Session& session, std::string output_las_name, bool as_local, bool skip_ts_0)

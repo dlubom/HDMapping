@@ -214,6 +214,10 @@ func normalize(req SubmitRequest) (SubmitRequest, error) {
 		return req, errors.New("invalid job access")
 	}
 	switch {
+	case req.Operation.Operation == OpenSession:
+		if req.Snapshot != nil || req.Recording != nil || req.Access != AccessMutate {
+			return req, errors.New("session.open requires external input and mutate access")
+		}
 	case req.Recording != nil:
 		if req.Snapshot != nil || req.CaptureSource != "" {
 			return req, errors.New("recording requires an exclusive input source")

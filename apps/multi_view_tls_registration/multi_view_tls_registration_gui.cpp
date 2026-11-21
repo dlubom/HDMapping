@@ -107,6 +107,7 @@
 #include "../lidar_odometry_step_1/lidar_odometry_utils.h"
 #include "bow_loop_closure_detector.h"
 #include "multi_view_tls_registration.h"
+#include "step2_io_operations.h"
 #include "step2_segment_operations.h"
 #include "step2_solver_selection.h"
 #include <Core/reference_tracks.h>
@@ -1092,6 +1093,7 @@ bool fillInSession = true;
 
 TLSRegistration tls_registration;
 ObservationPicking observation_picking;
+static std::string observations_file_name;
 
 bool new_loop_closure_index = false;
 int num_edge_extended_before = 0;
@@ -2155,8 +2157,6 @@ void pose_graph_slam_gui()
 
 void observation_picking_gui()
 {
-    static std::string observations_file_name = "";
-
     ImGui::Begin("Observations", &is_manual_analisys);
     {
         ImGui::Checkbox("Observation picking mode", &observation_picking.is_observation_picking_mode);
@@ -3884,7 +3884,7 @@ void loadE57Files(const std::vector<std::string>& input_file_names, bool fillInS
             pc.laz_in_memory_only = true;
             // Provenance for "Update e57 poses".
             pc.e57_source_path = abs_src;
-            pc.e57_scan_index = static_cast<int>(si);
+            pc.e57_scan_index = static_cast<int>(scan.data3d_index);
             pc.points_local = std::move(scan.points);
             pc.intensities = std::move(scan.intensities);
             pc.colors = std::move(scan.colors);
@@ -8444,6 +8444,18 @@ static nlohmann::json step2CaptureParameters()
     parameters["visible_scans"] = std::move(selected);
     parameters["range"] = { index_begin, index_end };
     parameters["manual_graph"] = proc::DescribeManualGraphSettings(session.pose_graph_loop_closure);
+    parameters["observations"] = nlohmann::json::array();
+    for (const auto& observation : observation_picking.observations)
+    {
+        auto points = nlohmann::json::array();
+        for (const auto& [scan_id, value] : observation)
+            points.push_back({ { "scan_id", scan_id }, { "local_coords", { value.x(), value.y(), value.z() } } });
+        parameters["observations"].push_back(std::move(points));
+    }
+    parameters["intersections"] = nlohmann::json::array();
+    for (const auto& roi : observation_picking.intersections)
+        parameters["intersections"].push_back(
+            { { "translation", roi.translation }, { "rotation", roi.rotation }, { "size", roi.width_length_height } });
     return parameters;
 }
 
@@ -8464,6 +8476,9 @@ static proc::StateSummary describeStep2()
         operations.push_back(operation.id);
     for (const auto& operation : proc::DescribeStep2Segments())
         operations.push_back(operation.id);
+    for (const auto operation :
+         { proc::session_open_operation, proc::session_save_operation, proc::session_subsession_operation, proc::export_session_operation })
+        operations.push_back(operation);
     return { {},
              step2CaptureParameters(),
              { { "kind", "session" },
@@ -8524,6 +8539,36 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
+    if (source.kind == "native_session" &&
+        source.parameters.value("session_io_import", std::string{}) == proc::import_session_observations_operation)
+    {
+        std::vector<std::map<int, Eigen::Vector3d>> imported;
+        const auto& clouds = session.point_clouds_container;
+        const auto& scans = clouds.point_clouds;
+        for (const auto& observation : source.parameters.at("observations"))
+        {
+            auto& points = imported.emplace_back();
+            for (const auto& point : observation)
+            {
+                const auto index = point.at("scan_id").get<int>();
+                if (index < 0 || static_cast<std::size_t>(index) >= scans.size())
+                    return proc::OperationError{ "invalid_result", "Observation does not match a live scan", {} };
+                const auto coordinates = point.at("local_coords").get<std::array<double, 3>>();
+                points.try_emplace(index, coordinates[0], coordinates[1], coordinates[2]);
+            }
+        }
+        observation_picking.observations = std::move(imported);
+        for (const auto& points : observation_picking.observations)
+        {
+            if (points.empty())
+                continue;
+            const auto& [index, position] = *points.begin();
+            const auto& scan = scans[static_cast<std::size_t>(index)];
+            const auto& pose = clouds.show_with_initial_pose ? scan.m_initial_pose : scan.m_pose;
+            observation_picking.add_intersection(pose * position);
+        }
+        return {};
+    }
     if (source.kind == "native_session" && source.parameters.contains("segment_result"))
     {
         const auto& edit = source.parameters.at("segment_result");
@@ -8645,6 +8690,27 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     auto scans = std::move(loaded.point_clouds_container.point_clouds);
     session = loaded;
     session.point_clouds_container.point_clouds = std::move(scans);
+    if (const auto names = source.parameters.find("scan_names");
+        names != source.parameters.end() && names->is_array() && names->size() == session.point_clouds_container.point_clouds.size())
+    {
+        for (std::size_t index = 0; index < names->size(); ++index)
+            if (names->at(index).is_string())
+                session.point_clouds_container.point_clouds[index].source_scan_name = names->at(index).get<std::string>();
+    }
+    if (const auto origins = source.parameters.find("e57_origins");
+        origins != source.parameters.end() && origins->is_array() && origins->size() == session.point_clouds_container.point_clouds.size())
+    {
+        for (std::size_t index = 0; index < origins->size(); ++index)
+        {
+            const auto& origin = origins->at(index);
+            if (!origin.is_object() || !origin.contains("path") || !origin["path"].is_string() || !origin.contains("index") ||
+                !origin["index"].is_number_integer())
+                continue;
+            auto& scan = session.point_clouds_container.point_clouds[index];
+            scan.e57_source_path = origin.at("path").get<std::string>();
+            scan.e57_scan_index = origin.at("index").get<int>();
+        }
+    }
     session_file_name = sessionPathText(source.entry);
     state_path = session_file_name;
     registration_result_path.clear();
@@ -8661,6 +8727,13 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     gizmo_drag_first_index = -1;
     gizmo_drag_preview_poses.clear();
     clearTranslatePreview();
+    if (source.parameters.value("session_open", false))
+    {
+        observation_picking.observations.clear();
+        observation_picking.current_observation.clear();
+        observation_picking.intersections.clear();
+        observations_file_name.clear();
+    }
     auto unavailable = [](const auto& point)
     {
         const int scan_index = point.first;
