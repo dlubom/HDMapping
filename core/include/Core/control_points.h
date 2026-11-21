@@ -2,6 +2,7 @@
 
 #include <Core/point_clouds.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,7 @@ public:
     int index_pose = 0;
 
 #if WITH_GUI == 1
-    void imgui(PointClouds& point_clouds_container, const Eigen::Vector3f& rotation_center);
+    void imgui(PointClouds& point_clouds_container, const Eigen::Vector3f& rotation_center, const std::function<void()>& align = {});
     void render(const PointClouds& point_clouds_container, bool show_pc);
     void draw_ellipse(const Eigen::Matrix3d& covar, const Eigen::Vector3d& mean, const Eigen::Vector3f& color, float nstd = 1);
 #endif

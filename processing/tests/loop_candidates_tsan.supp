@@ -1,0 +1,3 @@
+# Ubuntu's external GDAL takes these locks in both orders during its one-time
+# driver registration from OpenCV 4.6 imgcodecs, even for a JPEG.
+deadlock:CPLCreateOrAcquireMutexEx

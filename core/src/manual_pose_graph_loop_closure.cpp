@@ -63,7 +63,7 @@ void ManualPoseGraphLoopClosure::icp_all_edges_step(
     }
 }
 
-void ManualPoseGraphLoopClosure::icp_all_edges_gui()
+void ManualPoseGraphLoopClosure::icp_all_edges_gui(const Actions* actions)
 {
     auto& run = icp_all_edges_run;
     const auto format_duration = [](double seconds)
@@ -108,10 +108,15 @@ void ManualPoseGraphLoopClosure::icp_all_edges_gui()
     ImGui::BeginDisabled(edges.empty());
     if (ImGui::Button("ICP all edges"))
     {
-        run = IcpAllEdgesRun{};
-        run.running = true;
-        run.radii = icp_search_radii(static_cast<float>(icp_all_edges_start_radius));
-        run.start = std::chrono::steady_clock::now();
+        if (actions)
+            actions->icp(icp_all_edges_start_radius, 30, true);
+        else
+        {
+            run = IcpAllEdgesRun{};
+            run.running = true;
+            run.radii = icp_search_radii(static_cast<float>(icp_all_edges_start_radius));
+            run.start = std::chrono::steady_clock::now();
+        }
         icp_all_edges_count = 0;
     }
     ImGui::EndDisabled();
@@ -150,16 +155,6 @@ void ManualPoseGraphLoopClosure::icp_all_edges_gui()
     }
 }
 
-void ManualPoseGraphLoopClosure::compute_pose_graph_slam(
-    PointClouds& point_clouds_container, GNSS& gnss, GroundControlPoints& gcps, ControlPoints& cps)
-{
-    if (keep_initial_trajectory_curvature)
-        set_initial_poses_as_motion_model(point_clouds_container);
-    else
-        set_current_poses_as_motion_model(point_clouds_container);
-    graph_slam(point_clouds_container, gnss, gcps, cps);
-}
-
 void ManualPoseGraphLoopClosure::Gui(
     PointClouds& point_clouds_container,
     int& index_loop_closure_source,
@@ -170,7 +165,9 @@ void ManualPoseGraphLoopClosure::Gui(
     GroundControlPoints& gcps,
     ControlPoints& cps,
     int num_edge_extended_before,
-    int num_edge_extended_after)
+    int num_edge_extended_after,
+    void (*cache_edited)(),
+    const Actions* actions)
 {
     if (point_clouds_container.point_clouds.size() > 0)
     {
@@ -228,8 +225,10 @@ void ManualPoseGraphLoopClosure::Gui(
 
             if (ImGui::Button("Add edge"))
             {
-                add_edge(point_clouds_container, index_loop_closure_source, index_loop_closure_target);
-                index_active_edge = edges.size() - 1;
+                if (!actions)
+                    add_edge(point_clouds_container, index_loop_closure_source, index_loop_closure_target);
+                if (!actions || actions->add(index_loop_closure_source, index_loop_closure_target))
+                    index_active_edge = static_cast<int>(edges.size()) - 1;
                 icp_all_edges_count = 0;
                 icp_all_edges_run.running = false;
             }
@@ -238,11 +237,16 @@ void ManualPoseGraphLoopClosure::Gui(
 
             if (!manipulate_active_edge)
             {
-                icp_all_edges_gui();
+                icp_all_edges_gui(actions);
 
                 ImGui::BeginDisabled(icp_all_edges_run.running);
                 if (ImGui::Button("Compute Pose Graph SLAM"))
-                    compute_pose_graph_slam(point_clouds_container, gnss, gcps, cps);
+                {
+                    if (actions)
+                        actions->optimize();
+                    else
+                        compute_pose_graph_slam(point_clouds_container, gnss, gcps, cps);
+                }
                 ImGui::EndDisabled();
 
                 ImGui::SameLine();
@@ -293,12 +297,18 @@ void ManualPoseGraphLoopClosure::Gui(
 
                 if (ImGui::Button("Fuse trajectory with GNSS (trajectory is rigid)"))
                 {
-                    FuseTrajectoryWithGNSS(point_clouds_container, gnss);
+                    if (actions && actions->align_reference)
+                        actions->align_reference("gnss");
+                    else
+                        FuseTrajectoryWithGNSS(point_clouds_container, gnss);
                 }
 
                 if (ImGui::Button("Fuse trajectory with TUM (trajectory is rigid)"))
                 {
-                    FuseTrajectoryWithTUM(point_clouds_container, tum);
+                    if (actions && actions->align_reference)
+                        actions->align_reference("tum");
+                    else
+                        FuseTrajectoryWithTUM(point_clouds_container, tum);
                 }
             }
         }
@@ -314,9 +324,21 @@ void ManualPoseGraphLoopClosure::Gui(
 
             if (!gizmo)
             {
+                const auto refine = [&](double radius, int iterations)
+                {
+                    if (actions)
+                        actions->icp(radius, iterations, false);
+                    else
+                        run_icp(
+                            point_clouds_container,
+                            index_active_edge,
+                            radius,
+                            iterations,
+                            num_edge_extended_before,
+                            num_edge_extended_after);
+                };
                 if (ImGui::Button("ICP"))
-                    run_icp(
-                        point_clouds_container, index_active_edge, search_radious, 10, num_edge_extended_before, num_edge_extended_after);
+                    refine(search_radious, 10);
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(ImGuiNumberWidth);
                 ImGui::InputDouble("Search_radius [m]", &search_radious);
@@ -324,19 +346,19 @@ void ManualPoseGraphLoopClosure::Gui(
                     search_radious = 0.01;
 
                 if (ImGui::Button("ICP (2.0)"))
-                    run_icp(point_clouds_container, index_active_edge, 2.0, 30, num_edge_extended_before, num_edge_extended_after);
+                    refine(2.0f, 30);
                 ImGui::SameLine();
                 if (ImGui::Button("ICP (1.0)"))
-                    run_icp(point_clouds_container, index_active_edge, 1.0, 30, num_edge_extended_before, num_edge_extended_after);
+                    refine(1.0f, 30);
                 ImGui::SameLine();
                 if (ImGui::Button("ICP (0.5)"))
-                    run_icp(point_clouds_container, index_active_edge, 0.5, 30, num_edge_extended_before, num_edge_extended_after);
+                    refine(0.5f, 30);
                 ImGui::SameLine();
                 if (ImGui::Button("ICP (0.25)"))
-                    run_icp(point_clouds_container, index_active_edge, 0.25, 30, num_edge_extended_before, num_edge_extended_after);
+                    refine(0.25f, 30);
                 ImGui::SameLine();
                 if (ImGui::Button("ICP (0.1)"))
-                    run_icp(point_clouds_container, index_active_edge, 0.1, 30, num_edge_extended_before, num_edge_extended_after);
+                    refine(0.1f, 30);
 
                 if (ImGui::Button("Save source (local)"))
                 {
@@ -574,18 +596,18 @@ void ManualPoseGraphLoopClosure::Gui(
                     {
                         gizmo = false;
 
-                        std::vector<Edge> new_edges;
-                        for (int ni = 0; ni < edges.size(); ni++)
+                        if (!actions)
                         {
-                            if (i != ni)
-                                new_edges.push_back(edges[ni]);
+                            edges.erase(edges.begin() + i);
+                            index_active_edge = std::max(0, std::min(index_active_edge, static_cast<int>(edges.size()) - 1));
+                            manipulate_active_edge = !edges.empty();
                         }
-                        edges = new_edges;
-                        icp_all_edges_count = 0;
-                        icp_all_edges_run.running = false;
-
-                        index_active_edge = std::min(index_active_edge, static_cast<int>(edges.size() - 1));
-                        manipulate_active_edge = (edges.size() > 0);
+                        if (!actions || actions->remove(static_cast<int>(i)))
+                        {
+                            icp_all_edges_count = 0;
+                            icp_all_edges_run.running = false;
+                            break;
+                        }
                     }
 
                     if (index_active_edge == i)
@@ -598,6 +620,8 @@ void ManualPoseGraphLoopClosure::Gui(
 
                         if (ImGui::Button(("Reload cache##" + std::to_string(i)).c_str()))
                         {
+                            if (cache_edited)
+                                cache_edited();
                             std::cout << point_clouds_container.point_clouds[edges[index_active_edge].index_from].file_name << std::endl;
                             std::cout << point_clouds_container.point_clouds[edges[index_active_edge].index_to].file_name << std::endl;
 
@@ -613,7 +637,8 @@ void ManualPoseGraphLoopClosure::Gui(
                         }
 
                         ImGui::SameLine();
-                        ImGui::InputDouble("downsampling_voxel_size ", &downsampling_voxel_size);
+                        if (ImGui::InputDouble("downsampling_voxel_size ", &downsampling_voxel_size) && cache_edited)
+                            cache_edited();
                     }
 
                     ImGui::BeginDisabled(true);
@@ -627,7 +652,7 @@ void ManualPoseGraphLoopClosure::Gui(
             }
             ImGui::EndChild();
 
-            if ((prev_gizmo != gizmo) || (prev_index_active_edge != index_active_edge))
+            if (!edges.empty() && ((prev_gizmo != gizmo) || (prev_index_active_edge != index_active_edge)))
             {
                 auto m_to = point_clouds_container.point_clouds[edges[index_active_edge].index_from].m_pose *
                     affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);

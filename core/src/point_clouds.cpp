@@ -2,6 +2,9 @@
 
 #include <Core/point_clouds.h>
 #include <Core/transformations.h>
+#include <HDMapping/SessionPaths.h>
+
+#include <set>
 
 #if WITH_GUI == 1
 #include <GL/freeglut.h>
@@ -115,6 +118,12 @@ bool PointClouds::load(
                 sum_points_after_decimation += pc.points_local.size();
             }
         }
+        else
+        {
+            pc.deferred_points =
+                PointCloud::DeferredPoints{ PointCloud::DeferredPoints::Format::Ply,
+                                            std::filesystem::absolute(std::filesystem::path(folder_with_point_clouds) / pc.file_name) };
+        }
 
         point_clouds.push_back(pc);
     }
@@ -127,7 +136,20 @@ bool PointClouds::load(
     return true;
 }
 
-bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name)
+namespace
+{
+    bool matches_resso_name(std::string_view filename, std::string_view line, bool strict)
+    {
+        if (strict || filename == line)
+            return filename == line;
+        constexpr std::string_view whitespace = " \t\r\v\f";
+        const auto begin = line.find_first_not_of(whitespace);
+        return begin != std::string_view::npos && filename == line.substr(begin, line.find_first_of(whitespace, begin) - begin);
+    }
+} // namespace
+
+bool PointClouds::update_poses_from_RESSO(
+    const std::string& folder_with_point_clouds, const std::filesystem::path& poses_file_name, bool strict, bool utf8_paths)
 {
     std::ifstream infile(poses_file_name);
     if (!infile.good())
@@ -140,33 +162,42 @@ bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_c
     std::istringstream iss(line);
 
     int num_scans = 0;
-    iss >> num_scans;
+    if (!(iss >> num_scans) || num_scans < 0)
+        return false;
+
+    if (strict && static_cast<std::size_t>(num_scans) != point_clouds.size())
+        return false;
 
     std::cout << "number of scans: " << num_scans << std::endl;
 
     std::vector<PointCloud> pcs;
+    std::set<std::string> exact_names;
 
     for (size_t i = 0; i < num_scans; i++)
     {
         std::getline(infile, line);
-        std::istringstream iss(line);
-        std::string point_cloud_file_name;
-        iss >> point_cloud_file_name;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const auto point_cloud_file_name = line;
+        exact_names.insert(point_cloud_file_name);
 
         double r11, r12, r13, r21, r22, r23, r31, r32, r33;
         double t14, t24, t34;
 
         std::getline(infile, line);
         std::istringstream iss1(line);
-        iss1 >> r11 >> r12 >> r13 >> t14;
+        if (!(iss1 >> r11 >> r12 >> r13 >> t14))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss2(line);
-        iss2 >> r21 >> r22 >> r23 >> t24;
+        if (!(iss2 >> r21 >> r22 >> r23 >> t24))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss3(line);
-        iss3 >> r31 >> r32 >> r33 >> t34;
+        if (!(iss3 >> r31 >> r32 >> r33 >> t34))
+            return false;
 
         std::getline(infile, line);
 
@@ -194,10 +225,15 @@ bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_c
     {
         for (int i = 0; i < point_clouds.size(); i++)
         {
+            const auto filename = utf8_paths ? sessionPathText(sessionPathFromText(point_clouds[i].file_name).filename())
+                                             : std::filesystem::path(point_clouds[i].file_name).filename().string();
+            const bool exact = strict || exact_names.contains(filename);
+            int matches = 0;
             for (int j = 0; j < pcs.size(); j++)
             {
-                if (std::filesystem::path(point_clouds[i].file_name).filename().string() == pcs[j].file_name)
+                if (matches_resso_name(filename, pcs[j].file_name, exact))
                 {
+                    ++matches;
                     point_clouds[i].m_pose = pcs[j].m_pose;
                     point_clouds[i].pose = pose_tait_bryan_from_affine_matrix(point_clouds[i].m_pose);
                     point_clouds[i].gui_translation[0] = point_clouds[i].pose.px;
@@ -208,6 +244,8 @@ bool PointClouds::update_poses_from_RESSO(const std::string& folder_with_point_c
                     point_clouds[i].gui_rotation[2] = rad2deg(point_clouds[i].pose.ka);
                 }
             }
+            if (strict && matches != 1)
+                return false;
         }
     }
     else
@@ -318,7 +356,8 @@ bool PointClouds::update_poses_from_RESSO_inverse(const std::string& folder_with
     return true;
 }
 
-bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name)
+bool PointClouds::update_initial_poses_from_RESSO(
+    const std::string& folder_with_point_clouds, const std::filesystem::path& poses_file_name, bool strict, bool utf8_paths)
 {
     std::ifstream infile(poses_file_name);
     if (!infile.good())
@@ -331,33 +370,42 @@ bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with
     std::istringstream iss(line);
 
     int num_scans = 0;
-    iss >> num_scans;
+    if (!(iss >> num_scans) || num_scans < 0)
+        return false;
+
+    if (strict && static_cast<std::size_t>(num_scans) != point_clouds.size())
+        return false;
 
     std::cout << "number of scans: " << num_scans << std::endl;
 
     std::vector<PointCloud> pcs;
+    std::set<std::string> exact_names;
 
     for (size_t i = 0; i < num_scans; i++)
     {
         std::getline(infile, line);
-        std::istringstream iss(line);
-        std::string point_cloud_file_name;
-        iss >> point_cloud_file_name;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const auto point_cloud_file_name = line;
+        exact_names.insert(point_cloud_file_name);
 
         double r11, r12, r13, r21, r22, r23, r31, r32, r33;
         double t14, t24, t34;
 
         std::getline(infile, line);
         std::istringstream iss1(line);
-        iss1 >> r11 >> r12 >> r13 >> t14;
+        if (!(iss1 >> r11 >> r12 >> r13 >> t14))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss2(line);
-        iss2 >> r21 >> r22 >> r23 >> t24;
+        if (!(iss2 >> r21 >> r22 >> r23 >> t24))
+            return false;
 
         std::getline(infile, line);
         std::istringstream iss3(line);
-        iss3 >> r31 >> r32 >> r33 >> t34;
+        if (!(iss3 >> r31 >> r32 >> r33 >> t34))
+            return false;
 
         std::getline(infile, line);
 
@@ -385,13 +433,20 @@ bool PointClouds::update_initial_poses_from_RESSO(const std::string& folder_with
     {
         for (int i = 0; i < point_clouds.size(); i++)
         {
+            const auto filename = utf8_paths ? sessionPathText(sessionPathFromText(point_clouds[i].file_name).filename())
+                                             : std::filesystem::path(point_clouds[i].file_name).filename().string();
+            const bool exact = strict || exact_names.contains(filename);
+            int matches = 0;
             for (int j = 0; j < pcs.size(); j++)
             {
-                if (std::filesystem::path(point_clouds[i].file_name).filename().string() == pcs[j].file_name)
+                if (matches_resso_name(filename, pcs[j].file_name, exact))
                 {
+                    ++matches;
                     point_clouds[i].m_initial_pose = pcs[j].m_initial_pose;
                 }
             }
+            if (strict && matches != 1)
+                return false;
         }
     }
     return true;
@@ -801,69 +856,44 @@ void PointClouds::render(
 }
 #endif
 
-bool PointClouds::save_poses(const std::string file_name, bool is_subsession)
+bool PointClouds::save_poses(const std::filesystem::path& file_name, bool is_subsession, bool initial, bool full_precision)
 {
-    int number_pc = 0;
-    if (!is_subsession)
-    {
-        number_pc = this->point_clouds.size();
-    }
-    else
-    {
-        for (size_t i = 0; i < this->point_clouds.size(); i++)
-        {
-            if (this->point_clouds[i].visible)
-            {
-                number_pc++;
-            }
-        }
-    }
-
-    std::ofstream outfile;
-    outfile.open(file_name);
-    if (!outfile.good())
+    const auto number_pc = is_subsession ? std::count_if(
+                                               point_clouds.begin(),
+                                               point_clouds.end(),
+                                               [](const PointCloud& pc)
+                                               {
+                                                   return pc.visible;
+                                               })
+                                         : point_clouds.size();
+    std::ofstream outfile(file_name);
+    if (!outfile)
     {
         std::cout << "can not save file: " << file_name << std::endl;
-        std::cout << "if you can see only '' it means there is no filename assigned to poses, please read manual or ask for support"
-                  << std::endl;
-        std::cout << "To assign filename to poses please use following two buttons in multi_view_tls_registration_step_2" << std::endl;
-        std::cout << "1: update initial poses from RESSO file" << std::endl;
-        std::cout << "2: update poses from RESSO file" << std::endl;
         return false;
     }
-
-    outfile << number_pc << std::endl;
-    for (size_t i = 0; i < this->point_clouds.size(); i++)
+    if (full_precision)
     {
-        if (!is_subsession)
+        outfile << std::setprecision(std::numeric_limits<double>::max_digits10);
+    }
+    outfile << number_pc << std::endl;
+    for (const auto& pc : point_clouds)
+    {
+        if (is_subsession && !pc.visible)
         {
-            outfile << std::filesystem::path(point_clouds[i].file_name).filename().string() << std::endl;
-            outfile << this->point_clouds[i].m_pose(0, 0) << " " << this->point_clouds[i].m_pose(0, 1) << " "
-                    << this->point_clouds[i].m_pose(0, 2) << " " << this->point_clouds[i].m_pose(0, 3) << std::endl;
-            outfile << this->point_clouds[i].m_pose(1, 0) << " " << this->point_clouds[i].m_pose(1, 1) << " "
-                    << this->point_clouds[i].m_pose(1, 2) << " " << this->point_clouds[i].m_pose(1, 3) << std::endl;
-            outfile << this->point_clouds[i].m_pose(2, 0) << " " << this->point_clouds[i].m_pose(2, 1) << " "
-                    << this->point_clouds[i].m_pose(2, 2) << " " << this->point_clouds[i].m_pose(2, 3) << std::endl;
-            outfile << "0 0 0 1" << std::endl;
+            continue;
         }
-        else
+        const auto& pose_to_write = initial ? pc.m_initial_pose : pc.m_pose;
+        outfile << std::filesystem::path(pc.file_name).filename().string() << std::endl;
+        for (int row = 0; row < 3; ++row)
         {
-            if (this->point_clouds[i].visible)
-            {
-                outfile << std::filesystem::path(point_clouds[i].file_name).filename().string() << std::endl;
-                outfile << this->point_clouds[i].m_pose(0, 0) << " " << this->point_clouds[i].m_pose(0, 1) << " "
-                        << this->point_clouds[i].m_pose(0, 2) << " " << this->point_clouds[i].m_pose(0, 3) << std::endl;
-                outfile << this->point_clouds[i].m_pose(1, 0) << " " << this->point_clouds[i].m_pose(1, 1) << " "
-                        << this->point_clouds[i].m_pose(1, 2) << " " << this->point_clouds[i].m_pose(1, 3) << std::endl;
-                outfile << this->point_clouds[i].m_pose(2, 0) << " " << this->point_clouds[i].m_pose(2, 1) << " "
-                        << this->point_clouds[i].m_pose(2, 2) << " " << this->point_clouds[i].m_pose(2, 3) << std::endl;
-                outfile << "0 0 0 1" << std::endl;
-            }
+            outfile << pose_to_write(row, 0) << " " << pose_to_write(row, 1) << " " << pose_to_write(row, 2) << " " << pose_to_write(row, 3)
+                    << std::endl;
         }
+        outfile << "0 0 0 1" << std::endl;
     }
     outfile.close();
-
-    return true;
+    return outfile.good();
 }
 
 bool PointClouds::save_scans()
@@ -1122,7 +1152,9 @@ bool PointClouds::load_whu_tls(
     double bucket_y,
     double bucket_z,
     bool calculate_offset,
-    bool load_cache_mode)
+    bool load_cache_mode,
+    bool utf8_paths,
+    bool strict_trajectory)
 {
     const auto start = std::chrono::system_clock::now();
     std::vector<PointCloud> point_clouds_nodata;
@@ -1137,133 +1169,70 @@ bool PointClouds::load_whu_tls(
         auto& pc = point_clouds_nodata[i]; // reference directly to vector slot
 
         pc.file_name = input_file_names[i];
-        //---
-        std::filesystem::path path = std::filesystem::path(pc.file_name);
-
-        auto only_fn = (path.filename()).stem();
-
-        std::vector<std::string> strs;
-        std::string line = only_fn.string();
-        split(line, '_', strs);
-
-        //--
-
-        auto trj_path = std::filesystem::path(input_file_names[i]).parent_path();
-        std::filesystem::path trajectorypath(pc.file_name);
-        // std::string fn = (trajectorypath.filename().stem()).string();
-
-        trajectorypath.remove_filename();
-
-        // std::string trj_fn = "trajectory_lio_" + std::to_string(i) + ".csv";
-        std::string trj_fn = "trajectory_lio_" + strs[strs.size() - 1] + ".csv";
-
-        // fn.replace(0, 9, "trajectory_lio_");
-        // std::string trajectory_filename = (fn + ".csv");
-        // trj_path /= trajectory_filename;
-
-        trj_path /= trj_fn;
-
-        // std::cout << "trajectory (" << (std::filesystem::path(trj_path).filename().string()) << ")";
-
-        if (std::filesystem::exists(trj_path))
+        const auto cloud_path = utf8_paths ? sessionPathFromText(pc.file_name) : std::filesystem::path(pc.file_name);
+        if (load_cache_mode)
+        {
+            pc.deferred_points =
+                PointCloud::DeferredPoints{ PointCloud::DeferredPoints::Format::Las, std::filesystem::absolute(cloud_path) };
+        }
+        const auto trj_path = sessionTrajectoryPath(cloud_path);
+        if (!trj_path.empty() && std::filesystem::exists(trj_path))
         {
             std::vector<PointCloud::LocalTrajectoryNode> local_trajectory;
-            //
-            std::ifstream infile(trj_path.string());
+            std::ifstream infile(trj_path);
             if (!infile.good())
             {
                 // std::cout << "problem with file: '" << trj_path.string() << "'" << std::endl;
-                spdlog::error("Failed opening trajectory: '{}'", trj_path.string());
+                spdlog::error("Failed opening trajectory: '{}'", sessionPathText(trj_path));
                 return false;
             }
 
-            std::string s;
-            getline(infile, s); // csv header
-            while (!infile.eof())
+            std::string line;
+            std::getline(infile, line); // csv header
+            while (std::getline(infile, line))
             {
-                getline(infile, s);
-                // Remove trailing \r from Windows CRLF line endings
-                if (!s.empty() && s.back() == '\r')
-                    s.pop_back();
-                std::vector<std::string> strs;
-                split(s, ' ', strs);
-
-                if (strs.size() == 13)
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                std::vector<std::string> fields;
+                split(line, ' ', fields);
+                if (fields.empty())
+                    continue;
+                if (fields.size() != 13 && fields.size() != 14 && fields.size() != 17)
                 {
-                    PointCloud::LocalTrajectoryNode ltn;
-                    std::istringstream(strs[0]) >> ltn.timestamps.first;
-                    std::istringstream(strs[1]) >> ltn.m_pose(0, 0);
-                    std::istringstream(strs[2]) >> ltn.m_pose(0, 1);
-                    std::istringstream(strs[3]) >> ltn.m_pose(0, 2);
-                    std::istringstream(strs[4]) >> ltn.m_pose(0, 3);
-                    std::istringstream(strs[5]) >> ltn.m_pose(1, 0);
-                    std::istringstream(strs[6]) >> ltn.m_pose(1, 1);
-                    std::istringstream(strs[7]) >> ltn.m_pose(1, 2);
-                    std::istringstream(strs[8]) >> ltn.m_pose(1, 3);
-                    std::istringstream(strs[9]) >> ltn.m_pose(2, 0);
-                    std::istringstream(strs[10]) >> ltn.m_pose(2, 1);
-                    std::istringstream(strs[11]) >> ltn.m_pose(2, 2);
-                    std::istringstream(strs[12]) >> ltn.m_pose(2, 3);
-
-                    ltn.timestamps.second = 0.0;
-                    ltn.imu_om_fi_ka = { 0, 0, 0 };
-                    local_trajectory.push_back(ltn);
+                    if (strict_trajectory)
+                        return false;
+                    continue;
                 }
 
-                if (strs.size() == 14)
+                PointCloud::LocalTrajectoryNode node;
+                bool valid = true;
+                std::size_t index = 0;
+                const auto read = [&](double& value)
                 {
-                    PointCloud::LocalTrajectoryNode ltn;
-                    std::istringstream(strs[0]) >> ltn.timestamps.first;
-                    std::istringstream(strs[1]) >> ltn.m_pose(0, 0);
-                    std::istringstream(strs[2]) >> ltn.m_pose(0, 1);
-                    std::istringstream(strs[3]) >> ltn.m_pose(0, 2);
-                    std::istringstream(strs[4]) >> ltn.m_pose(0, 3);
-                    std::istringstream(strs[5]) >> ltn.m_pose(1, 0);
-                    std::istringstream(strs[6]) >> ltn.m_pose(1, 1);
-                    std::istringstream(strs[7]) >> ltn.m_pose(1, 2);
-                    std::istringstream(strs[8]) >> ltn.m_pose(1, 3);
-                    std::istringstream(strs[9]) >> ltn.m_pose(2, 0);
-                    std::istringstream(strs[10]) >> ltn.m_pose(2, 1);
-                    std::istringstream(strs[11]) >> ltn.m_pose(2, 2);
-                    std::istringstream(strs[12]) >> ltn.m_pose(2, 3);
-                    std::istringstream(strs[13]) >> ltn.timestamps.second;
-                    ltn.imu_om_fi_ka = { 0, 0, 0 };
-                    local_trajectory.push_back(ltn);
-                }
-
-                if (strs.size() == 17)
+                    std::istringstream input(fields[index++]);
+                    if (!(input >> value) || !input.eof() || !std::isfinite(value))
+                        valid = false;
+                };
+                read(node.timestamps.first);
+                for (int row = 0; row < 3; ++row)
                 {
-                    PointCloud::LocalTrajectoryNode ltn;
-                    std::istringstream(strs[0]) >> ltn.timestamps.first;
-                    std::istringstream(strs[1]) >> ltn.m_pose(0, 0);
-                    std::istringstream(strs[2]) >> ltn.m_pose(0, 1);
-                    std::istringstream(strs[3]) >> ltn.m_pose(0, 2);
-                    std::istringstream(strs[4]) >> ltn.m_pose(0, 3);
-                    std::istringstream(strs[5]) >> ltn.m_pose(1, 0);
-                    std::istringstream(strs[6]) >> ltn.m_pose(1, 1);
-                    std::istringstream(strs[7]) >> ltn.m_pose(1, 2);
-                    std::istringstream(strs[8]) >> ltn.m_pose(1, 3);
-                    std::istringstream(strs[9]) >> ltn.m_pose(2, 0);
-                    std::istringstream(strs[10]) >> ltn.m_pose(2, 1);
-                    std::istringstream(strs[11]) >> ltn.m_pose(2, 2);
-                    std::istringstream(strs[12]) >> ltn.m_pose(2, 3);
-                    std::istringstream(strs[13]) >> ltn.timestamps.second;
-                    std::istringstream(strs[14]) >> ltn.imu_om_fi_ka.x();
-                    std::istringstream(strs[15]) >> ltn.imu_om_fi_ka.y();
-                    std::istringstream(strs[16]) >> ltn.imu_om_fi_ka.z();
-
-                    local_trajectory.push_back(ltn);
+                    for (int column = 0; column < 4; ++column)
+                        read(node.m_pose(row, column));
                 }
+                if (fields.size() >= 14)
+                    read(node.timestamps.second);
+                if (fields.size() == 17)
+                {
+                    for (int axis = 0; axis < 3; ++axis)
+                        read(node.imu_om_fi_ka(axis));
+                }
+                if (strict_trajectory && !valid)
+                    return false;
+                local_trajectory.push_back(std::move(node));
             }
-
-            // std::cout << ", " << local_trajectory.size() << " local nodes" << std::endl;
-            infile.close();
-
-            pc.local_trajectory = local_trajectory;
-        }
-        else
-        {
-            // std::cerr << "trajectory path: '" << trj_path.string() << "' does not exist" << std::endl;
+            if (infile.bad())
+                return false;
+            pc.local_trajectory = std::move(local_trajectory);
         }
     }
 
@@ -1282,7 +1251,7 @@ bool PointClouds::load_whu_tls(
         {
             if (!load_cache_mode)
             {
-                if (load_pc(pc, pc.file_name, load_cache_mode))
+                if (pc.load_pc(pc.file_name, load_cache_mode, utf8_paths))
                 {
                     if (is_decimate && pc.points_local.size() > 0)
                     {

@@ -129,7 +129,7 @@ struct TLSRegistration
     bool save_trajectories_laz = false; // Save laz with all trajectories
     bool save_gnss_laz = false; // Save laz with GNSS data
     bool save_scale_board_laz = false; // Save laz with scale board
-    float scale_board_dec = 0.1; // Decimation for scale board laz export
+    float scale_board_dec = 0.1f; // Decimation for scale board laz export
     float scale_board_side_len = -1.0; // Range covered in x and y dimensions
     bool save_initial_poses = false; // Path where initial poses are saved
     bool save_poses = false; // Path where poses are saved

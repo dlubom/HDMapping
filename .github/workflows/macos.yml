@@ -1,21 +1,32 @@
 name: Build on macOS
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "mcp/**"]
   pull_request:
     branches: ["main"]
+
+# A PR and its branch push validate the same head; keep one active run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 env:
   BUILD_TYPE: Release
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["OFF"]') }}
     runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: true
           fetch-depth: 0
 
@@ -36,7 +47,11 @@ jobs:
             -DBUILD_WITH_UTILITY_APPLICATION=ON \
             -DFREEGLUT_COCOA=ON \
             -DHD_CPU_OPTIMIZATION=AUTO \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
+
+      - name: Check MCP quality
+        if: matrix.mcp == 'ON'
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls
 
       - name: Build
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
@@ -46,6 +61,9 @@ jobs:
         # Execute tests defined by the CMake configuration.
         # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
         run: ctest -C ${{env.BUILD_TYPE}} --output-on-failure
+
+      - name: Check installed product relocation
+        run: python3 scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }}
 
       - name: List built binaries
         run: |
@@ -59,6 +77,9 @@ jobs:
           cd ${{github.workspace}}
           ./macos_bundle_toolkit/create_dir_bundle.sh
 
+      - name: Check bundled product relocation
+        run: python3 scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }} --package-dir build/HDMapping --package-executable bin/hdmapping_mcp
+
       - name: Create DMG Package
         run: |
           chmod +x ${{github.workspace}}/macos_bundle_toolkit/create_dir_bundle_dmg.sh
@@ -66,10 +87,18 @@ jobs:
           ./macos_bundle_toolkit/create_dir_bundle_dmg.sh
           mv build/HDMapping.dmg "build/HDMapping-${VERSION}.dmg"
 
+      - name: Check relocated product from the DMG
+        run: |
+          mount_dir=$(mktemp -d)
+          hdiutil attach "build/HDMapping-${VERSION}.dmg" -readonly -nobrowse -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir"; rmdir "$mount_dir"' EXIT
+          python3 scripts/check_mcp_install.py --build-dir build --config "${BUILD_TYPE}" \
+            --mcp ${{ matrix.mcp }} --package-dir "$mount_dir/HDMapping" --package-executable bin/hdmapping_mcp
+
       - name: Upload DMG Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hdmapping-macos-dmg-${{env.VERSION}}
+          name: hdmapping-macos-dmg-${{env.VERSION}}${{ matrix.mcp == 'ON' && '-mcp' || '' }}
           path: ${{github.workspace}}/build/HDMapping-${{env.VERSION}}.dmg
           retention-days: 90
           compression-level: 0

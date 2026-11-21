@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Check MCP ON/OFF in an installed or packaged product after relocation."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+
+def run(command, **kwargs):
+    print("+", subprocess.list2cmdline([str(arg) for arg in command]), flush=True)
+    return subprocess.run(command, check=True, **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-dir", required=True, type=Path)
+    parser.add_argument("--config", default="Release")
+    parser.add_argument("--mcp", choices=("ON", "OFF"), required=True)
+    parser.add_argument("--package-dir", type=Path)
+    parser.add_argument("--package-executable", help="MCP path relative to package directory")
+    args = parser.parse_args()
+    if bool(args.package_dir) != bool(args.package_executable):
+        parser.error("--package-dir and --package-executable must be used together")
+
+    build = args.build_dir.resolve()
+    cache = {}
+    for line in (build / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        if not line.startswith(("//", "#")) and ":" in line and "=" in line:
+            key, value = line.split("=", 1)
+            cache[key.split(":", 1)[0]] = value
+    enabled = (build / "hdmapping-mcp-enabled.txt").read_text(encoding="utf-8").strip()
+    if enabled != ("1" if args.mcp == "ON" else "0"):
+        raise RuntimeError("BUILD_WITH_MCP does not match the requested check")
+    tests = json.loads(run(
+        ["ctest", "--test-dir", build, "-C", args.config, "--show-only=json-v1"],
+        capture_output=True, text=True, encoding="utf-8").stdout)["tests"]
+    contracts = [test for test in tests if test["name"] == "mcp-contract"]
+    if len(contracts) != (1 if args.mcp == "ON" else 0):
+        raise RuntimeError("Unexpected MCP test registration")
+    if args.mcp == "OFF":
+        go_artifacts = list((build / "_deps").glob("go-*"))
+        go_artifacts += [build / name for name in ("go-cache", "go-modules", "go-tools")
+                         if (build / name).exists()]
+        if go_artifacts:
+            raise RuntimeError(f"MCP OFF bootstrapped Go: {go_artifacts}")
+
+    suffix = ".exe" if os.name == "nt" else ""
+    with tempfile.TemporaryDirectory(prefix="hdmapping-install-") as temporary:
+        staging = Path(temporary) / "original"
+        if args.package_dir:
+            shutil.copytree(args.package_dir, staging, symlinks=True)
+            relative_executable = Path(args.package_executable)
+            if relative_executable.is_absolute() or ".." in relative_executable.parts:
+                raise RuntimeError("Package executable must be relative to its directory")
+        else:
+            run(["cmake", "--install", build, "--config", args.config,
+                 "--component", "applications", "--prefix", staging])
+            relative_executable = Path("bin") / (
+                cache["HDMAPPING_BINARY_PREFIX"] + "hdmapping_mcp" + suffix)
+        relocated = Path(temporary) / "przeniesiona instalacja żółć"
+        staging.rename(relocated)
+        executable = relocated / relative_executable
+        vocabulary = executable.with_name("hdmapping-orb-mur.fbow")
+        sha256 = hashlib.sha256()
+        with vocabulary.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                sha256.update(block)
+        digest = sha256.hexdigest()
+        if digest != "310cdf3581b5dd5becfabd75823606e315b1f049f70e51fa23be05021dc4b107":
+            raise RuntimeError(f"Unexpected bundled BoW vocabulary: {vocabulary}")
+        print(f"PASS: relocated BoW vocabulary {digest}", flush=True)
+        if args.mcp == "ON":
+            if not executable.is_file():
+                raise RuntimeError(f"Installed MCP is missing: {executable}")
+            prefix = executable.name.removesuffix("hdmapping_mcp" + suffix)
+            worker_name = prefix + "hdmapping_worker" + suffix
+            run([executable.with_name(worker_name), "--check-bow-vocabulary"], cwd=temporary)
+            test = contracts[0]
+            command = test["command"][:]
+            properties = {prop["name"]: prop["value"] for prop in test["properties"]}
+            environment = dict(entry.split("=", 1) for entry in properties["ENVIRONMENT"])
+            if "HDMAPPING_MCP_EXECUTABLE" not in environment:
+                raise RuntimeError("MCP contract must explicitly select the shipped executable")
+            environment["HDMAPPING_MCP_EXECUTABLE"] = str(executable)
+            # Run the native test in the same environment as CTest.
+            command[-1:] = ["-run=^TestStdioProduct$", "./cmd/mcp"]
+            run(command, cwd=properties["WORKING_DIRECTORY"], env=dict(os.environ, **environment))
+            if os.name == "nt":
+                # Exercise the pinned PROJ data with relocated runtime DLLs
+                # and an unrelated working directory, as in the worker.
+                georeference = next(test for test in tests if test["name"] == "processing-georeference")
+                probe = executable.with_name("processing_georeference_test.exe")
+                shutil.copy2(georeference["command"][0], probe)
+                run([probe, "--test-case=GNSS CRS projection persists its datum and preserves the WGS84 fix"],
+                    cwd=temporary)
+        elif executable.exists() or any(
+            next(relocated.rglob(f"*{name}*"), None)
+            for name in ("hdmapping_mcp", "hdmapping_coordinator", "hdmapping_worker")
+        ):
+            raise RuntimeError("MCP OFF unexpectedly installed an MCP runtime executable")
+        print(f"PASS: MCP {args.mcp}, relocated product: {relocated}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

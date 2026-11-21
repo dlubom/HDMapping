@@ -28,8 +28,19 @@
 #include <Core/registration_plane_feature.h>
 #include <Core/session.h>
 
+#ifdef HDMAPPING_GUI_BRIDGE
+#include "odometry_capture.h"
+#include "recording_capture.h"
+#include "step1_parameters.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#include <HDMapping/SessionPaths.h>
+#endif
 #include "toml_io.h"
 #include <HDMapping/HDMAPPING_ConfigureInfo.hpp>
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -163,7 +174,9 @@ void publish_trajectory_preview(const std::vector<WorkerData>& source, bool forc
     last_update = now;
 }
 
+#ifndef HDMAPPING_GUI_BRIDGE
 std::string working_directory = "";
+#endif
 bool initial_transformation_gizmo = false;
 
 float m_gizmo[] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
@@ -179,7 +192,9 @@ LidarOdometryParams params;
 std::vector<std::string> csv_files;
 std::vector<std::string> sn_files;
 std::string imuSnToUse;
+#ifndef HDMAPPING_GUI_BRIDGE
 Session session;
+#endif
 
 std::vector<std::vector<Point3Di>> pointsPerFile;
 Imu imu_data;
@@ -197,13 +212,364 @@ std::atomic<double> loEstimatedTimeRemaining{ 0.0 };
 fs::path outwd;
 std::atomic<bool> loLoading{ false };
 std::thread pipelineThread;
+#ifndef HDMAPPING_GUI_BRIDGE
 std::mutex completionMutex;
 std::string completionMessage;
 bool pipelinePending = false;
 bool pendingCompute = true, pendingSave = true;
 std::string pendingFolder;
+#endif
 void startPipeline(const std::string& folder, bool compute, bool save);
 
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace proc = HDMapping::Processing;
+namespace
+{
+    using json = nlohmann::json;
+    std::optional<json> previousOdometryParameters;
+    fs::path recordingDirectory;
+
+    struct PendingStep1
+    {
+        std::string operation;
+        json scope;
+        bool writesState;
+    };
+
+    struct Step1JobView
+    {
+        std::string id;
+        std::string status;
+        std::string message;
+        std::string destination;
+        json progress = json::object();
+        bool finished = false;
+        bool cancelRequested = false;
+    };
+
+    enum class JobRequest
+    {
+        Submit,
+        Poll,
+        Cancel,
+    };
+
+    std::optional<PendingStep1> pendingStep1;
+    std::optional<Step1JobView> step1Job;
+    std::optional<JobRequest> step1JobRequest;
+    std::chrono::steady_clock::time_point nextJobPoll;
+    std::uint64_t requestSequence = 0;
+    std::unique_ptr<proc::GuiStateBridge> guiState;
+    std::unique_ptr<proc::GuiStateConnection> guiConnection;
+
+    json odometryParameters()
+    {
+        auto values = Step1Parameters(params);
+        auto visible = json::array();
+        for (size_t i = 0; i < worker_data.size(); ++i)
+            if (worker_data[i].show)
+                visible.push_back(i);
+        values["selected_chunks"] = std::move(visible);
+        values["range"] = { index_begin, index_end };
+        values["initial_transform"] = std::vector<double>(params.m_g.data(), params.m_g.data() + 16);
+        values["prepared"] = step_1_done;
+        values["processed"] = step_2_done;
+        values["recording_directory"] = sessionPathText(recordingDirectory);
+        return values;
+    }
+
+    bool odometryBusy()
+    {
+        return pendingStep1.has_value() || (step1Job && !step1Job->finished) || guiState->Reserved();
+    }
+
+    proc::StateSummary describeOdometry()
+    {
+        return { {},
+                 odometryParameters(),
+                 { { "step", 1 },
+                   { "busy", odometryBusy() },
+                   { "directory", sessionPathText(recordingDirectory) },
+                   { "chunks", worker_data.size() },
+                   { "prepared", step_1_done } } };
+    }
+
+    proc::MutationResult mutateOdometry(const proc::OperationRequest& request)
+    {
+        if (pendingStep1)
+            return proc::OperationError{ "state_busy", "Odometry owns the prepared data", json::object() };
+        if (request.operation != "step1.set_parameters" || !request.scope.empty() || request.parameters.empty())
+            return proc::OperationError{ "invalid_request", "Expected odometry parameters and an empty scope", json::object() };
+        if (auto error = ApplyStep1Parameters(request.parameters, params))
+            return *error;
+        return describeOdometry();
+    }
+
+    std::unique_ptr<proc::CaptureSource> pinOdometry(const proc::OperationRequest& request)
+    {
+        auto settings = odometryParameters();
+        settings["apply_to_gui"] = true;
+        if (request.scope.contains("recording_directory") &&
+            (request.operation == "step1.load" || request.operation == "step1.prepare" || request.operation == "step1.odometry"))
+        {
+            auto recording = sessionPathFromText(request.scope.at("recording_directory").get<std::string>());
+            std::unique_ptr<proc::CaptureSource> reference;
+            if (!params.reference_points.empty())
+            {
+                static const std::vector<WorkerData> noWorkers;
+                reference = std::make_unique<OdometryCapture>(request.target, noWorkers, params, json::object());
+            }
+            return std::make_unique<proc::RecordingCapture>(
+                request.target, std::move(recording), fs::path{}, std::move(settings), std::move(reference));
+        }
+        std::vector<fs::path> references;
+        if (request.operation == "step1.reference" && request.scope.value("mode", "") == "load")
+            for (const auto& file : request.scope.at("files").get<std::vector<std::string>>())
+                references.push_back(sessionPathFromText(file));
+        return std::make_unique<OdometryCapture>(request.target, worker_data, params, std::move(settings), std::move(references));
+    }
+
+    std::optional<proc::OperationError> applyOdometry(const proc::ArtifactManifest& artifact)
+    {
+        auto snapshot = proc::ReadSnapshot(artifact.snapshot);
+        if (auto* error = std::get_if<proc::OperationError>(&snapshot))
+            return *error;
+        const auto& contents = std::get<proc::SnapshotContents>(snapshot);
+        if (contents.kind != "step1_prepared")
+            return proc::OperationError{ "incompatible_result", "Expected a prepared odometry workspace", json::object() };
+
+        const auto& values = contents.parameters;
+        LidarOdometryParams validated{};
+        if (auto error = ApplyStep1Parameters(values, validated))
+            return error;
+
+        const auto directory = sessionPathFromText(values.value("recording_directory", std::string{}));
+        const auto range = values.value("range", std::array{ -1, -1 });
+        const auto prepared = values.value("prepared", true);
+        const auto processed = values.value("processed", false);
+        const auto hadReferences = !params.reference_points.empty();
+        proc::RunContext context{};
+        if (auto error = RestoreOdometry(contents, worker_data, params, context))
+            return error;
+        ApplyStep1Parameters(values, params);
+
+        step_1_done = prepared;
+        step_2_done = processed;
+        calculations_failed = false;
+        recordingDirectory = directory;
+        index_begin = range[0];
+        index_end = range[1];
+        if (index_end >= 0 && static_cast<std::size_t>(index_end) < worker_data.size() &&
+            !worker_data[index_end].intermediate_trajectory.empty())
+            stretch_gizmo_m = worker_data[index_end].intermediate_trajectory.front();
+        const auto& pose = gizmo_stretch_interval ? stretch_gizmo_m : params.m_g;
+        std::transform(
+            pose.data(),
+            pose.data() + 16,
+            m_gizmo,
+            [](double v)
+            {
+                return static_cast<float>(v);
+            });
+        if (recordingDirectory.empty())
+            SetWindowTitle(winTitle.c_str());
+        else
+            SetWindowTitle((winTitle + " - " + sessionPathText(directory.filename())).c_str());
+        if (!hadReferences && !params.reference_points.empty())
+            show_reference_points = true;
+        trajectory_points_dirty = true;
+        publish_trajectory_preview(worker_data, true);
+        if (!worker_data.empty() && !worker_data.back().intermediate_trajectory.empty())
+            publish_processing_head(worker_data.back().intermediate_trajectory.back().translation());
+        return std::nullopt;
+    }
+
+    void connectOdometry()
+    {
+        guiState = std::make_unique<proc::GuiStateBridge>(
+            proc::GuiStateCallbacks{ describeOdometry,
+                                     mutateOdometry,
+                                     [](proc::TargetRef target)
+                                     {
+                                         return pinOdometry({ {}, std::move(target), json::object(), json::object() });
+                                     },
+                                     applyOdometry,
+                                     pinOdometry });
+        guiConnection = std::make_unique<proc::GuiStateConnection>(*guiState, "lidar_odometry_step_1");
+    }
+
+    void reportJobError(const std::string& message)
+    {
+        step1Job.emplace();
+        step1Job->status = "Failed";
+        step1Job->message = message;
+        step1Job->finished = true;
+    }
+
+    void submitStep1(std::string operation, json scope, bool writesState)
+    {
+        if (odometryBusy())
+            return;
+        step1Job.emplace();
+        step1Job->status = "Submitting";
+        step1Job->destination = scope.value("destination", std::string{});
+        pendingStep1 = PendingStep1{ std::move(operation), std::move(scope), writesState };
+    }
+
+    void submitExport(const fs::path& file, std::string mode, bool selected = false)
+    {
+        try
+        {
+            json scope{ { "mode", std::move(mode) }, { "destination", sessionPathText(fs::absolute(file)) } };
+            if (selected)
+                scope["selected"] = true;
+            submitStep1("step1.export", std::move(scope), false);
+        } catch (const std::exception& error)
+        {
+            reportJobError(error.what());
+        }
+    }
+
+    std::string cloudExportMode(const fs::path& file)
+    {
+        auto extension = file.extension().string();
+        std::ranges::transform(
+            extension,
+            extension.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            });
+        return extension == ".las" ? "las" : "laz";
+    }
+
+    void recordJob(const json& record)
+    {
+        auto& job = *step1Job;
+        job.id = record.at("job_id").get<std::string>();
+        job.status = record.at("status").get<std::string>();
+        job.progress = record.at("progress");
+        const auto apply = record.value("gui_apply_status", std::string{});
+        job.finished = job.status == "failed" || job.status == "interrupted" || job.status == "cancelled" ||
+            (job.status == "completed" && apply != "pending");
+        job.message.clear();
+        if (record.contains("error"))
+            job.message = record.at("error").value("message", std::string{});
+        else if (job.status == "completed")
+        {
+            if (apply == "pending")
+                job.message = "Applying result";
+            else if (apply != "applied" && apply != "not_requested")
+                job.message = "Result saved. Workspace update: " + apply;
+        }
+    }
+
+    void pollStep1Job(bool closing = false)
+    {
+        using namespace std::chrono_literals;
+        if (auto reply = guiConnection->TakeJobReply())
+        {
+            const auto action = *step1JobRequest;
+            step1JobRequest.reset();
+            if (action == JobRequest::Submit)
+                pendingStep1.reset();
+            if (const auto* error = std::get_if<proc::OperationError>(&*reply))
+            {
+                if (action == JobRequest::Submit || (action == JobRequest::Poll && error->code != "job_transport_failed"))
+                    reportJobError(error->message);
+                else if (step1Job)
+                    step1Job->message = error->message;
+            }
+            else
+                recordJob(std::get<json>(*reply));
+        }
+        if (step1JobRequest)
+            return;
+        if (pendingStep1)
+        {
+            auto& pending = *pendingStep1;
+            if (pending.scope.contains("recording_directory"))
+                guiState->Open();
+            const auto target = guiState->Target();
+            json operation{ { "operation", pending.operation },
+                            { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                            { "scope", pending.scope },
+                            { "parameters", json::object() } };
+            guiConnection->RequestJob(
+                "jobs.submit",
+                { { "request_key", target.state_id + "-" + std::to_string(++requestSequence) },
+                  { "operation", std::move(operation) },
+                  { "capture_source", target.state_id },
+                  { "source", "gui" },
+                  { "access", pending.writesState ? "mutate" : "read" } });
+            step1JobRequest = JobRequest::Submit;
+            return;
+        }
+        if (closing || !step1Job || step1Job->finished)
+            return;
+        if (step1Job->cancelRequested)
+        {
+            guiConnection->RequestJob("jobs.cancel", step1Job->id);
+            step1JobRequest = JobRequest::Cancel;
+            step1Job->cancelRequested = false;
+        }
+        else if (std::chrono::steady_clock::now() >= nextJobPoll)
+        {
+            guiConnection->RequestJob("jobs.get", step1Job->id);
+            step1JobRequest = JobRequest::Poll;
+            nextJobPoll = std::chrono::steady_clock::now() + 400ms;
+        }
+    }
+
+    void step1JobWindow()
+    {
+        if (!step1Job)
+            return;
+        auto& job = *step1Job;
+        ImGui::Begin("Step 1 job", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::TextUnformatted(job.status.c_str());
+        if (!job.id.empty())
+            ImGui::Text("Job %s", job.id.c_str());
+        const auto& progress = job.progress;
+        const auto label = progress.value("stage", std::string{});
+        const auto total = progress.value("total", 0.0);
+        if (!job.finished && total > 0)
+        {
+            const auto fraction = std::clamp(progress.value("current", 0.0) / total, 0.0, 1.0);
+            ImGui::ProgressBar(static_cast<float>(fraction), ImVec2(-1.0f, 0.0f), label.c_str());
+#ifdef _WIN32
+            SetTaskbarProgress(fraction);
+#endif
+        }
+        else if (!job.finished && !label.empty())
+            ImGui::TextUnformatted(label.c_str());
+        if (const auto message = progress.value("message", std::string{}); !job.finished && !message.empty())
+            ImGui::TextWrapped("%s", message.c_str());
+        if (!job.message.empty())
+            ImGui::TextWrapped("%s", job.message.c_str());
+        if (job.status == "completed" && !job.destination.empty())
+            ImGui::TextWrapped("%s", job.destination.c_str());
+        if (job.finished)
+        {
+#ifdef _WIN32
+            ClearTaskbarProgress();
+#endif
+            if (ImGui::Button("Dismiss"))
+                step1Job.reset();
+        }
+        else if (!job.id.empty() && job.status != "cancelling" && job.status != "completed")
+        {
+            ImGui::BeginDisabled(job.cancelRequested || step1JobRequest == JobRequest::Cancel);
+            if (ImGui::Button("Cancel job"))
+                job.cancelRequested = true;
+            ImGui::EndDisabled();
+        }
+        ImGui::End();
+    }
+} // namespace
+#endif
+
+#ifndef HDMAPPING_GUI_BRIDGE
 static void resources_gui()
 {
     if (!params.run_report || !ImGui::CollapsingHeader("Resources", ImGuiTreeNodeFlags_DefaultOpen))
@@ -261,6 +627,7 @@ static void resources_gui()
         static_cast<double>(live.cachePeak) / (1024 * 1024));
     ImGui::TextDisabled("Commit is not physical pagefile usage. Peaks are sampled within this run.");
 }
+#endif
 
 #if _WIN32
 #define DEFAULT_PATH "C:\\"
@@ -269,33 +636,6 @@ static void resources_gui()
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////
-
-void set_lidar_odometry_default_params(LidarOdometryParams& params)
-{
-    params.decimation = 0.01;
-    params.in_out_params_indoor.resolution_X = 0.1;
-    params.in_out_params_indoor.resolution_Y = 0.1;
-    params.in_out_params_indoor.resolution_Z = 0.1;
-
-    params.in_out_params_outdoor.resolution_X = 0.3;
-    params.in_out_params_outdoor.resolution_Y = 0.3;
-    params.in_out_params_outdoor.resolution_Z = 0.3;
-
-    params.filter_threshold_xy_inner = 0.3;
-    params.filter_threshold_xy_outer = 70.0;
-    params.threshould_output_filter = 0.3;
-
-    params.use_robust_and_accurate_lidar_odometry = false;
-    params.distance_bucket = 0.2;
-    params.polar_angle_deg = 10.0;
-    params.azimutal_angle_deg = 10.0;
-    params.robust_and_accurate_lidar_odometry_iterations = 20;
-
-    params.max_distance_lidar = 70.0;
-    params.nr_iter = 1000;
-    params.sliding_window_trajectory_length_threshold = 200;
-    params.real_time_threshold_seconds = 10;
-}
 
 // Helper function to format time in human-readable format
 std::string formatTime(double seconds)
@@ -691,6 +1031,7 @@ Eigen::Vector3d GLWidgetGetOGLPos(int x, int y, const ObservationPicking& observ
     return pos;
 }
 
+#ifndef HDMAPPING_GUI_BRIDGE
 void step1(const std::string& input_folder_name, const std::atomic<bool>& loPause)
 {
     trajectory_points_dirty = true;
@@ -757,6 +1098,7 @@ void step2(const std::atomic<bool>& loPause)
         calculations_failed = true;
     }
 }
+#endif
 
 void settings_gui()
 {
@@ -861,11 +1203,8 @@ void settings_gui()
         if (!simple_gui)
         {
             ImGui::SetNextItemWidth(ImGuiNumberWidth);
-            ImGui::InputInt("Threshold nr poses", &params.threshold_nr_poses);
-            if (params.threshold_nr_poses < 1)
-            {
-                params.threshold_nr_poses = 1;
-            }
+            if (ImGui::InputInt("Threshold nr poses", &params.threshold_nr_poses))
+                params.threshold_nr_poses = std::max(1, params.threshold_nr_poses);
 
             ImGui::NewLine();
         }
@@ -910,53 +1249,24 @@ void settings_gui()
             ImGui::NewLine();
             ImGui::Text("NDT bucket size (inner/outer)");
             ImGui::PushItemWidth(ImGuiNumberWidth);
-            ImGui::InputDouble("##x", &params.in_out_params_indoor.resolution_X, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(xText);
-            if (params.in_out_params_indoor.resolution_X < 0.01)
+            const auto editResolution = [](const char* label, double& resolution, const char* tooltip)
             {
-                params.in_out_params_indoor.resolution_X = 0.01;
-            }
+                if (ImGui::InputDouble(label, &resolution, 0.0, 0.0, "%.3f"))
+                    resolution = std::max(0.01, resolution);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", tooltip);
+            };
+            editResolution("##x", params.in_out_params_indoor.resolution_X, xText);
             ImGui::SameLine();
-            ImGui::InputDouble("X##ndt", &params.in_out_params_outdoor.resolution_X, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(xText);
-            if (params.in_out_params_outdoor.resolution_X < 0.01)
-            {
-                params.in_out_params_outdoor.resolution_X = 0.01;
-            }
+            editResolution("X##ndt", params.in_out_params_outdoor.resolution_X, xText);
 
-            ImGui::InputDouble("##y", &params.in_out_params_indoor.resolution_Y, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(yText);
-            if (params.in_out_params_indoor.resolution_Y < 0.01)
-            {
-                params.in_out_params_indoor.resolution_Y = 0.01;
-            }
+            editResolution("##y", params.in_out_params_indoor.resolution_Y, yText);
             ImGui::SameLine();
-            ImGui::InputDouble("Y##ndt", &params.in_out_params_outdoor.resolution_Y, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(yText);
-            if (params.in_out_params_outdoor.resolution_Y < 0.01)
-            {
-                params.in_out_params_outdoor.resolution_Y = 0.01;
-            }
+            editResolution("Y##ndt", params.in_out_params_outdoor.resolution_Y, yText);
 
-            ImGui::InputDouble("##z", &params.in_out_params_indoor.resolution_Z, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(zText);
-            if (params.in_out_params_indoor.resolution_Z < 0.01)
-            {
-                params.in_out_params_indoor.resolution_Z = 0.01;
-            }
+            editResolution("##z", params.in_out_params_indoor.resolution_Z, zText);
             ImGui::SameLine();
-            ImGui::InputDouble("Z##ndt", &params.in_out_params_outdoor.resolution_Z, 0.0, 0.0, "%.3f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(zText);
-            if (params.in_out_params_outdoor.resolution_Z < 0.01)
-            {
-                params.in_out_params_outdoor.resolution_Z = 0.01;
-            }
+            editResolution("Z##ndt", params.in_out_params_outdoor.resolution_Z, zText);
 
             ImGui::NewLine();
 
@@ -984,9 +1294,10 @@ void settings_gui()
             if (!params.use_vqf)
             {
                 // Fusion-specific parameters
-                static int fusionConvention; // 0=NWU, 1=ENU, 2=NED
-                if (fusionConvention < 0 || fusionConvention > 2)
-                    fusionConvention = 0;
+                int fusionConvention = params.fusionConventionNwu ? 0
+                    : params.fusionConventionEnu                  ? 1
+                    : params.fusionConventionNed                  ? 2
+                                                                  : -1;
 
                 ImGui::Text("Fusion convention: ");
                 if (ImGui::IsItemHovered())
@@ -994,21 +1305,24 @@ void settings_gui()
                         "Coordinate system conventions for sensor fusion defining how the axes are oriented relative to world frame");
 
                 ImGui::SameLine();
-                ImGui::RadioButton("NWU", &fusionConvention, 0);
+                bool conventionChanged = ImGui::RadioButton("NWU", &fusionConvention, 0);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("North West Up");
                 ImGui::SameLine();
-                ImGui::RadioButton("ENU", &fusionConvention, 1);
+                conventionChanged |= ImGui::RadioButton("ENU", &fusionConvention, 1);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("East North Up");
                 ImGui::SameLine();
-                ImGui::RadioButton("NED", &fusionConvention, 2);
+                conventionChanged |= ImGui::RadioButton("NED", &fusionConvention, 2);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("North East Down");
 
-                params.fusionConventionNwu = (fusionConvention == 0);
-                params.fusionConventionEnu = (fusionConvention == 1);
-                params.fusionConventionNed = (fusionConvention == 2);
+                if (conventionChanged)
+                {
+                    params.fusionConventionNwu = (fusionConvention == 0);
+                    params.fusionConventionEnu = (fusionConvention == 1);
+                    params.fusionConventionNed = (fusionConvention == 2);
+                }
 
                 ImGui::InputDouble("Fusion gain", &params.fusion_gain, 0.0, 0.0, "%.3f");
                 if (ImGui::IsItemHovered())
@@ -1226,8 +1540,12 @@ void settings_gui()
         {
             if (ImGui::Button("Point cloud consistency and trajectory smoothness"))
             {
+#ifdef HDMAPPING_GUI_BRIDGE
+                submitStep1("step1.consistency", json::object(), true);
+#else
                 run_consistency(worker_data, params);
                 trajectory_points_dirty = true;
+#endif
             }
             if (ImGui::IsItemHovered())
             {
@@ -1260,9 +1578,14 @@ void settings_gui()
 
                 if (output_file_name.size() > 0)
                 {
+#ifdef HDMAPPING_GUI_BRIDGE
+                    const auto file = sessionPathFromText(output_file_name);
+                    submitExport(file, cloudExportMode(file));
+#else
                     session.fill_session_from_worker_data(worker_data, false, true, true, params.threshould_output_filter);
                     // save_all_to_las(session, output_file_name, false);
                     save_all_to_las(session, output_file_name, true, true);
+#endif
                 }
             }
         }
@@ -1333,23 +1656,47 @@ void settings_gui()
 
                 if (output_file_name.size() > 0)
                 {
+#ifdef HDMAPPING_GUI_BRIDGE
+                    submitExport(sessionPathFromText(output_file_name), "trajectory");
+#else
                     save_trajectory_to_ascii(worker_data, output_file_name);
+#endif
                 }
             }
 
             ImGui::NewLine();
             ImGui::Text("Reference point clouds for initial alignment:");
 
+#ifndef HDMAPPING_GUI_BRIDGE
             static std::vector<std::string> input_file_names;
+#endif
 
             if (ImGui::Button("Load laz/las files"))
             {
+#ifdef HDMAPPING_GUI_BRIDGE
+                const auto input_file_names = mandeye::fd::OpenFileDialog("Load laz/las files", mandeye::fd::LAS_LAZ_filter, true);
+                if (!input_file_names.empty())
+                {
+                    try
+                    {
+                        auto files = json::array();
+                        for (const auto& input : input_file_names)
+                            files.push_back(sessionPathText(fs::absolute(sessionPathFromText(input))));
+                        show_reference_points = true;
+                        submitStep1("step1.reference", { { "mode", "load" }, { "files", std::move(files) } }, true);
+                    } catch (const std::exception& error)
+                    {
+                        reportJobError(error.what());
+                    }
+                }
+#else
                 input_file_names = mandeye::fd::OpenFileDialog("Load laz/las files", mandeye::fd::LAS_LAZ_filter, true);
                 if (input_file_names.size() > 0)
                 {
                     show_reference_points = true;
                     load_reference_point_clouds(input_file_names, params);
                 }
+#endif
             }
 
             if (ImGui::Button("Set parameters for drone with Ouster (https://ntu-aris.github.io/ntu_viral_dataset/)"))
@@ -1364,7 +1711,11 @@ void settings_gui()
                 params.in_out_params_outdoor.resolution_Z = 2.0;
             }
 
+#ifdef HDMAPPING_GUI_BRIDGE
+            if (!params.reference_points.empty())
+#else
             if (!input_file_names.empty())
+#endif
             {
                 ImGui::Checkbox("Show points", &show_reference_points);
                 ImGui::SameLine();
@@ -1374,7 +1725,11 @@ void settings_gui()
 
                 if (ImGui::Button("Filter reference buckets"))
                 {
+#ifdef HDMAPPING_GUI_BRIDGE
+                    submitStep1("step1.reference", { { "mode", "filter" } }, true);
+#else
                     filter_reference_buckets(params);
+#endif
                 }
             }
 
@@ -1407,10 +1762,14 @@ void settings_gui()
                 {
                     if (ImGui::Button("Align to reference"))
                     {
+#ifdef HDMAPPING_GUI_BRIDGE
+                        submitStep1("step1.reference", { { "mode", "align" } }, true);
+#else
                         for (int i = 0; i < 30; i++)
                         {
                             align_to_reference(params.in_out_params_indoor, params.initial_points, params.m_g, params.buckets_indoor);
                         }
+#endif
                     }
                 }
             }
@@ -1531,6 +1890,13 @@ void settings_gui()
                 if (ImGui::Button("Export selected scans"))
                 {
                     auto output_file_name = mandeye::fd::SaveFileDialog("Save las/laz file", mandeye::fd::LAS_LAZ_filter, ".laz");
+#ifdef HDMAPPING_GUI_BRIDGE
+                    if (!output_file_name.empty())
+                    {
+                        const auto file = sessionPathFromText(output_file_name);
+                        submitExport(file, cloudExportMode(file), true);
+                    }
+#else
                     Eigen::Affine3d pose;
                     if (output_file_name.size() > 0)
                     {
@@ -1563,6 +1929,7 @@ void settings_gui()
                               << "0.0208355 -0.0634754 0.997766 0.0028499" << std::endl
                               << "0 0 0 1" << std::endl;
                     std::cout << "................................................." << std::endl;
+#endif
                 }
 
                 ImGui::SameLine();
@@ -1574,7 +1941,11 @@ void settings_gui()
 
                     if (output_file_name.size() > 0)
                     {
+#ifdef HDMAPPING_GUI_BRIDGE
+                        submitExport(sessionPathFromText(output_file_name), "poses", true);
+#else
                         session.point_clouds_container.save_poses(fs::path(output_file_name).string(), false);
+#endif
                     }
                 }
 
@@ -1612,6 +1983,9 @@ void settings_gui()
 
                     if (ImGui::Button("Accept Gizmo (only translation)"))
                     {
+#ifdef HDMAPPING_GUI_BRIDGE
+                        guiState->Changed();
+#endif
                         if (index_end < worker_data.size())
                         {
                             if (worker_data[index_end].intermediate_trajectory.size() > 0)
@@ -1731,6 +2105,7 @@ void settings_gui()
     ImGui::End();
 }
 
+#ifndef HDMAPPING_GUI_BRIDGE
 static void recording_span_gui()
 {
     const auto seconds = params.run_report ? params.run_report->recordingSeconds() : std::nullopt;
@@ -1860,9 +2235,9 @@ void progress_window()
 
     ImGui::End();
 }
+#endif
 
 //! folder: Mandeye data folder to process; empty asks for one with a folder dialog.
-//! Loading and processing share one owned worker; drawing is suspended only during initial preparation.
 void openData(const std::string& folder = "")
 {
     const std::string input_folder_name = folder.empty() ? mandeye::fd::SelectFolder("Select Mandeye data folder") : folder;
@@ -1872,14 +2247,40 @@ void openData(const std::string& folder = "")
 
 void startPipeline(const std::string& folder, bool compute, bool save)
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (odometryBusy())
+        return;
+    try
+    {
+        auto scope = json::object();
+        const auto recording = folder.empty() ? fs::path{} : fs::absolute(sessionPathFromText(folder));
+        if (!recording.empty())
+            scope["recording_directory"] = sessionPathText(recording);
+        if (save)
+        {
+            const auto& directory = recording.empty() ? recordingDirectory : recording;
+            scope["destination"] = sessionPathText(fs::absolute(get_next_result_path(directory)));
+        }
+        if (compute)
+            scope["save"] = save;
+        if ((compute || !recording.empty()) && full_debug_messages)
+            scope["debug"] = true;
+        submitStep1(compute ? "step1.odometry" : save ? "step1.save" : "step1.load", std::move(scope), compute || !recording.empty());
+    } catch (const std::exception& error)
+    {
+        reportJobError(error.what());
+    }
+#else
     if (loRunning)
         return;
     pendingFolder = folder;
     pendingCompute = compute;
     pendingSave = save;
     pipelinePending = true;
+#endif
 }
 
+#ifndef HDMAPPING_GUI_BRIDGE
 static void launchPipeline(const std::string& folder, bool compute, bool save)
 {
     if (loRunning)
@@ -1983,6 +2384,7 @@ static void launchPipeline(const std::string& folder, bool compute, bool save)
             loRunning = false;
         });
 }
+#endif
 
 bool step1(
     const std::string& folder,
@@ -2033,6 +2435,9 @@ bool step2(std::vector<WorkerData>& worker_data, LidarOdometryParams& params, co
 //! window open until display() sees the run parked or finished (quit_abandoned_run()).
 bool confirm_close()
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    return true;
+#else
     if (!loRunning)
         return true;
     if (loQuitting)
@@ -2049,8 +2454,10 @@ bool confirm_close()
     if (!loLoading)
         loPause.store(true);
     return false;
+#endif
 }
 
+#ifndef HDMAPPING_GUI_BRIDGE
 //! The detached run thread can't be joined and still uses the globals, so the process ends
 //! without destructors, after removing the cache the parked (or finished) run no longer reads.
 static void quit_abandoned_run()
@@ -2071,9 +2478,24 @@ static void quit_abandoned_run()
     remove_cache(params);
     std::_Exit(0);
 }
+#endif
 
 void display()
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (!guiState->Reserved())
+    {
+        auto current = odometryParameters();
+        if (previousOdometryParameters && *previousOdometryParameters != current)
+            guiState->Changed();
+        previousOdometryParameters = std::move(current);
+    }
+    pollStep1Job();
+    const auto before = guiState->Target();
+    guiConnection->Poll();
+    if (before != guiState->Target())
+        previousOdometryParameters = odometryParameters();
+#else
     if (pipelinePending)
     {
         pipelinePending = false;
@@ -2118,6 +2540,7 @@ void display()
             popup.result();
         }
     }
+#endif
     const bool trajectory_running = loRunning.load();
     const auto [preview, head] = [] // retain an immutable snapshot for this whole frame
     {
@@ -2338,17 +2761,50 @@ void display()
 
     view_kbd_shortcuts();
 
+#ifdef HDMAPPING_GUI_BRIDGE
+    step1JobWindow();
+    if (odometryBusy())
+    {
+        // Rendering and camera input above remain live during snapshot transfer.
+        takeDroppedFiles();
+        if (guiState->Reserved() && !step1Job)
+            ImGui::TextUnformatted("Processing data reserved");
+        end3DAndDrawLabels();
+        if (compass_ruler)
+            drawMiniCompassWithRuler();
+        rlImGuiEnd();
+        return;
+    }
+#endif
     // Drag and drop: a Mandeye data folder, or any file in one, is processed like "Load & process scanning".
     const auto dropped = takeDroppedFiles();
-    if (!dropped.empty() && !loRunning && !pipelinePending)
+#ifdef HDMAPPING_GUI_BRIDGE
+    const auto canOpen = []
     {
+        return !odometryBusy();
+    };
+#else
+    const auto canOpen = []
+    {
+        return !loRunning && !pipelinePending;
+    };
+#endif
+    if (!dropped.empty() && canOpen())
+    {
+#ifdef HDMAPPING_GUI_BRIDGE
+        auto folder = sessionPathFromText(dropped[0]);
+        if (!fs::is_directory(folder))
+            folder = folder.parent_path();
+        openData(sessionPathText(folder));
+#else
         fs::path folder(dropped[0]);
         if (!fs::is_directory(folder))
             folder = folder.parent_path();
         openData(folder.string());
+#endif
     }
 
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false) && !loRunning && !pipelinePending)
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false) && canOpen())
     {
         openData();
 
@@ -2563,9 +3019,15 @@ void display()
 
             if (ImGui::BeginMenu("View"))
             {
+#ifdef HDMAPPING_GUI_BRIDGE
+                ImGui::BeginDisabled(params.initial_points.empty() && params.reference_points.empty());
+#else
                 ImGui::BeginDisabled(!(session.point_clouds_container.point_clouds.size() > 0));
+#endif
                 {
+#ifndef HDMAPPING_GUI_BRIDGE
                     auto tmp = point_size;
+#endif
                     ImGui::SetNextItemWidth(ImGuiNumberWidth);
                     ImGui::InputInt("Points size", &point_size);
                     if (ImGui::IsItemHovered())
@@ -2575,9 +3037,11 @@ void display()
                     else if (point_size > 10)
                         point_size = 10;
 
+#ifndef HDMAPPING_GUI_BRIDGE
                     if (tmp != point_size)
                         for (auto& point_cloud : session.point_clouds_container.point_clouds)
                             point_cloud.point_size = point_size;
+#endif
 
                     ImGui::Separator();
                 }
@@ -2725,14 +3189,20 @@ void display()
         settings_gui();
     }
 
+#ifndef HDMAPPING_GUI_BRIDGE
     if (loRunning)
         progress_window();
+#endif
 
     cor_window();
 
     if (info_gui)
     {
+#ifdef HDMAPPING_GUI_BRIDGE
+        infoLines[infoLines.size() - 2] = "It saves session file in " + sessionPathText(recordingDirectory / "lio_result_*");
+#else
         infoLines[infoLines.size() - 2] = "It saves session file in " + working_directory + "\\lio_result_*";
+#endif
         info_window(infoLines, appShortcuts);
     }
 
@@ -2911,7 +3381,21 @@ int main(int argc, char* argv[])
             InitTaskbarProgress();
 #endif
 
+#ifdef HDMAPPING_GUI_BRIDGE
+            connectOdometry();
+#endif
             mainLoop(confirm_close);
+#ifdef HDMAPPING_GUI_BRIDGE
+            SetWindowState(FLAG_WINDOW_HIDDEN);
+            // Submit may be awaiting the capture reservation on this window thread.
+            while (pendingStep1)
+            {
+                pollStep1Job(true);
+                guiConnection->Poll();
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            guiConnection->Close();
+#endif
             if (pipelineThread.joinable())
                 pipelineThread.join();
 

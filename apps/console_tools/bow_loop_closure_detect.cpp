@@ -57,7 +57,7 @@ int main(int argc, char* argv[])
 
     auto chunk_frames = bow_loop_closure::associateFramesToChunks(session.point_clouds_container, frames, params.max_frame_time_gap_ns);
 
-    std::string vocab_path = bow_loop_closure::defaultVocabularyPath();
+    const auto vocab_path = bow_loop_closure::defaultVocabularyPath();
     std::unique_ptr<fbow::Vocabulary> vocabulary;
     try
     {

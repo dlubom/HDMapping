@@ -6,6 +6,8 @@
 #include <Core/point_clouds.h>
 #include <Core/tum.h>
 
+#include <functional>
+
 class PoseGraphLoopClosure
 {
 public:
@@ -28,7 +30,7 @@ public:
         bool is_fixed_om = false;
         bool is_fixed_fi = false;
         bool is_fixed_ka = false;
-        EdgeType type;
+        EdgeType type = loop_closure;
     };
 
     std::vector<Edge> edges;
@@ -59,10 +61,18 @@ public:
     PoseGraphLoopClosure() {};
     ~PoseGraphLoopClosure() {};
 
+    //! Construct a manual edge from the current endpoint poses and default information weights.
+    static Edge make_edge(const PointClouds& clouds, int from, int to);
     void add_edge(PointClouds& point_clouds_container, int index_loop_closure_source, int index_loop_closure_target);
     void set_initial_poses_as_motion_model(PointClouds& point_clouds_container);
     void set_current_poses_as_motion_model(PointClouds& point_clouds_container);
-    void graph_slam(PointClouds& point_clouds_container, GNSS& gnss, GroundControlPoints& gcps, ControlPoints& cps);
+    //! Optimize the graph. Return false on solver failure or when the iteration callback asks to stop.
+    bool graph_slam(
+        PointClouds& point_clouds_container,
+        GNSS& gnss,
+        GroundControlPoints& gcps,
+        ControlPoints& cps,
+        const std::function<bool(int, int)>& continue_iteration = {});
     void FuseTrajectoryWithGNSS(PointClouds& point_clouds_container, GNSS& gnss);
     void FuseTrajectoryWithTUM(PointClouds& point_clouds_container, TUM& tum);
     //! Refines one edge's relative pose with point-to-point ICP between its two scans (each extended by its

@@ -8,6 +8,7 @@
 #include <tbb/parallel_invoke.h>
 
 #include <Core/hash_utils.h>
+#include <HDMapping/SessionPaths.h>
 
 #include <spdlog/spdlog.h>
 
@@ -399,7 +400,8 @@ bool save_poses(const std::string& file_name, const std::vector<Eigen::Affine3d>
     return static_cast<bool>(outfile);
 }
 
-std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector3f>> load_imu(const std::string& imu_file, int imuToUse)
+std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector3f>> load_imu(
+    const std::string& imu_file, int imuToUse, bool validate, std::stop_token stop)
 {
     std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector3f>> all_data;
 
@@ -426,6 +428,8 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
         bool is_legacy = true;
         if (hasTsColumn)
         {
+            if (validate && (!hasAccsColumns || !hasGyrosColumns))
+                throw std::invalid_argument("Missing mandatory IMU CSV columns");
             is_legacy = false;
             if (!hasAccsColumns && !hasGyrosColumns && !hasUnixTimestampColumn)
             {
@@ -440,6 +444,8 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
             // check if all needed columns are in csv
             for (auto row : reader)
             {
+                if (stop.stop_requested())
+                    return {};
                 int imu_id = -1;
                 if (hasImuIdColumn)
                 {
@@ -448,9 +454,11 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
                 if (imu_id < 0 || imuToUse == imu_id)
                 {
                     double timestamp = row["timestamp"].get<double>();
-                    double timestampUnix = row["timestampUnix"].get<double>();
+                    double timestampUnix = !validate || hasUnixTimestampColumn ? row["timestampUnix"].get<double>() : 0.0;
                     Eigen::Vector3f gyr(row["gyroX"].get<float>(), row["gyroY"].get<float>(), row["gyroZ"].get<float>());
                     Eigen::Vector3f acc(row["accX"].get<float>(), row["accY"].get<float>(), row["accZ"].get<float>());
+                    if (validate && (!std::isfinite(timestamp) || !std::isfinite(timestampUnix) || !gyr.allFinite() || !acc.allFinite()))
+                        throw std::invalid_argument("Non-finite IMU sample");
                     all_data.emplace_back(std::pair(timestamp / 1e9, timestampUnix / 1e9), gyr, acc);
                 }
             }
@@ -460,15 +468,22 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
             std::ifstream myfile(imu_file);
             if (myfile.is_open())
             {
-                while (myfile)
+                bool repeatLastSample = false;
+                for (std::string line; std::getline(myfile, line);)
                 {
+                    repeatLastSample = false;
+                    if (stop.stop_requested())
+                        return {};
                     double data[7];
                     double timestampUnix = 0.0;
                     int imuId = 0;
-                    std::string line;
-                    std::getline(myfile, line);
                     std::istringstream iss(line);
-                    iss >> data[0] >> data[1] >> data[2] >> data[3] >> data[4] >> data[5] >> data[6];
+                    if (!(iss >> data[0] >> data[1] >> data[2] >> data[3] >> data[4] >> data[5] >> data[6]))
+                    {
+                        if (validate && line.find_first_not_of(" \t\r") != std::string::npos)
+                            throw std::invalid_argument("Invalid legacy IMU sample");
+                        continue;
+                    }
                     if (!iss.eof())
                     {
                         iss >> imuId;
@@ -483,14 +498,27 @@ std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector
                         Eigen::Vector3f gyr(static_cast<float>(data[1]), static_cast<float>(data[2]), static_cast<float>(data[3]));
                         Eigen::Vector3f acc(static_cast<float>(data[4]), static_cast<float>(data[5]), static_cast<float>(data[6]));
 
+                        if (validate && (!std::isfinite(data[0]) || !std::isfinite(timestampUnix) || !gyr.allFinite() || !acc.allFinite()))
+                            throw std::invalid_argument("Non-finite legacy IMU sample");
                         all_data.emplace_back(std::pair(data[0] / 1e9, timestampUnix / 1e9), gyr, acc);
+                        repeatLastSample = imuId == 0 && !myfile.eof();
                     }
+                }
+                // Legacy odometry revisits the last IMU 0 sample at the closing newline.
+                // Preserve the zero-time AHRS update using the parsed sample.
+                if (repeatLastSample)
+                {
+                    auto sample = all_data.back();
+                    std::get<0>(sample).second = 0.0;
+                    all_data.push_back(std::move(sample));
                 }
                 myfile.close();
             }
         }
     } catch (const std::exception& e)
     {
+        if (validate)
+            throw std::invalid_argument("Cannot read IMU " + imu_file + ": " + e.what());
         std::cout << "load_imu error for file: '" << imu_file << "'" << e.what() << std::endl;
         // return all_data;
     }
@@ -535,37 +563,41 @@ std::vector<Point3Di> load_point_cloud(
     double filter_threshold_xy_inner,
     double filter_threshold_xy_outer,
     const std::unordered_map<int, Eigen::Affine3d>& calibrations,
-    std::vector<uint16_t>* rings)
+    std::vector<uint16_t>* rings,
+    bool validate,
+    std::stop_token stop)
 {
     std::vector<Point3Di> points;
-    laszip_POINTER laszip_reader;
-    if (laszip_create(&laszip_reader))
+    const auto fail = [&](const char* action)
     {
-        spdlog::error("DLL ERROR: creating laszip reader");
+        if (validate)
+            throw std::invalid_argument(std::string(action) + ": " + lazFile);
+        spdlog::error("{}: {}", action, lazFile);
         std::abort();
-    }
-
+    };
+    laszip_POINTER laszip_reader = nullptr;
+    if (laszip_create(&laszip_reader))
+        fail("Cannot initialize LAS reader");
+    bool open = false;
+    const auto close = [&](void* reader)
+    {
+        if (open)
+            laszip_close_reader(reader);
+        laszip_destroy(reader);
+    };
+    const std::unique_ptr<void, decltype(close)> owner(laszip_reader, close);
     laszip_BOOL is_compressed = 0;
     if (laszip_open_reader(laszip_reader, lazFile.c_str(), &is_compressed))
-    {
-        spdlog::error("DLL ERROR: opening laszip reader for '{}'\n", lazFile);
-        std::abort();
-    }
+        fail("Cannot open LAS or LAZ file");
+    open = true;
 
-    laszip_header* header;
-
+    laszip_header* header = nullptr;
     if (laszip_get_header_pointer(laszip_reader, &header))
-    {
-        spdlog::error("DLL ERROR: getting header pointer from laszip reader");
-        std::abort();
-    }
+        fail("Cannot read LAS header");
 
-    laszip_point* point;
+    laszip_point* point = nullptr;
     if (laszip_get_point_pointer(laszip_reader, &point))
-    {
-        spdlog::error("DLL ERROR: getting point pointer from laszip reader");
-        std::abort();
-    }
+        fail("Cannot read LAS point layout");
 
     int counter_ts0 = 0;
     int counter_filtered_points = 0;
@@ -579,12 +611,14 @@ std::vector<Point3Di> load_point_cloud(
 
     for (laszip_U32 j = 0; j < header->number_of_point_records; j++)
     {
+        if ((j % 4096) == 0 && stop.stop_requested())
+            return {};
         if (laszip_read_point(laszip_reader))
         {
             spdlog::error("DLL ERROR: reading point {}", j);
-            laszip_close_reader(laszip_reader);
+            if (validate)
+                fail("Cannot read LAS point");
             return points;
-            // std::abort();
         }
 
         Point3Di p;
@@ -610,6 +644,8 @@ std::vector<Point3Di> load_point_cloud(
         p.lidarid = id;
         p.timestamp = point->gps_time;
         p.intensity = point->intensity;
+        if (validate && (!p.point.allFinite() || !std::isfinite(p.timestamp)))
+            fail("Non-finite LAS point");
         if (has_rgb)
         {
             p.rgb[0] = static_cast<uint8_t>(point->rgb[0] >> 8);
@@ -652,7 +688,6 @@ std::vector<Point3Di> load_point_cloud(
     }
     std::cout << std::endl;
 
-    laszip_close_reader(laszip_reader);
     return points;
 }
 
@@ -718,7 +753,7 @@ inline bool JsonGetBool(const nlohmann::json& obj, const char* key, bool default
     return defaultValue;
 }
 
-std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFile(const std::string& filename)
+std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFile(const std::string& filename, bool validate)
 {
     std::unordered_map<std::string, Eigen::Affine3d> dataMap;
     std::ifstream file;
@@ -728,6 +763,8 @@ std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFi
     file.open(filename);
     if (!file)
     {
+        if (validate && !filename.empty())
+            throw std::invalid_argument("Cannot read calibration file " + filename);
         std::cerr << "Cannot open file '" << filename << "'" << std::endl;
         return {};
     }
@@ -737,12 +774,28 @@ std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFi
         jsonData = json::parse(file);
     } catch (const json::exception& e)
     {
+        if (validate)
+            throw std::invalid_argument("Cannot read calibration file " + filename + ": " + e.what());
         std::cerr << "JSON parsing error in file '" << filename << "': " << e.what() << std::endl;
         return {};
     }
 
     if (!jsonData.contains("calibration"))
+    {
+        auto extension = fs::path(filename).extension().string();
+        std::ranges::transform(
+            extension,
+            extension.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            });
+        if (validate && extension == ".mjc")
+            throw std::invalid_argument("Missing calibration object in " + filename);
         return {};
+    }
+    if (!jsonData["calibration"].is_object())
+        throw std::invalid_argument("Invalid calibration object in " + filename);
 
     // Iterate through the JSON object and parse each value into Eigen::Affine3d
     for (auto& calibrationEntry : jsonData["calibration"].items())
@@ -757,9 +810,10 @@ std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFi
             continue;
         }
 
-        assert(calibrationEntry.value().contains("data"));
-        const auto matrixRawData = calibrationEntry.value()["data"];
-        assert(matrixRawData.size() == 16);
+        const auto& entry = calibrationEntry.value();
+        if (!entry.contains("data") || !entry["data"].is_array() || entry["data"].size() != 16)
+            throw std::invalid_argument("Invalid calibration matrix in " + filename);
+        const auto& matrixRawData = entry["data"];
         // Populate the Eigen::Affine3d matrix from the JSON array
         for (int i = 0; i < 4; ++i)
         {
@@ -784,6 +838,8 @@ std::unordered_map<std::string, Eigen::Affine3d> MLvxCalib::GetCalibrationFromFi
 
         Eigen::IOFormat HeavyFmt(Eigen::FullPrecision, 0, ", ", ";\n", "[", "]", "[", "]");
 
+        if (validate && !value.allFinite())
+            throw std::invalid_argument("Non-finite calibration matrix in " + filename);
         dataMap[lidarSn] = value;
     }
 
@@ -868,7 +924,7 @@ int MLvxCalib::GetImuIdToUse(const std::unordered_map<int, std::string>& idToSn,
     return 0;
 }
 
-fs::path get_next_result_path(const std::string& working_directory)
+fs::path get_next_result_path(const fs::path& working_directory)
 {
     std::regex pattern(R"(lio_result_(\d+))");
     int max_number = -1;
@@ -877,9 +933,9 @@ fs::path get_next_result_path(const std::string& working_directory)
         if (entry.is_directory())
         {
             std::smatch match;
-            std::string folder_name = entry.path().filename().string();
+            const auto name = sessionPathText(entry.path().filename());
 
-            if (std::regex_match(folder_name, match, pattern))
+            if (std::regex_match(name, match, pattern))
             {
                 int folder_number = std::stoi(match[1].str());
                 max_number = std::max(max_number, folder_number);

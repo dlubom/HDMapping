@@ -9,11 +9,55 @@
 
 namespace fs = std::filesystem;
 
+namespace
+{
+    bool is_cloud_path(const fs::path& file)
+    {
+        auto ext = file.extension().string();
+        std::ranges::transform(
+            ext,
+            ext.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            });
+        return ext == ".laz" || ext == ".las";
+    }
+
+    fs::path session_input_path(const std::string& name)
+    {
+#ifdef _WIN32
+        // MJS uses UTF-8. Preserve callers that supply an existing native narrow path.
+        fs::path utf8;
+        try
+        {
+            utf8 = sessionPathFromText(name);
+        } catch (const fs::filesystem_error&)
+        {
+            return fs::path(name);
+        }
+
+        std::error_code error;
+        if (fs::exists(utf8, error))
+            return utf8;
+        try
+        {
+            const fs::path native(name);
+            if (fs::exists(native, error))
+                return native;
+        } catch (const fs::filesystem_error&)
+        {
+        }
+        return utf8;
+#else
+        return fs::path(name);
+#endif
+    }
+} // namespace
+
 bool Session::is_point_cloud_file(const std::string& file_name)
 {
-    std::string ext = fs::path(file_name).extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return ext == ".laz" || ext == ".las";
+    return is_cloud_path(session_input_path(file_name));
 }
 
 bool Session::load_from_point_cloud(
@@ -75,12 +119,36 @@ bool Session::load_from_point_cloud(
 
 bool Session::load(const std::string& file_name, bool is_decimate, double bucket_x, double bucket_y, double bucket_z, bool calculate_offset)
 {
-    if (is_point_cloud_file(file_name))
+    const auto path = session_input_path(file_name);
+    if (is_cloud_path(path))
         return load_from_point_cloud(file_name, is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset);
 
+    return load_impl(path, is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset, false);
+}
+
+bool Session::load_snapshot_metadata(const fs::path& file)
+{
+    return load_impl(file, false, 0, 0, 0, false, true);
+}
+
+bool Session::load_published(const fs::path& file)
+{
+    return load_impl(file, false, 0, 0, 0, false, false, true);
+}
+
+bool Session::load_impl(
+    const fs::path& file,
+    bool is_decimate,
+    double bucket_x,
+    double bucket_y,
+    double bucket_z,
+    bool calculate_offset,
+    bool metadata_only,
+    bool strict_paths)
+{
+    const auto file_name = sessionPathText(metadata_only ? file.filename() : file);
     this->session_file_name = file_name;
     std::cout << "Loading file: '" << file_name << "'" << std::endl;
-    // point_clouds_container.point_clouds.clear();
 
     std::string folder_name;
     std::string out_folder_name;
@@ -101,12 +169,20 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
     // Stored paths are relative to the session file (absolute in older sessions)
     auto getNewPath = [&](const std::string& path) -> std::string
     {
-        return resolveSessionPath(path, file_name);
+        if (metadata_only || (strict_paths && path.empty()))
+            return path;
+        auto normalized = path;
+        std::ranges::replace(normalized, '\\', '/');
+        const auto stored = sessionPathFromText(normalized);
+        std::error_code error;
+        const auto directory = fs::absolute(file, error).parent_path();
+        const auto resolved = stored.is_absolute() ? stored : (directory / stored).lexically_normal();
+        return sessionPathText(strict_paths || fs::exists(resolved, error) ? resolved : directory / stored.filename());
     };
 
     try
     {
-        std::ifstream fs(file_name);
+        std::ifstream fs(file);
         if (!fs.good())
             return false;
         nlohmann::json data = nlohmann::json::parse(fs);
@@ -200,12 +276,15 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
             }
         }
 
-#if WITH_GUI == 1
         for (const auto& gcp_json : data["ground_control_points"])
         {
             GroundControlPoint gcp;
             std::string name = gcp_json.value("name", "");
-            strcpy(gcp.name, name.c_str());
+            if (name.size() >= sizeof(gcp.name))
+            {
+                return false;
+            }
+            std::copy_n(name.c_str(), name.size() + 1, gcp.name);
             gcp.x = gcp_json.value("x", 0.0);
             gcp.y = gcp_json.value("y", 0.0);
             gcp.z = gcp_json.value("z", 0.0);
@@ -224,7 +303,11 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
         {
             ControlPoint cp;
             std::string name = cp_json.value("name", "");
-            strcpy(cp.name, name.c_str());
+            if (name.size() >= sizeof(cp.name))
+            {
+                return false;
+            }
+            std::copy_n(name.c_str(), name.size() + 1, cp.name);
             cp.x_source_local = cp_json.value("x_source_local", 0.0);
             cp.y_source_local = cp_json.value("y_source_local", 0.0);
             cp.z_source_local = cp_json.value("z_source_local", 0.0);
@@ -240,13 +323,28 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
 
             std::cout << "adding cp[" << name << "]" << std::endl;
         };
-#endif
 
         std::cout << "-----------------------------" << std::endl;
 
         // loading all data
-        if (!point_clouds_container.load_whu_tls(
-                laz_file_names, is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset, this->load_cache_mode))
+        if (metadata_only)
+        {
+            point_clouds_container.point_clouds.resize(laz_file_names.size());
+            for (std::size_t i = 0; i < laz_file_names.size(); ++i)
+            {
+                point_clouds_container.point_clouds[i].file_name = laz_file_names[i];
+            }
+        }
+        else if (!point_clouds_container.load_whu_tls(
+                     laz_file_names,
+                     is_decimate,
+                     bucket_x,
+                     bucket_y,
+                     bucket_z,
+                     calculate_offset,
+                     strict_paths ? false : this->load_cache_mode,
+                     true,
+                     strict_paths))
         {
             std::cerr << "Failed loading session point clouds: " << file_name << std::endl;
             return false;
@@ -254,13 +352,19 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
 
         if (laz_file_names.size() > 0)
         {
-            working_directory = fs::path(laz_file_names[0]).parent_path().string();
+            working_directory = sessionPathText(sessionPathFromText(laz_file_names[0]).parent_path());
 
             point_clouds_container.folder_name = folder_name;
             point_clouds_container.out_folder_name = out_folder_name;
             point_clouds_container.out_poses_file_name = out_poses_file_name;
 
-            if (!point_clouds_container.update_initial_poses_from_RESSO(working_directory.c_str(), initial_poses_file_name.c_str()))
+            const auto base = metadata_only ? file.parent_path() : fs::path{};
+            auto pose_path = [&](const std::string& path)
+            {
+                return base / sessionPathFromText(path);
+            };
+            if (!point_clouds_container.update_initial_poses_from_RESSO(
+                    working_directory, pose_path(initial_poses_file_name), strict_paths, true))
             {
                 std::cout << __FILE__ << " " << __LINE__ << std::endl;
                 std::cout << "check input files" << std::endl;
@@ -275,14 +379,14 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
             // fallback
             std::string poses_source_file_name = poses_file_name;
             std::error_code ec;
-            if (!fs::exists(poses_file_name, ec) || fs::file_size(poses_file_name, ec) == 0)
+            if (!strict_paths && (!fs::exists(pose_path(poses_file_name), ec) || fs::file_size(pose_path(poses_file_name), ec) == 0))
             {
                 std::cout << "poses file '" << poses_file_name << "' is missing or empty, using initial poses from '"
                           << initial_poses_file_name << "'" << std::endl;
                 poses_source_file_name = initial_poses_file_name;
             }
 
-            if (!point_clouds_container.update_poses_from_RESSO(working_directory.c_str(), poses_source_file_name.c_str()))
+            if (!point_clouds_container.update_poses_from_RESSO(working_directory, pose_path(poses_source_file_name), strict_paths, true))
             {
                 std::cout << __FILE__ << " " << __LINE__ << std::endl;
                 std::cout << "check input files" << std::endl;
@@ -375,7 +479,27 @@ bool Session::load(const std::string& file_name, bool is_decimate, double bucket
 bool Session::save(
     const std::string& file_name, const std::string& poses_file_name, const std::string& initial_poses_file_name, bool is_subsession)
 {
+    return save_impl(session_input_path(file_name), poses_file_name, initial_poses_file_name, is_subsession, false);
+}
+
+bool Session::save_snapshot_metadata(const fs::path& file, const std::string& poses, const std::string& initial_poses)
+{
+    return save_impl(file, poses, initial_poses, false, true);
+}
+
+bool Session::save_impl(
+    const fs::path& file,
+    const std::string& poses_file_name,
+    const std::string& initial_poses_file_name,
+    bool is_subsession,
+    bool metadata_only)
+{
+    const auto file_name = sessionPathText(metadata_only ? file.filename() : file);
     std::cout << "saving file: '" << file_name << "'" << std::endl;
+    auto stored_path = [&](const std::string& path)
+    {
+        return metadata_only || path.empty() ? path : sessionPathText(sessionPathRelativeTo(session_input_path(path), file));
+    };
 
     nlohmann::json jj;
     nlohmann::json j;
@@ -386,11 +510,11 @@ bool Session::save(
     j["offset_to_apply_x"] = point_clouds_container.offset_to_apply.x();
     j["offset_to_apply_y"] = point_clouds_container.offset_to_apply.y();
     j["offset_to_apply_z"] = point_clouds_container.offset_to_apply.z();
-    j["folder_name"] = toSessionPath(point_clouds_container.folder_name, file_name);
-    j["out_folder_name"] = toSessionPath(point_clouds_container.out_folder_name, file_name);
-    j["poses_file_name"] = toSessionPath(poses_file_name, file_name); // point_clouds_container.poses_file_name;
-    j["initial_poses_file_name"] = toSessionPath(initial_poses_file_name, file_name); // point_clouds_container.initial_poses_file_name;
-    j["out_poses_file_name"] = toSessionPath(point_clouds_container.out_poses_file_name, file_name);
+    j["folder_name"] = stored_path(point_clouds_container.folder_name);
+    j["out_folder_name"] = stored_path(point_clouds_container.out_folder_name);
+    j["poses_file_name"] = stored_path(poses_file_name); // point_clouds_container.poses_file_name;
+    j["initial_poses_file_name"] = stored_path(initial_poses_file_name); // point_clouds_container.initial_poses_file_name;
+    j["out_poses_file_name"] = stored_path(point_clouds_container.out_poses_file_name);
     j["ground_truth"] = is_ground_truth;
     j["exporting_software_version"] = HDMAPPING_CONFIGURE_PROJECT_VERSION;
     jj["Session Settings"] = j;
@@ -432,7 +556,7 @@ bool Session::save(
         {
             if (pc.visible)
             {
-                nlohmann::json jfn{ { "file_name", toSessionPath(pc.file_name, file_name) },
+                nlohmann::json jfn{ { "file_name", stored_path(pc.file_name) },
                                     { "fuse_inclination_from_IMU", pc.fuse_inclination_from_IMU },
                                     { "fixed_x", pc.fixed_x },
                                     { "fixed_y", pc.fixed_y },
@@ -445,7 +569,7 @@ bool Session::save(
         }
         else
         {
-            nlohmann::json jfn{ { "file_name", toSessionPath(pc.file_name, file_name) },
+            nlohmann::json jfn{ { "file_name", stored_path(pc.file_name) },
                                 { "fuse_inclination_from_IMU", pc.fuse_inclination_from_IMU },
                                 { "fixed_x", pc.fixed_x },
                                 { "fixed_y", pc.fixed_y },
@@ -457,7 +581,6 @@ bool Session::save(
         }
     }
     jj["laz_file_names"] = jlaz_file_names;
-#if WITH_GUI == 1
     nlohmann::json jgcps;
     for (const auto& gcp : ground_control_points.gpcs)
     {
@@ -474,9 +597,7 @@ bool Session::save(
         jgcps.push_back(jgcp);
     }
     jj["ground_control_points"] = jgcps;
-#endif
 
-#if WITH_GUI == 1
     nlohmann::json jcps;
     for (const auto& cp : control_points.cps)
     {
@@ -495,14 +616,13 @@ bool Session::save(
         jcps.push_back(jcp);
     }
     jj["control_points"] = jcps;
-#endif
 
-    std::ofstream fs(file_name);
+    std::ofstream fs(file);
     if (!fs.good())
         return false;
     fs << jj.dump(2);
     fs.close();
-    return true;
+    return fs.good();
 }
 
 void Session::fill_session_from_worker_data(

@@ -98,4 +98,8 @@ public:
     double WGS84ReferenceLongitude = 0;
     double geoidSeparation = 0; //! Distance from WGS84 elipsoid to geoid at reference
     bool setWGS84ReferenceFromFirstPose = true;
+
+    //! Optional datum of a PROJ-projected track carried in the Cartesian slots.
+    std::string projected_crs;
+    std::string projected_vertical_datum;
 };

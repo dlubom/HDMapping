@@ -1,5 +1,7 @@
 #include "toml_io.h"
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 bool TomlIO::SaveParametersToTomlFile(const std::string& filepath, const LidarOdometryParams& params)
@@ -144,7 +146,7 @@ void TomlIO::read_grid_params(NDT::GridParameters& grid, const toml::table* grid
     set_if_exists(grid, grid_tbl, "resolution_Z", &NDT::GridParameters::resolution_Z);
 }
 
-bool TomlIO::LoadParametersFromTomlFile(const std::string& filepath, LidarOdometryParams& params)
+bool TomlIO::LoadParametersFromTomlFile(const std::string& filepath, LidarOdometryParams& params, std::string* validation_error)
 {
     toml::table tbl;
     try
@@ -152,8 +154,88 @@ bool TomlIO::LoadParametersFromTomlFile(const std::string& filepath, LidarOdomet
         tbl = toml::parse_file(filepath);
     } catch (const toml::parse_error& err)
     {
-        std::cerr << "Parsing failed:\n" << err << "\n";
+        if (validation_error)
+            *validation_error = std::string(err.description());
+        else
+            std::cerr << "Parsing failed:\n" << err << "\n";
         return false;
+    }
+    if (validation_error)
+    {
+        const auto fail = [&](const std::string& field)
+        {
+            *validation_error = "Invalid TOML value for " + field;
+            return false;
+        };
+        for (const auto& [category, attributes] : CATEGORIES)
+        {
+            const auto* node = tbl.get(category);
+            if (!node)
+                continue;
+            const auto* section = node->as_table();
+            if (!section)
+                return fail(category);
+            for (const auto& attribute : attributes)
+            {
+                const auto* value = section->get(attribute);
+                if (!value)
+                    continue;
+                const auto known = POINTERS.find(attribute);
+                if (known != POINTERS.end())
+                {
+                    const bool valid = std::visit(
+                        [&](auto ptr)
+                        {
+                            using T = std::remove_cvref_t<decltype(params.*ptr)>;
+                            if constexpr (std::is_same_v<T, int>)
+                            {
+                                const auto n = value->value_exact<std::int64_t>();
+                                return n && *n >= std::numeric_limits<int>::min() && *n <= std::numeric_limits<int>::max();
+                            }
+                            else if constexpr (std::is_same_v<T, double>)
+                            {
+                                const auto number = value->value<double>();
+                                return number && std::isfinite(*number);
+                            }
+                            else
+                                return value->value_exact<T>().has_value();
+                        },
+                        known->second);
+                    if (!valid)
+                        return fail(category + "." + attribute);
+                }
+                else if (MOTION_MODEL_CORRECTION_POINTERS.contains(attribute))
+                {
+                    const auto number = value->value<double>();
+                    if (!number || !std::isfinite(*number))
+                        return fail(category + "." + attribute);
+                }
+            }
+        }
+        for (const auto* name : { "in_out_params_indoor", "in_out_params_outdoor" })
+        {
+            const auto* node = tbl.get(name);
+            if (!node)
+                continue;
+            const auto* grid = node->as_table();
+            if (!grid)
+                return fail(name);
+            for (const auto& [key, field] : *grid)
+            {
+                if (key.str().starts_with("number_of_buckets"))
+                {
+                    const auto count = field.value_exact<std::int64_t>();
+                    if (!count || *count < 0 || *count > std::numeric_limits<int>::max())
+                        return fail(std::string(name) + "." + std::string(key.str()));
+                }
+                else
+                {
+                    const auto number = field.value<double>();
+                    if (!number || !std::isfinite(*number))
+                        return fail(std::string(name) + "." + std::string(key.str()));
+                }
+            }
+        }
     }
     for (const auto& [category, attributes] : CATEGORIES)
     {
@@ -274,9 +356,9 @@ TomlIO::VersionInfo TomlIO::CheckConfigVersion(const std::string& filepath)
                 auto cfg_ver = version_section->get("config_version");
                 auto build_dt = version_section->get("build_date");
 
-                info.software_version = sw_ver ? sw_ver->as_string()->get() : "";
-                info.config_version = cfg_ver ? cfg_ver->as_string()->get() : "";
-                info.build_date = build_dt ? build_dt->as_string()->get() : "";
+                info.software_version = sw_ver ? sw_ver->value_or(std::string{}) : "";
+                info.config_version = cfg_ver ? cfg_ver->value_or(std::string{}) : "";
+                info.build_date = build_dt ? build_dt->value_or(std::string{}) : "";
                 info.found = true;
             }
         }

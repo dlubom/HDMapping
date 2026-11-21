@@ -133,7 +133,15 @@ PYBIND11_MODULE(lidar_odometry_py, m)
     m.def("run_lidar_odometry", &run_lidar_odometry, py::arg("input_dir"), py::arg("params"), "Run lidar odometry with given parameters");
 
     // Bind run_consistency function
-    m.def("run_consistency", &run_consistency, py::arg("worker_data"), py::arg("params"), "Run trajectory consistency.");
+    m.def(
+        "run_consistency",
+        [](std::vector<WorkerData>& worker_data, const LidarOdometryParams& params)
+        {
+            run_consistency(worker_data, params);
+        },
+        py::arg("worker_data"),
+        py::arg("params"),
+        "Run trajectory consistency.");
 
     // Bind save_results_automatic function
     m.def(

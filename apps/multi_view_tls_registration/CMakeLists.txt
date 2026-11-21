@@ -25,6 +25,7 @@ set(SOURCES
     multi_view_tls_registration_gui.cpp multi_view_tls_registration.h
     ../lidar_odometry_step_1/lidar_odometry_utils.cpp
     bow_loop_closure_detector.h bow_loop_closure_detector.cpp
+    step2_segment_operations.h step2_segment_operations.cpp
 )
 
 # Windows: add resource file
@@ -36,17 +37,13 @@ add_executable(
   multi_view_tls_registration_step_2 ${SOURCES}
   )
 
-# FBOW_VOCABULARY_PATH: absolute source-tree path to the bundled ORB
-# vocabulary, baked in at configure time (dev-build convenience; a packaged
-# install would instead copy the file next to the binary and resolve it
-# relative to argv[0]).
-target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE
-    -DWITH_GUI=1
-    -DFBOW_VOCABULARY_PATH="${THIRDPARTY_DIRECTORY}/fbow/vocabularies/orb_mur.fbow")
+target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE WITH_GUI=1)
+add_dependencies(multi_view_tls_registration_step_2 hdmapping_bow_vocabulary)
 
 target_include_directories(
           multi_view_tls_registration_step_2
           PRIVATE include
+          ${REPOSITORY_DIRECTORY}/processing/include
           ${REPOSITORY_DIRECTORY}/core/include
           ${EIGEN3_INCLUDE_DIR}
           ${THIRDPARTY_DIRECTORY}
@@ -104,6 +101,17 @@ endif()
 
 if (MSVC)
     target_compile_options(multi_view_tls_registration_step_2 PRIVATE /bigobj)
+endif()
+
+if(BUILD_WITH_MCP)
+    target_sources(multi_view_tls_registration_step_2 PRIVATE step2_state_parameters.cpp)
+    target_link_libraries(multi_view_tls_registration_step_2 PRIVATE processing_gui_state processing_constraints processing_georeference)
+    target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE HDMAPPING_GUI_STATE)
+endif()
+
+if(BUILD_WITH_MCP AND BUILD_TESTING)
+    target_sources(processing_state_test PRIVATE step2_state_parameters.cpp step2_state_parameters_test.cpp)
+    target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE HDMAPPING_SNAPSHOT_PROBE)
 endif()
 
 hdmapping_install_app(multi_view_tls_registration_step_2)

@@ -192,33 +192,6 @@ fs::path outwd;
 
 ///////////////////////////////////////////////////////////////////////////////////
 
-void set_lidar_odometry_default_params(LidarOdometryParams& params)
-{
-    params.decimation = 0.01;
-    params.in_out_params_indoor.resolution_X = 0.1;
-    params.in_out_params_indoor.resolution_Y = 0.1;
-    params.in_out_params_indoor.resolution_Z = 0.1;
-
-    params.in_out_params_outdoor.resolution_X = 0.3;
-    params.in_out_params_outdoor.resolution_Y = 0.3;
-    params.in_out_params_outdoor.resolution_Z = 0.3;
-
-    params.filter_threshold_xy_inner = 0.3;
-    params.filter_threshold_xy_outer = 70.0;
-    params.threshould_output_filter = 0.3;
-
-    params.use_robust_and_accurate_lidar_odometry = false;
-    params.distance_bucket = 0.2;
-    params.polar_angle_deg = 10.0;
-    params.azimutal_angle_deg = 10.0;
-    params.robust_and_accurate_lidar_odometry_iterations = 20;
-
-    params.max_distance_lidar = 70.0;
-    params.nr_iter = 1000;
-    params.sliding_window_trajectory_length_threshold = 200;
-    params.real_time_threshold_seconds = 10;
-}
-
 // Helper function to format time in human-readable format
 std::string formatTime(double seconds)
 {
