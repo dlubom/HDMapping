@@ -271,6 +271,7 @@ if grep -q '^1$' build/hdmapping-mcp-enabled.txt; then
         fi
     done
 fi
+cp "build/bin/hdmapping-orb-mur.fbow" "$BUNDLE_DIR/bin/" || exit 1
 echo "  Total: $BINARY_COUNT executables copied"
 
 echo -e "${YELLOW}Step 3: Detecting and bundling dynamic libraries...${NC}"

@@ -104,6 +104,21 @@ include(cmake/implot.cmake)
 # ============================================================================
 include(cmake/dependencies.cmake)
 
+# The GUI and worker resolve this asset beside their executable.
+get_property(_bow_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+set(_bow_bin "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+if(_bow_multi_config)
+    string(APPEND _bow_bin "/$<CONFIG>")
+endif()
+set(_bow_source "${THIRDPARTY_DIRECTORY}/fbow/vocabularies/orb_mur.fbow")
+set(_bow_file "${_bow_bin}/hdmapping-orb-mur.fbow")
+add_custom_command(OUTPUT "${_bow_file}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bow_bin}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${_bow_source}" "${_bow_file}"
+    DEPENDS "${_bow_source}" VERBATIM)
+add_custom_target(hdmapping_bow_vocabulary DEPENDS "${_bow_file}")
+install(FILES "${_bow_source}" DESTINATION bin RENAME hdmapping-orb-mur.fbow COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+
 # raylib/imgui_raylib/rlimgui/imguizmo_raylib targets, needed before
 # add_subdirectory(core) below since core's own CMakeLists.txt defines a
 # core_raylib target (holding shared raylib rendering/camera/picking code,

@@ -1,5 +1,7 @@
 #include "GuiRelayProcess.h"
 
+#include <HDMapping/ExecutablePath.h>
+
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -26,7 +28,6 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <crt_externs.h>
-#include <mach-o/dyld.h>
 #else
 extern char** environ;
 #endif
@@ -38,26 +39,6 @@ namespace HDMapping::Processing
     {
         namespace fs = std::filesystem;
         constexpr std::size_t max_frame = 4U << 20;
-
-        fs::path executablePath()
-        {
-#ifdef _WIN32
-            std::vector<wchar_t> path(32768);
-            const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-            if (length == 0 || length == path.size())
-                throw std::runtime_error("Cannot locate GUI executable");
-            return fs::path(path.data(), path.data() + length);
-#elif defined(__APPLE__)
-            std::uint32_t size = 0;
-            _NSGetExecutablePath(nullptr, &size);
-            std::vector<char> path(size);
-            if (_NSGetExecutablePath(path.data(), &size) != 0)
-                throw std::runtime_error("Cannot locate GUI executable");
-            return fs::canonical(path.data());
-#else
-            return fs::canonical("/proc/self/exe");
-#endif
-        }
 
         fs::path companion(std::string_view gui)
         {

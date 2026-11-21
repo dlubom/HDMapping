@@ -1,8 +1,12 @@
 #include "bow_loop_closure_detector.h"
 
+#include <HDMapping/ExecutablePath.h>
+#include <HDMapping/SessionPaths.h>
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 
@@ -257,23 +261,19 @@ namespace bow_loop_closure
         return chunk_frames;
     }
 
-    std::string defaultVocabularyPath()
+    fs::path defaultVocabularyPath()
     {
-#ifdef FBOW_VOCABULARY_PATH
-        return FBOW_VOCABULARY_PATH;
-#else
-        return "";
-#endif
+        return HDMapping::executablePath().parent_path() / "hdmapping-orb-mur.fbow";
     }
 
-    fbow::Vocabulary loadVocabulary(const std::string& vocabulary_path)
+    fbow::Vocabulary loadVocabulary(const fs::path& vocabulary_path)
     {
         fbow::Vocabulary vocabulary;
-        if (vocabulary_path.empty() || !fs::exists(vocabulary_path))
-            throw std::runtime_error("bow_loop_closure: vocabulary file not found: '" + vocabulary_path + "'");
-        vocabulary.readFromFile(vocabulary_path);
-        if (!vocabulary.isValid())
-            throw std::runtime_error("bow_loop_closure: failed to load vocabulary from '" + vocabulary_path + "'");
+        std::ifstream input(vocabulary_path, std::ios::binary);
+        if (!input)
+            throw std::runtime_error("bow_loop_closure: vocabulary file not found: '" + sessionPathText(vocabulary_path) + "'");
+        input.exceptions(std::ios::badbit | std::ios::failbit);
+        vocabulary.fromStream(input);
         return vocabulary;
     }
 

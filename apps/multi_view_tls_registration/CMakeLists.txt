@@ -36,13 +36,8 @@ add_executable(
   multi_view_tls_registration_step_2 ${SOURCES}
   )
 
-# FBOW_VOCABULARY_PATH: absolute source-tree path to the bundled ORB
-# vocabulary, baked in at configure time (dev-build convenience; a packaged
-# install would instead copy the file next to the binary and resolve it
-# relative to argv[0]).
-target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE
-    -DWITH_GUI=1
-    -DFBOW_VOCABULARY_PATH="${THIRDPARTY_DIRECTORY}/fbow/vocabularies/orb_mur.fbow")
+target_compile_definitions(multi_view_tls_registration_step_2 PRIVATE WITH_GUI=1)
+add_dependencies(multi_view_tls_registration_step_2 hdmapping_bow_vocabulary)
 
 target_include_directories(
           multi_view_tls_registration_step_2

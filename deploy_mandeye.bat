@@ -86,6 +86,10 @@ if defined MISSING (
     echo   all expected executables and DLLs present.
 )
 
+echo Copying BoW vocabulary...
+copy /Y "%BUILD_DIR%\hdmapping-orb-mur.fbow" "%DEPLOY_DIR%\hdmapping-orb-mur.fbow" >nul
+if errorlevel 1 exit /b 1
+
 echo Copying PROJ database (proj.db)...
 if exist "%PROJ_DB_SRC%" (
     copy /Y "%PROJ_DB_SRC%" "%DEPLOY_DIR%\proj.db" >nul
