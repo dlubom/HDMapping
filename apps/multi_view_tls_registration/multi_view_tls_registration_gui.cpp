@@ -93,6 +93,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <string_view>
 #include <tuple>
 
 #include <opencv2/imgcodecs.hpp>
@@ -106,9 +107,11 @@
 #include "bow_loop_closure_detector.h"
 #include "multi_view_tls_registration.h"
 #include "step2_solver_selection.h"
+#include <Core/reference_tracks.h>
 
 #ifdef HDMAPPING_GUI_STATE
 #include "step2_constraint_operations.h"
+#include "step2_georeference_operations.h"
 #include "step2_operations.h"
 #include "step2_state_parameters.h"
 #include <HDMapping/Processing/GuiStateBridge.h>
@@ -1151,6 +1154,7 @@ static std::string state_path;
 static std::string registration_result_path;
 static std::optional<std::pair<proc::OperationRequest, bool>> registration_request;
 static std::string constraint_result_path;
+static std::string georeference_result_path;
 static nlohmann::json registration_job = nlohmann::json::object();
 static std::string registration_error;
 static bool registration_in_flight = false;
@@ -1170,6 +1174,11 @@ static void submitStep2Job(std::string_view operation, nlohmann::json scope, nlo
     registration_job = nlohmann::json::object();
     registration_error.clear();
     registration_request.emplace(proc::OperationRequest{ std::string(operation), {}, std::move(scope), std::move(parameters) }, mutate);
+}
+
+static void submitReferenceAlignment(const char* source)
+{
+    submitStep2Job("step2.align_reference", nlohmann::json::object(), { { "source", source } }, true);
 }
 
 static void submitRegistration(std::string algorithm, bool changes_poses = true)
@@ -1324,6 +1333,7 @@ static void openedStep2Session([[maybe_unused]] const std::string& path)
     state_path = path;
     registration_result_path.clear();
     constraint_result_path.clear();
+    georeference_result_path.clear();
     if (state_bridge)
         state_bridge->Open();
 #endif
@@ -2697,6 +2707,7 @@ void loop_closure_gui()
             },
             submitGraphOptimization,
             submitConstraintIcp,
+            submitReferenceAlignment,
         };
         const auto* actions = &graph_actions;
 #else
@@ -3135,77 +3146,7 @@ void lio_segments_gui()
 }
 
 // -----------------------------------------------------------------------------
-// GNSS / TUM / ENU-origin session persistence
-//
-// core's Session::save()/Session::load() (core/src/session.cpp) only knows about
-// point clouds, loop-closure edges and control points -- the GNSS track, the TUM
-// track and the ENU projection origin live in the GUI's own `tls_registration`
-// (see multi_view_tls_registration.h), so they're persisted here by re-opening
-// the *.mjs JSON that Session::save() just wrote and adding three extra
-// top-level keys:
-//
-//   "enu_origin"        - the WGS84 lat/lon (+ geoid separation) the GNSS
-//                         topocentric projection is referenced to. Previously
-//                         this was always re-derived from the first GNSS pose on
-//                         every projection/load; saving it lets a reopened
-//                         session keep the exact same origin even before GNSS
-//                         data is reloaded.
-//   "gnss_measurements" - every GNSS::GlobalPose (raw WGS84 + projected ENU).
-//   "tum_trajectory"    - every TUM::TumPose.
-//
-// All three keys are optional: an older session without them just loads with
-// empty GNSS/TUM tracks and the from-first-pose origin behaviour, as before.
-// -----------------------------------------------------------------------------
-static nlohmann::json gnssTumSessionData(const GNSS& gnss, const TUM& tum)
-{
-    auto data = nlohmann::json::object();
-    nlohmann::json jorigin;
-    jorigin["latitude"] = gnss.WGS84ReferenceLatitude;
-    jorigin["longitude"] = gnss.WGS84ReferenceLongitude;
-    jorigin["geoid_separation"] = gnss.geoidSeparation;
-    jorigin["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
-    data["enu_origin"] = jorigin;
-
-    nlohmann::json jgnss = nlohmann::json::array();
-    for (const auto& p : gnss.gnss_poses)
-    {
-        jgnss.push_back(
-            { { "timestamp", p.timestamp },
-              { "lat", p.lat },
-              { "lon", p.lon },
-              { "h_wgs84", p.h_wgs84 },
-              { "undulation", p.undulation },
-              { "alt", p.alt },
-              { "hdop", p.hdop },
-              { "satelites_tracked", p.satelites_tracked },
-              { "height", p.height },
-              { "age", p.age },
-              { "time", p.time },
-              { "fix_quality", p.fix_quality },
-              { "enu_x", p.enu_x },
-              { "enu_y", p.enu_y },
-              { "enu_z", p.enu_z },
-              { "dist_xy_along", p.dist_xy_along } });
-    }
-    data["gnss_measurements"] = jgnss;
-
-    nlohmann::json jtum = nlohmann::json::array();
-    for (const auto& p : tum.tum_poses)
-    {
-        jtum.push_back(
-            { { "timestamp", p.timestamp },
-              { "x", p.x },
-              { "y", p.y },
-              { "z", p.z },
-              { "qx", p.qx },
-              { "qy", p.qy },
-              { "qz", p.qz },
-              { "qw", p.qw } });
-    }
-    data["tum_trajectory"] = jtum;
-    return data;
-}
-
+// Persist the optional reference tracks alongside the native session metadata.
 static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss, const TUM& tum)
 {
     try
@@ -3221,7 +3162,7 @@ static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss,
             data = nlohmann::json::parse(fin);
         }
 
-        data.update(gnssTumSessionData(gnss, tum));
+        data.update(HDMapping::EncodeReferenceTracks(gnss, tum));
 
         std::ofstream fout(path);
         if (!fout.good())
@@ -3240,76 +3181,21 @@ static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss,
 
 static void readGnssTumFromSessionFile(const std::string& path, GNSS& gnss, TUM& tum)
 {
+    const auto show_gnss = gnss.show_correspondences;
+    const auto show_tum = tum.show_correspondences;
+    const auto point_size = tum.point_size;
+    const auto next_tum_version = tum.version + 1;
+    gnss = GNSS{};
+    tum = TUM{};
+    gnss.show_correspondences = show_gnss;
+    tum.show_correspondences = show_tum;
+    tum.point_size = point_size;
+    tum.version = next_tum_version;
     try
     {
-        std::ifstream fin(path);
-        if (!fin.good())
-            return;
-        nlohmann::json data = nlohmann::json::parse(fin);
-
-        if (data.contains("enu_origin"))
-        {
-            const auto& jorigin = data["enu_origin"];
-            gnss.WGS84ReferenceLatitude = jorigin.value("latitude", 0.0);
-            gnss.WGS84ReferenceLongitude = jorigin.value("longitude", 0.0);
-            gnss.geoidSeparation = jorigin.value("geoid_separation", 0.0);
-            // A stored origin takes precedence over re-deriving one from the
-            // first GNSS pose; honour an explicit flag if the session carries
-            // one, otherwise assume the stored origin should be used as-is.
-            gnss.setWGS84ReferenceFromFirstPose = jorigin.value("set_from_first_pose", false);
-            spdlog::info(
-                "Loaded ENU origin from session: lat={}, lon={}, geoid_separation={}",
-                gnss.WGS84ReferenceLatitude,
-                gnss.WGS84ReferenceLongitude,
-                gnss.geoidSeparation);
-        }
-
-        if (data.contains("gnss_measurements"))
-        {
-            gnss.gnss_poses.clear();
-            for (const auto& j : data["gnss_measurements"])
-            {
-                GNSS::GlobalPose p{};
-                p.timestamp = j.value("timestamp", 0.0);
-                p.lat = j.value("lat", 0.0);
-                p.lon = j.value("lon", 0.0);
-                p.h_wgs84 = j.value("h_wgs84", 0.0);
-                p.undulation = j.value("undulation", 0.0);
-                p.alt = j.value("alt", 0.0);
-                p.hdop = j.value("hdop", 0.0);
-                p.satelites_tracked = j.value("satelites_tracked", 0.0);
-                p.height = j.value("height", 0.0);
-                p.age = j.value("age", 0.0);
-                p.time = j.value("time", 0.0);
-                p.fix_quality = j.value("fix_quality", 0.0);
-                p.enu_x = j.value("enu_x", 0.0);
-                p.enu_y = j.value("enu_y", 0.0);
-                p.enu_z = j.value("enu_z", 0.0);
-                p.dist_xy_along = j.value("dist_xy_along", 0.0);
-                gnss.gnss_poses.push_back(p);
-            }
-            spdlog::info("Loaded {} GNSS measurement(s) from session '{}'", gnss.gnss_poses.size(), path);
-        }
-
-        if (data.contains("tum_trajectory"))
-        {
-            tum.tum_poses.clear();
-            for (const auto& j : data["tum_trajectory"])
-            {
-                TUM::TumPose p{};
-                p.timestamp = j.value("timestamp", 0.0);
-                p.x = j.value("x", 0.0);
-                p.y = j.value("y", 0.0);
-                p.z = j.value("z", 0.0);
-                p.qx = j.value("qx", 0.0);
-                p.qy = j.value("qy", 0.0);
-                p.qz = j.value("qz", 0.0);
-                p.qw = j.value("qw", 1.0);
-                tum.tum_poses.push_back(p);
-            }
-            tum.version++;
-            spdlog::info("Loaded {} TUM pose(s) from session '{}'", tum.tum_poses.size(), path);
-        }
+        std::ifstream fin(sessionPathFromText(path));
+        if (fin)
+            HDMapping::DecodeReferenceTracks(nlohmann::json::parse(fin), gnss, tum);
     } catch (const std::exception& e)
     {
         spdlog::error("Failed reading GNSS/TUM data from session '{}': {}", path, e.what());
@@ -5651,6 +5537,47 @@ void lioSegmentsGizmo()
     }
 }
 
+static void importGnssReference(std::string_view format, std::string_view projection)
+{
+    const bool nmea = format == "nmea";
+    const auto paths = mandeye::fd::OpenFileDialog(
+        nmea ? "Load nmea files" : "Load gnss files", nmea ? mandeye::fd::Nmea_filter : mandeye::fd::Gnss_filter, true);
+    if (paths.empty())
+        return;
+    auto& gnss = tls_registration.gnss;
+#ifdef HDMAPPING_GUI_STATE
+    nlohmann::json parameters = { { "paths", paths }, { "format", std::string(format) }, { "projection", std::string(projection) } };
+    if (projection == "puwg92")
+        parameters["localize"] = gnssWithOffset;
+    else
+    {
+        parameters["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
+        if (!gnss.setWGS84ReferenceFromFirstPose)
+        {
+            parameters["latitude_deg"] = gnss.WGS84ReferenceLatitude;
+            parameters["longitude_deg"] = gnss.WGS84ReferenceLongitude;
+        }
+    }
+    submitStep2Job("gnss.import", nlohmann::json::object(), std::move(parameters), true);
+#else
+    if (projection == "puwg92")
+    {
+        Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+        if (gnss.load_data_from_gnss_and_convert_to_92(paths, offset, gnssWithOffset))
+            session.point_clouds_container.offset_to_apply = offset;
+        else
+            spdlog::error("Error loading GNSS files!");
+        return;
+    }
+    const bool loaded = nmea ? gnss.load_raw_data_from_nmea(paths) : gnss.load_raw_data_from_gnss(paths);
+    if (!loaded)
+        spdlog::error("Error loading {} files!", format);
+    const bool projected = projection == "mercator" ? gnss.project_to_mercator_projection() : gnss.project_using_proj();
+    if (!projected)
+        spdlog::error("Error converting WGS84 to {} projection!", projection);
+#endif
+}
+
 void display()
 {
     // Safety net: rebuilds any scan whose m_pose no longer matches its
@@ -5856,10 +5783,19 @@ void display()
 
     if (session.control_points.is_imgui)
     {
+        const Eigen::Vector3f rotation_center(
+            app_state.camera.euler.rotationCenter.x, app_state.camera.euler.rotationCenter.y, app_state.camera.euler.rotationCenter.z);
+#ifdef HDMAPPING_GUI_STATE
         session.control_points.imgui(
             session.point_clouds_container,
-            Eigen::Vector3f(
-                app_state.camera.euler.rotationCenter.x, app_state.camera.euler.rotationCenter.y, app_state.camera.euler.rotationCenter.z));
+            rotation_center,
+            []
+            {
+                submitReferenceAlignment("cp");
+            });
+#else
+        session.control_points.imgui(session.point_clouds_container, rotation_center);
+#endif
 
         // Appends to the same "Control Point" window ControlPoints::imgui() just built.
         if (session.control_points.is_imgui)
@@ -5876,7 +5812,18 @@ void display()
     }
 
     if (session.ground_control_points.is_imgui)
+    {
+#ifdef HDMAPPING_GUI_STATE
+        session.ground_control_points.imgui(
+            session.point_clouds_container,
+            []
+            {
+                submitReferenceAlignment("gcp");
+            });
+#else
         session.ground_control_points.imgui(session.point_clouds_container);
+#endif
+    }
 
     // Commits a still-running drag whose gizmo won't be processed this frame.
     commitGizmoDragIfOrphaned();
@@ -6587,102 +6534,25 @@ void display()
                     ImGui::MenuItem("Load with offset -> move to (0,0,0)", nullptr, &gnssWithOffset);
 
                     if (ImGui::MenuItem("Load GNSS files and convert WGS84 to PUWG92"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            Eigen::Vector3d out_offset(0.0, 0.0, 0.0);
-                            markBulkEdit();
-                            if (!tls_registration.gnss.load_data_from_gnss_and_convert_to_92(input_file_names, out_offset, gnssWithOffset))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            else
-                            {
-                                session.point_clouds_container.offset_to_apply = out_offset;
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "puwg92");
 
                     ImGui::MenuItem("Set WGS84 reference from 1st pose", nullptr, &tls_registration.gnss.setWGS84ReferenceFromFirstPose);
 
                     ImGui::Text("Load & convert WGS84 to Cartesian by Mercator projection");
 
                     if (ImGui::MenuItem("Load GNSS (deprecated)"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            markBulkEdit();
-                            if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            if (!tls_registration.gnss.project_to_mercator_projection())
-                            {
-                                spdlog::error("Error converting WGS84 to Mercator projection!");
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "mercator");
                     if (ImGui::MenuItem("Load GNSS"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            markBulkEdit();
-                            if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            if (!tls_registration.gnss.project_using_proj())
-                            {
-                                spdlog::error("Error converting WGS84 to PROJ projection!");
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "topocentric");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load structured GNSS dataset and decode it into coordinates, using PROJ library");
 
                     if (ImGui::MenuItem("Load NMEA (deprecated)"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load nmea files", mandeye::fd::Nmea_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            markBulkEdit();
-                            if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
-                                spdlog::error("Error loading NMEA files!");
-                        }
-                        if (!tls_registration.gnss.project_to_mercator_projection())
-                        {
-                            spdlog::error("Error converting WGS84 to Mercator projection!");
-                        }
-                    }
+                        importGnssReference("nmea", "mercator");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load raw GNSS serial output and decode it into coordinates");
                     if (ImGui::MenuItem("Load NMEA"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load nmea files", mandeye::fd::Nmea_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            markBulkEdit();
-                            if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
-                                spdlog::error("Error loading NMEA files!");
-                        }
-                        if (!tls_registration.gnss.project_using_proj())
-                        {
-                            spdlog::error("Error converting WGS84 to PROJ projection!");
-                        }
-                    }
+                        importGnssReference("nmea", "topocentric");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load raw GNSS serial output and decode it into coordinates, using PROJ library");
 
@@ -6760,11 +6630,29 @@ void display()
                         std::string itemName = "Save metascan points in " + crtName + " (PROJ)";
                         if (ImGui::MenuItem(itemName.c_str()))
                         {
+                            if (!tls_registration.gnss.projected_crs.empty())
+                            {
+                                spdlog::error(
+                                    "Metascan projection requires a topocentric reference. Current GNSS CRS is '{}'.",
+                                    tls_registration.gnss.projected_crs);
+                                continue;
+                            }
                             const auto output_file_name = mandeye::fd::SaveFileDialog(out_fn.c_str(), mandeye::fd::LAS_LAZ_filter, ".laz");
 
                             const auto [pointcloud, intensity, timestamps] = prepareVisibleData();
                             const auto lla_points = tls_registration.gnss.unproject_using_proj(pointcloud);
                             auto crt_points = tls_registration.gnss.CRTConvert(lla_points, crtName, selected_geoid_model);
+                            if (crt_points.empty() ||
+                                !std::ranges::all_of(
+                                    crt_points,
+                                    [](const auto& p)
+                                    {
+                                        return p.allFinite();
+                                    }))
+                            {
+                                spdlog::error("Could not project scan points in '{}' with geoid '{}'", crtName, selected_geoid_model);
+                                continue;
+                            }
                             Eigen::Vector3d offset = crt_points.front();
                             for (auto& p : crt_points)
                             {
@@ -6792,6 +6680,17 @@ void display()
                             }
 
                             auto crt_points = tls_registration.gnss.CRTConvert(lla_points, crtName, selected_geoid_model);
+                            if (crt_points.empty() ||
+                                !std::ranges::all_of(
+                                    crt_points,
+                                    [](const auto& p)
+                                    {
+                                        return p.allFinite();
+                                    }))
+                            {
+                                spdlog::error("Could not project GNSS points in '{}' with geoid '{}'", crtName, selected_geoid_model);
+                                continue;
+                            }
                             Eigen::Vector3d offset = crt_points.front();
                             for (auto& p : crt_points)
                             {
@@ -6819,9 +6718,15 @@ void display()
                         std::vector<std::string> input_file_names;
                         input_file_names = mandeye::fd::OpenFileDialog("Load TUM trajectory files", mandeye::fd::Tum_filter, true);
 
-                        if (input_file_names.size() > 0)
+                        if (!input_file_names.empty())
                         {
-                            markBulkEdit();
+#ifdef HDMAPPING_GUI_STATE
+                            submitStep2Job(
+                                "tum.import",
+                                nlohmann::json::object(),
+                                { { "paths", std::move(input_file_names) }, { "subtract_first_pose", tumSubtractFirstPose } },
+                                true);
+#else
                             if (!tls_registration.tum.load_data_from_tum(input_file_names, tumSubtractFirstPose))
                             {
                                 spdlog::error("Error loading TUM trajectory files!");
@@ -6834,6 +6739,7 @@ void display()
                                     session.point_clouds_container.offset.y(),
                                     session.point_clouds_container.offset.z());
                             }
+#endif
                         }
                     }
                     if (ImGui::IsItemHovered())
@@ -8268,28 +8174,47 @@ static nlohmann::json step2CaptureParameters()
 
 static proc::StateSummary describeStep2()
 {
+    auto operations = nlohmann::json::array(
+        { "step2.set_parameters",
+          proc::register_scans_operation,
+          proc::list_constraints_operation,
+          "constraints.add",
+          "constraints.update",
+          "constraints.remove",
+          "constraints.replace",
+          proc::constraint_icp_operation,
+          proc::optimize_graph_operation });
+    for (const auto& operation : proc::DescribeStep2Georeference())
+        operations.push_back(operation.id);
     return { {},
              step2CaptureParameters(),
              { { "kind", "session" },
                { "path", state_path },
                { "registration_result_path", registration_result_path },
                { "constraint_result_path", constraint_result_path },
+               { "georeference_result_path", georeference_result_path },
                { "active_edges", proc::DescribeActiveConstraints(session) },
+               { "control_points", proc::DescribeControlPoints(session) },
+               { "ground_control_points", proc::DescribeGroundControlPoints(session) },
+               { "reference",
+                 { { "gnss_count", tls_registration.gnss.gnss_poses.size() },
+                   { "tum_count", tls_registration.tum.tum_poses.size() },
+                   { "projected_crs", tls_registration.gnss.projected_crs },
+                   { "projected_vertical_datum", tls_registration.gnss.projected_vertical_datum },
+                   { "supported_crs", CRTs::SupportedCRTs },
+                   { "available_geoids", geoids } } },
                { "scan_count", session.point_clouds_container.point_clouds.size() },
-               { "operations",
-                 { "step2.set_parameters",
-                   proc::register_scans_operation,
-                   proc::list_constraints_operation,
-                   "constraints.add",
-                   "constraints.update",
-                   "constraints.remove",
-                   "constraints.replace",
-                   proc::constraint_icp_operation,
-                   proc::optimize_graph_operation } } } };
+               { "operations", std::move(operations) } } };
 }
 
 static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
 {
+    if (proc::IsStep2GeoreferenceOperation(request.operation))
+    {
+        if (auto error = proc::EditStep2Georeference(session, request))
+            return *error;
+        return describeStep2();
+    }
     if (request.operation != "step2.set_parameters")
     {
         if (request.operation == proc::list_constraints_operation || !proc::IsStep2ConstraintOperation(request.operation))
@@ -8315,13 +8240,54 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
     const auto constraintResult = source.parameters.find("constraints_result");
     const bool graph_job = constraintResult != source.parameters.end();
-    if (source.kind == "native_session" && (graph_job || source.parameters.contains("registration")))
+    const auto referenceResult = source.parameters.find("georeference_result");
+    const bool georeference_job = referenceResult != source.parameters.end();
+    if (source.kind == "native_session" && (graph_job || georeference_job || source.parameters.contains("registration")))
     {
         Session poses{};
         auto& live = session.point_clouds_container.point_clouds;
         if (!poses.load_snapshot_metadata(source.entry) || poses.point_clouds_container.point_clouds.size() != live.size())
             return proc::OperationError{ "invalid_result", "Registered poses do not match the live session", {} };
-        if (graph_job)
+        if (georeference_job)
+        {
+            const auto& operation = referenceResult->at("operation").get_ref<const std::string&>();
+            if (!proc::IsStep2GeoreferenceOperation(operation))
+                return proc::OperationError{ "invalid_result", "Unknown georeference result operation", {} };
+            if (operation.starts_with("cp."))
+                session.control_points.cps = std::move(poses.control_points.cps);
+            if (operation.starts_with("gcp."))
+                session.ground_control_points.gpcs = std::move(poses.ground_control_points.gpcs);
+            if (operation.starts_with("gnss.") || operation == "tum.import")
+            {
+                std::ifstream input(source.entry);
+                const auto tracks = nlohmann::json::parse(input);
+                GNSS gnss;
+                TUM tum;
+                HDMapping::DecodeReferenceTracks(tracks, gnss, tum);
+                if (operation.starts_with("gnss."))
+                {
+                    auto& live_gnss = tls_registration.gnss;
+                    live_gnss.gnss_poses = std::move(gnss.gnss_poses);
+                    live_gnss.WGS84ReferenceLatitude = gnss.WGS84ReferenceLatitude;
+                    live_gnss.WGS84ReferenceLongitude = gnss.WGS84ReferenceLongitude;
+                    live_gnss.geoidSeparation = gnss.geoidSeparation;
+                    live_gnss.setWGS84ReferenceFromFirstPose = gnss.setWGS84ReferenceFromFirstPose;
+                    live_gnss.projected_crs = std::move(gnss.projected_crs);
+                    live_gnss.projected_vertical_datum = std::move(gnss.projected_vertical_datum);
+                    session.point_clouds_container.offset_to_apply = poses.point_clouds_container.offset_to_apply;
+                }
+                else
+                {
+                    auto& live_tum = tls_registration.tum;
+                    live_tum.tum_poses = std::move(tum.tum_poses);
+                    ++live_tum.version;
+                }
+            }
+            georeference_result_path = sessionPathText(source.entry);
+            if (operation != "step2.align_reference")
+                return {};
+        }
+        else if (graph_job)
         {
             auto& graph = session.pose_graph_loop_closure;
             const auto& operation = constraintResult->at("operation").get_ref<const std::string&>();
@@ -8385,6 +8351,7 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     state_path = session_file_name;
     registration_result_path.clear();
     constraint_result_path.clear();
+    georeference_result_path.clear();
     readGnssTumFromSessionFile(session_file_name, tls_registration.gnss, tls_registration.tum);
     session_loaded = true;
     session_total_number_of_points = 0;
@@ -8507,7 +8474,7 @@ int main(int argc, char* argv[])
                           return target;
                       },
                       step2CaptureParameters(),
-                      gnssTumSessionData(tls_registration.gnss, tls_registration.tum));
+                      HDMapping::EncodeReferenceTracks(tls_registration.gnss, tls_registration.tum));
               },
               applyStep2Result });
         state_bridge = &bridge;

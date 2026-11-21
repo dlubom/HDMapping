@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -95,8 +96,16 @@ func TestStdioProduct(t *testing.T) {
 	var step2 struct {
 		Operations []struct{ ID string }
 	}
-	if err := json.Unmarshal(rawCatalog, &step2); err != nil || len(step2.Operations) != 2 || step2.Operations[0].ID != "step2.register_scans" || step2.Operations[1].ID != "step2.optimize_graph" {
+	if err := json.Unmarshal(rawCatalog, &step2); err != nil {
 		t.Fatalf("unexpected Step 2 catalog: %s (%v)", rawCatalog, err)
+	}
+	var step2IDs []string
+	for _, operation := range step2.Operations {
+		step2IDs = append(step2IDs, operation.ID)
+	}
+	slices.Sort(step2IDs)
+	if !slices.Equal(step2IDs, []string{"step2.align_reference", "step2.optimize_graph", "step2.register_scans"}) {
+		t.Fatalf("unexpected Step 2 operations: %v", step2IDs)
 	}
 
 	constraintCatalog, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_constraints_operations", Arguments: map[string]any{}})
@@ -104,6 +113,36 @@ func TestStdioProduct(t *testing.T) {
 		t.Fatalf("call constraints catalog: %v (%v)", err, constraintCatalog)
 	}
 	for _, name := range []string{"constraints.list", "constraints.add", "constraints.update", "constraints.remove", "constraints.replace", "constraints.run_icp", "step2.optimize_graph"} {
+		invalid, err := client.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: map[string]any{}})
+		if err != nil || !invalid.IsError {
+			t.Fatalf("%s must reject a missing target: %v (%v)", name, err, invalid)
+		}
+	}
+
+	georefCatalog, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_georeference_operations", Arguments: map[string]any{}})
+	if err != nil || georefCatalog.IsError {
+		t.Fatalf("call georeference catalog: %v (%v)", err, georefCatalog)
+	}
+	rawGeoref, err := json.Marshal(georefCatalog.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var georef struct {
+		Operations []struct{ ID string }
+	}
+	if err := json.Unmarshal(rawGeoref, &georef); err != nil {
+		t.Fatalf("decode georeference catalog: %v (%s)", err, rawGeoref)
+	}
+	var georefIDs []string
+	for _, operation := range georef.Operations {
+		georefIDs = append(georefIDs, operation.ID)
+	}
+	slices.Sort(georefIDs)
+	wantGeoref := []string{"cp.import", "cp.remove", "cp.update", "gcp.import", "gcp.remove", "gcp.update", "gnss.import", "gnss.project", "step2.align_reference", "tum.import"}
+	if !slices.Equal(georefIDs, wantGeoref) {
+		t.Fatalf("unexpected georeference operations: %v", georefIDs)
+	}
+	for _, name := range wantGeoref {
 		invalid, err := client.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: map[string]any{}})
 		if err != nil || !invalid.IsError {
 			t.Fatalf("%s must reject a missing target: %v (%v)", name, err, invalid)

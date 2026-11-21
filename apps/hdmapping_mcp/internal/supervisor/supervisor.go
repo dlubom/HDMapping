@@ -66,6 +66,11 @@ func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.Snap
 	if reply.Type != "snapshot_validated" {
 		return jobs.SnapshotRef{}, fmt.Errorf("unexpected snapshot validation response: %s", reply.Type)
 	}
+	if isReferenceImport(job.Request.Operation.Operation) {
+		if err := s.stageReferences(ctx, job); err != nil {
+			return jobs.SnapshotRef{}, err
+		}
+	}
 	return *snapshot, nil
 }
 
@@ -118,6 +123,13 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 	if err != nil {
 		return jobs.Publication{}, err
 	}
+	operation := job.Request.Operation
+	if isReferenceImport(operation.Operation) {
+		operation, err = s.useStagedReferences(ctx, job)
+		if err != nil {
+			return jobs.Publication{}, err
+		}
+	}
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return jobs.Publication{}, fmt.Errorf("create job directory: %w", err)
 	}
@@ -125,7 +137,7 @@ func (s *Supervisor) Run(ctx context.Context, job jobs.JobRecord) (jobs.Publicat
 	cmd.Dir = dir
 	cmd.Stderr = os.Stderr
 	reply, runErr := exchange(ctx, cmd, s.Version, command{
-		Type: "run", ID: job.ID, Operation: &job.Request.Operation, Snapshot: job.Snapshot,
+		Type: "run", ID: job.ID, Operation: &operation, Snapshot: job.Snapshot,
 	}, s.reportProgress(job.ID), true)
 	if reply.Error != nil {
 		runErr = errors.Join(runErr, reply.Error)

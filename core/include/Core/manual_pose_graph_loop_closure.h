@@ -60,6 +60,7 @@ public:
         std::function<bool(int)> remove;
         std::function<void()> optimize;
         std::function<void(double, int, bool)> icp;
+        std::function<void(const char*)> align_reference;
     };
     void Gui(
         PointClouds& point_clouds_container,

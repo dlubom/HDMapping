@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
@@ -33,15 +34,24 @@ type step1Job struct {
 	Progress       jobs.ProgressEvent `json:"progress"`
 	Snapshot       *jobs.SnapshotRef  `json:"snapshot,omitempty"`
 	Result         *jobs.Publication  `json:"result,omitempty"`
-	Error          *jobs.JobError     `json:"error,omitempty"`
+	Error          *toolJobError      `json:"error,omitempty"`
 	GUIApplyStatus string             `json:"gui_apply_status"`
+}
+
+type toolJobError struct {
+	Code          string `json:"code"`
+	Message       string `json:"message"`
+	OperationCode string `json:"operation_code,omitempty"`
+	// The SDK infers a byte-array schema from json.RawMessage. The worker
+	// supplies a JSON value whose encoding must survive the tool boundary.
+	Details any `json:"details,omitempty"`
 }
 
 type operationCatalog struct {
 	Operations []map[string]any `json:"operations"`
 }
 
-func addOperationCatalog(server *sdk.Server, call func(context.Context, string, any, any) error, family, description string) {
+func addOperationCatalog(server *sdk.Server, call func(context.Context, string, any, any) error, family, description string, operationIDs ...string) {
 	sdk.AddTool(server, &sdk.Tool{Name: "describe_" + family + "_operations", Description: description, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
 		func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, operationCatalog, error) {
 			var all []map[string]any
@@ -49,7 +59,7 @@ func addOperationCatalog(server *sdk.Server, call func(context.Context, string, 
 			result := operationCatalog{Operations: make([]map[string]any, 0)}
 			for _, operation := range all {
 				id, _ := operation["id"].(string)
-				if strings.HasPrefix(id, family+".") {
+				if (len(operationIDs) == 0 && strings.HasPrefix(id, family+".")) || slices.Contains(operationIDs, id) {
 					result.Operations = append(result.Operations, operation)
 				}
 			}
@@ -134,9 +144,16 @@ func (input step1Input) submit(operation string, access jobs.Access) (jobs.Submi
 }
 
 func summarizeJob(record jobs.JobRecord) step1Job {
-	return step1Job{
+	job := step1Job{
 		ID: record.ID, Operation: record.Request.Operation.Operation, Target: record.Request.Operation.Target,
 		Status: record.Status, Progress: record.Progress, Snapshot: record.Snapshot, Result: record.Result,
-		Error: record.Error, GUIApplyStatus: record.GUIApplyStatus,
+		GUIApplyStatus: record.GUIApplyStatus,
 	}
+	if failure := record.Error; failure != nil {
+		job.Error = &toolJobError{Code: failure.Code, Message: failure.Message, OperationCode: failure.OperationCode}
+		if len(failure.Details) != 0 {
+			job.Error.Details = failure.Details
+		}
+	}
+	return job
 }

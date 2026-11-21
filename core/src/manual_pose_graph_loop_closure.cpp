@@ -297,12 +297,18 @@ void ManualPoseGraphLoopClosure::Gui(
 
                 if (ImGui::Button("Fuse trajectory with GNSS (trajectory is rigid)"))
                 {
-                    FuseTrajectoryWithGNSS(point_clouds_container, gnss);
+                    if (actions && actions->align_reference)
+                        actions->align_reference("gnss");
+                    else
+                        FuseTrajectoryWithGNSS(point_clouds_container, gnss);
                 }
 
                 if (ImGui::Button("Fuse trajectory with TUM (trajectory is rigid)"))
                 {
-                    FuseTrajectoryWithTUM(point_clouds_container, tum);
+                    if (actions && actions->align_reference)
+                        actions->align_reference("tum");
+                    else
+                        FuseTrajectoryWithTUM(point_clouds_container, tum);
                 }
             }
         }

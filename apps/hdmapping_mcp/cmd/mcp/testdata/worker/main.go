@@ -49,7 +49,12 @@ func main() {
 	}
 	if command.Type == "describe" {
 		var operations []map[string]string
-		for _, id := range []string{"constraints.add", "constraints.list", "constraints.remove", "constraints.replace", "constraints.run_icp", "constraints.update", "step1.consistency", "step1.export", "step1.load", "step1.odometry", "step1.prepare", "step1.reference", "step1.save", "step2.register_scans", "step2.optimize_graph"} {
+		for _, id := range []string{
+			"constraints.add", "constraints.list", "constraints.remove", "constraints.replace", "constraints.run_icp", "constraints.update",
+			"cp.import", "cp.remove", "cp.update", "gcp.import", "gcp.remove", "gcp.update", "gnss.import", "gnss.project", "tum.import",
+			"step1.consistency", "step1.export", "step1.load", "step1.odometry", "step1.prepare", "step1.reference", "step1.save",
+			"step2.register_scans", "step2.optimize_graph", "step2.align_reference",
+		} {
 			operations = append(operations, map[string]string{"id": id})
 		}
 		write(map[string]any{"type": "operations", "operations": operations})
@@ -81,7 +86,18 @@ func main() {
 		write(map[string]any{"type": "snapshot_captured", "snapshot": jobs.SnapshotRef{ManifestPath: path, Target: command.Operation.Target}})
 		return
 	}
-	if command.Operation.Operation == "durable" || command.Operation.Operation == "step1.prepare" {
+	referenceImport := command.Operation.Operation == "gnss.import" || command.Operation.Operation == "tum.import"
+	if referenceImport {
+		var parameters struct{ Paths []string }
+		if err := json.Unmarshal(command.Operation.Parameters, &parameters); err != nil || len(parameters.Paths) != 1 {
+			os.Exit(12)
+		}
+		data, err := os.ReadFile(parameters.Paths[0])
+		if err != nil || string(data) != "recorded reference\n" {
+			os.Exit(13)
+		}
+	}
+	if command.Operation.Operation == "durable" || command.Operation.Operation == "step1.prepare" || referenceImport {
 		command.Snapshot.ManifestPath = "snapshot.json"
 		if err := os.WriteFile("snapshot.json", []byte(`{"fixture_complete":true}`), 0600); err != nil {
 			os.Exit(8)
@@ -101,7 +117,7 @@ func main() {
 			os.Exit(6)
 		}
 		progress("durable")
-		if command.Operation.Operation == "step1.prepare" {
+		if command.Operation.Operation == "step1.prepare" || referenceImport {
 			write(map[string]any{"type": "completed"})
 			return
 		}

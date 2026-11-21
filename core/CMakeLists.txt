@@ -11,6 +11,7 @@ set(CORE_BASE_SOURCES
     src/nmea.cpp
     src/point_cloud.cpp
     src/point_clouds.cpp
+    src/reference_tracks.cpp
     src/session.cpp
     src/tum.cpp
    # # src/utils.cpp # TODO(mwlasiuk) : broken AF ...
@@ -30,6 +31,8 @@ set(CORE_MATH_SOURCES
     src/pair_wise_iterative_closest_point.cpp
     src/pose_graph_loop_closure.cpp
     src/pose_graph_slam.cpp
+    src/reference_alignment.cpp
+
     src/registration_plane_feature.cpp
     src/point_cloud_evaluation.cpp
 )

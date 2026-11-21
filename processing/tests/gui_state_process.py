@@ -79,6 +79,41 @@ def check(binaries, directory):
                     else:
                         assert model[key] == expected, model[key]
             print(program, opening, changed, parameters, flush=True)
+        # Exercise the Step 2 owner, durable snapshot, worker and auto-apply
+        # through the same MCP calls as an external client.
+        control = [
+            {"name": str(i), "scan_index": 0, "local_m": local,
+             "target_m": [local[0] + 8, local[1] - 2, local[2] + 3],
+             "sigma_m": [0.01, 0.02, 0.03]}
+            for i, local in enumerate(([0, 0, 0], [1, 0, 0], [0, 1, 0]))
+        ]
+        added = call("cp.import", {"target": changed, "parameters": {"points": control}})
+        state = added["structuredContent"]["state"]
+        assert len(state["metadata"]["control_points"]) == 3
+        alignment = {"request_key": "gui-align-cp", "target": state["target"], "parameters": {"source": "cp"}}
+        submitted = call("step2.align_reference", alignment)["structuredContent"]["job"]
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            result = call("get_job", {"job_id": submitted["job_id"]})["structuredContent"]
+            assert result["status"] not in {"failed", "cancelled", "interrupted"}, result
+            if result["status"] == "completed" and result["gui_apply_status"] == "applied":
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError(result)
+        while time.monotonic() < deadline:
+            current = next((s for s in call("list_open_states", {})["structuredContent"]["states"]
+                            if s["state_id"] == changed["state_id"] and s["revision"] > state["target"]["revision"]), None)
+            if current:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("auto-applied revision is not visible")
+        metadata = call("describe_state", {"target": current})["structuredContent"]["metadata"]
+        published = Path(metadata["georeference_result_path"])
+        assert len(json.loads(published.read_text())["control_points"]) == 3
+        assert not json.loads(session.read_text()).get("control_points")
+        print("Step 2 CP captured from the live GUI and auto-applied", submitted["job_id"], flush=True)
         assert len(ids) == 4
     finally:
         adapter.stdin.close()

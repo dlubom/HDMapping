@@ -3,9 +3,11 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	"github.com/google/jsonschema-go/jsonschema"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -97,5 +99,54 @@ func TestServerContract(t *testing.T) {
 	}
 	if _, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "run_odometry", Arguments: map[string]any{}}); err == nil {
 		t.Fatal("unimplemented tool accepted")
+	}
+}
+
+func TestGetJobPreservesWorkerErrorDetails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	srv := NewWithCoordinator("1.2.3", func(_ context.Context, method string, in, out any) error {
+		if method != "jobs.get" || in != jobs.JobID("projection-job") {
+			return fmt.Errorf("unexpected request %s, %v", method, in)
+		}
+		*out.(*jobs.JobRecord) = jobs.JobRecord{
+			ID: "projection-job", Status: jobs.Failed, Error: &jobs.JobError{
+				Code: "execution_failed", OperationCode: "missing_geoid", Message: "grid file unavailable",
+				Details: json.RawMessage(`{"geoid":"missing-grid.gtx"}`),
+			},
+		}
+		return nil
+	})
+	serverTransport, clientTransport := sdk.NewInMemoryTransports()
+	session, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := sdk.NewClient(&sdk.Implementation{Name: "contract-test", Version: "1"}, nil).Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	result, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "get_job", Arguments: map[string]any{"job_id": "projection-job"}})
+	if err != nil || result.IsError {
+		t.Fatalf("get_job rejected worker error details: %v (%v)", err, result)
+	}
+	data, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response jobs.JobRecord
+	if err := json.Unmarshal(data, &response); err != nil || response.Status != jobs.Failed || response.Error == nil ||
+		response.Error.OperationCode != "missing_geoid" || string(response.Error.Details) != `{"geoid":"missing-grid.gtx"}` {
+		t.Fatalf("get_job lost the structured worker error: %s (%v)", data, err)
 	}
 }
