@@ -8,6 +8,7 @@
 #include <array>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,7 @@ public:
         header->x_scale_factor = coordinate_scale;
         header->y_scale_factor = coordinate_scale;
         header->z_scale_factor = coordinate_scale;
+        header_offset_ = { offset_x, offset_y, offset_z };
         header->x_offset = offset_x;
         header->y_offset = offset_y;
         header->z_offset = offset_z;
@@ -128,6 +130,19 @@ public:
         coordinates[1] = position.y() + offset_y;
         coordinates[2] = position.z() + offset_z;
 
+        // LASzip quantizes to a signed 32-bit integer without its own range check.
+        constexpr auto min_quantized = static_cast<double>(std::numeric_limits<std::int32_t>::min());
+        constexpr auto max_quantized = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+        for (std::size_t i = 0; i < header_offset_.size(); ++i)
+        {
+            const auto sample = std::round((coordinates[i] - header_offset_[i]) / coordinate_scale);
+            if (!std::isfinite(sample) || sample < min_quantized || sample > max_quantized)
+            {
+                std::cerr << "Point exceeds the LAS coordinate range for the selected offset and scale\n";
+                return false;
+            }
+        }
+
         if (laszip_set_coordinates(writer_, coordinates))
         {
             fprintf(stderr, "DLL ERROR: setting coordinates\n");
@@ -183,6 +198,7 @@ public:
 private:
     laszip_POINTER writer_ = nullptr;
     laszip_point* point_ = nullptr;
+    std::array<double, 3> header_offset_{};
 };
 
 inline bool exportLaz(
@@ -488,7 +504,7 @@ inline bool save_intersection(
         }
     }
 
-    return exportLaz(
+    const bool written = exportLaz(
         output_las_name,
         pointcloud,
         intensity,
@@ -497,6 +513,9 @@ inline bool save_intersection(
         session.point_clouds_container.offset.y(),
         session.point_clouds_container.offset.z(),
         include_scan_ids ? &point_source_ids : nullptr);
+    if (!written)
+        std::cerr << "problem with saving file: " << output_las_name << std::endl;
+    return written;
 }
 
 inline bool save_all_to_las(const Session& session, std::string output_las_name, bool as_local, bool skip_ts_0)

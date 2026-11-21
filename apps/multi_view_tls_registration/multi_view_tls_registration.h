@@ -152,6 +152,4 @@ void initial_pose_to_identity(Session& session);
 
 void save_separately_to_las(const Session& session, fs::path outwd, std::string extension = ".las");
 
-
-
 void run_multi_view_tls_registration(std::string input_file_name, TLSRegistration& tls_registration, std::string output_dir = "");
