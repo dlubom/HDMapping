@@ -77,6 +77,14 @@ def main():
             # Run the native test in the same environment as CTest.
             command[-1:] = ["-run=^TestStdioProduct$", "./cmd/mcp"]
             run(command, cwd=properties["WORKING_DIRECTORY"], env=dict(os.environ, **environment))
+            if os.name == "nt":
+                # Exercise the pinned PROJ data with relocated runtime DLLs
+                # and an unrelated working directory, as in the worker.
+                georeference = next(test for test in tests if test["name"] == "processing-georeference")
+                probe = executable.with_name("processing_georeference_test.exe")
+                shutil.copy2(georeference["command"][0], probe)
+                run([probe, "--test-case=GNSS CRS projection persists its datum and preserves the WGS84 fix"],
+                    cwd=temporary)
         elif executable.exists() or any(
             next(relocated.rglob(f"*{name}*"), None)
             for name in ("hdmapping_mcp", "hdmapping_coordinator", "hdmapping_worker")

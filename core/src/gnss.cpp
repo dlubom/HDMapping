@@ -14,38 +14,50 @@
 #include <cstdlib>
 #include <laszip/laszip_api.h>
 #include <proj.h>
-const std::string Elipsooid = "WGS84Ellipsoid";
 
-// path to find
-const std::vector<std::string> PathCandidate{
-    std::filesystem::current_path().string(),
-    std::filesystem::current_path().string() + "/proj",
-    std::filesystem::current_path().string() + "/share/proj",
-    std::filesystem::current_path().string() + "/data/proj",
-    "/usr/local/share/proj",
-    "/usr/share/proj",
-    "C:/HDMapping",
-};
+#ifdef _WIN32
+#include <windows.h>
+
+namespace
+{
+    std::filesystem::path executableDirectory()
+    {
+        std::array<wchar_t, 32768> path{};
+        const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0 || length >= path.size())
+            return {};
+        return std::filesystem::path(path.data(), path.data() + length).parent_path();
+    }
+} // namespace
+#endif
+
+const std::string Elipsooid = "WGS84Ellipsoid";
 
 std::vector<std::string> GNSS::get_available_geoids()
 {
-    std::set<std::string> unique;
-    unique.insert(Elipsooid);
-
-    // Respect HD_MAPPING_PROJ environment variable if set. It can point to a directory
-    // containing geoid grid files (*.gtx). If present, search it first.
-    std::vector<std::string> paths = PathCandidate;
-    const char* env_proj = std::getenv("HD_MAPPING_ASSETS");
-    if (env_proj && std::string(env_proj).size() > 0)
+    namespace fs = std::filesystem;
+    std::set<std::string> unique{ Elipsooid };
+    const auto current = fs::current_path();
+    std::vector<fs::path> paths{
+        current,           current / "proj", current / "share" / "proj", current / "data" / "proj", "/usr/local/share/proj",
+        "/usr/share/proj", "C:/HDMapping",
+    };
+#ifdef _WIN32
+    if (const auto directory = executableDirectory(); !directory.empty())
+        paths.push_back(directory);
+    const auto* env_proj = _wgetenv(L"HD_MAPPING_ASSETS");
+#else
+    const auto* env_proj = std::getenv("HD_MAPPING_ASSETS");
+#endif
+    if (env_proj && env_proj[0] != 0)
     {
-        // insert at front so user-specified path is searched first
-        paths.insert(paths.begin(), std::string(env_proj));
-        std::cout << "HD_MAPPING_ASSETS set: " << env_proj << std::endl;
+        const fs::path directory(env_proj);
+        paths.insert(paths.begin(), directory);
+        std::cout << "HD_MAPPING_ASSETS set: " << sessionPathText(directory) << std::endl;
     }
 
-    for (const auto& path : paths)
+    for (const auto& proj_path : paths)
     {
-        std::filesystem::path proj_path(path);
         std::error_code ec;
         if (std::filesystem::exists(proj_path, ec) && !ec)
         {
@@ -64,11 +76,11 @@ std::vector<std::string> GNSS::get_available_geoids()
                 }
                 const auto& entry = *dir_it;
                 if (entry.is_regular_file(ec) && !ec && entry.path().extension() == ".gtx")
-                    if (entry.is_regular_file() && entry.path().extension() == ".gtx")
-                    {
-                        std::cout << "found geoid model: " << entry.path().string() << std::endl;
-                        unique.insert(entry.path().string());
-                    }
+                {
+                    auto filename = sessionPathText(entry.path());
+                    std::cout << "found geoid model: " << filename << std::endl;
+                    unique.insert(std::move(filename));
+                }
             }
         }
     }
@@ -537,6 +549,20 @@ std::vector<Eigen::Vector3d> GNSS::CRTConvert(
     std::cout << "target CRT " << target << std::endl;
 
     PJ_CONTEXT* ctx = proj_context_create();
+#ifdef _WIN32
+    // deploy_mandeye uses a flat directory. The worker's current directory
+    // is its private job directory, so use the database next to the binary.
+    if (const auto directory = executableDirectory(); !directory.empty() && !std::getenv("PROJ_DATA") && !std::getenv("PROJ_LIB"))
+    {
+        const auto database = directory / "proj.db";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(database, ec))
+        {
+            const auto location = sessionPathText(database);
+            proj_context_set_database_path(ctx, location.c_str(), nullptr, nullptr);
+        }
+    }
+#endif
     PJ* P_geoid = nullptr;
 
     if (!(geoid.empty() || geoid == Elipsooid))

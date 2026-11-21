@@ -78,6 +78,17 @@ if(WIN32)
     set (PROJ_IMPLIB "${PROJ_ROOT}/lib/proj.lib")
     set (PROJ_DB "${PROJ_ROOT}/share/proj/proj.db")
 
+    # PROJ resolves resources relative to its DLL. Multi-config generators
+    # put the runtime DLLs one directory below CMAKE_RUNTIME_OUTPUT_DIRECTORY.
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(_proj_build_data "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/share/proj")
+    else()
+        set(_proj_build_data "${CMAKE_BINARY_DIR}/share/proj")
+    endif()
+    configure_file("${PROJ_DB}" "${_proj_build_data}/proj.db" COPYONLY)
+    unset(_proj_build_data)
+    install(FILES "${PROJ_DB}" DESTINATION share/proj COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+
     # ----------------------------
     # Create imported target
     # ----------------------------
