@@ -26,6 +26,6 @@ namespace HDMapping::Processing
     //! Validate the entire pose edit before writing any scan, and return the edited indices.
     SegmentEditResult EditStep2Poses(PointClouds& clouds, const OperationRequest& request);
 
-    //! Transfer only explicitly scoped poses from a published result into a live session.
-    SegmentEditResult ApplyStep2PoseResult(PointClouds& live, const PointClouds& result, const nlohmann::json& scope);
+    //! Transfer only explicitly scoped current or initial poses from a published result.
+    SegmentEditResult ApplyStep2PoseResult(PointClouds& live, const PointClouds& result, const nlohmann::json& scope, bool initial = false);
 } // namespace HDMapping::Processing

@@ -1,4 +1,5 @@
 #include "step2_io_operations.h"
+#include "step2_segment_operations.h"
 
 #include <Core/e57_utils.h>
 #include <Core/session.h>
@@ -227,6 +228,25 @@ TEST_CASE("published Step 2 exports honor explicit hidden scans and snapshot vis
     REQUIRE(updated.load_published(entry(std::get<ArtifactManifest>(inverse))));
     CHECK(updated.point_clouds_container.point_clouds.at(1).m_pose.translation().x() == doctest::Approx(-4));
     CHECK(updated.point_clouds_container.point_clouds.at(1).m_initial_pose.translation().x() == doctest::Approx(0));
+
+    // Applying a pose file must retain the live cloud objects and visibility.
+    auto live = clouds;
+    auto& original = live.point_clouds.at(1);
+    original.visible = false;
+    const auto geometry = original.points_local;
+    const auto initial_before = original.m_initial_pose;
+    auto applied = ApplyStep2PoseResult(live, updated.point_clouds_container, { { "scan_indices", { 1 } } });
+    CHECK(std::holds_alternative<std::vector<std::size_t>>(applied));
+    CHECK_FALSE(original.visible);
+    CHECK(original.points_local == geometry);
+    CHECK(original.m_initial_pose.matrix() == initial_before.matrix());
+    CHECK(original.m_pose.translation().x() == doctest::Approx(-4));
+    updated.point_clouds_container.point_clouds.at(1).m_initial_pose.translation().x() = 8;
+    applied = ApplyStep2PoseResult(live, updated.point_clouds_container, { { "scan_indices", { 1 } } }, true);
+    CHECK(std::holds_alternative<std::vector<std::size_t>>(applied));
+    CHECK_FALSE(original.visible);
+    CHECK(original.m_pose.translation().x() == doctest::Approx(-4));
+    CHECK(original.m_initial_pose.translation().x() == doctest::Approx(8));
 
     RunContext invalid{ scratch.path / "invalid", {}, {} };
     REQUIRE(fs::create_directory(invalid.output_directory));

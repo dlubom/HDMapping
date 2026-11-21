@@ -8476,8 +8476,12 @@ static proc::StateSummary describeStep2()
         operations.push_back(operation.id);
     for (const auto& operation : proc::DescribeStep2Segments())
         operations.push_back(operation.id);
-    for (const auto operation :
-         { proc::session_open_operation, proc::session_save_operation, proc::session_subsession_operation, proc::export_session_operation })
+    for (const auto operation : { proc::session_open_operation,
+                                  proc::session_save_operation,
+                                  proc::session_subsession_operation,
+                                  proc::import_session_poses_operation,
+                                  proc::import_session_observations_operation,
+                                  proc::export_session_operation })
         operations.push_back(operation);
     return { {},
              step2CaptureParameters(),
@@ -8539,8 +8543,21 @@ static std::optional<proc::OperationError> applyStep2Result(const proc::Artifact
     if (auto* error = std::get_if<proc::OperationError>(&snapshot))
         return *error;
     const auto& source = std::get<proc::SnapshotContents>(snapshot);
-    if (source.kind == "native_session" &&
-        source.parameters.value("session_io_import", std::string{}) == proc::import_session_observations_operation)
+    const auto imported_io = source.parameters.value("session_io_import", std::string{});
+    if (source.kind == "native_session" && imported_io == proc::import_session_poses_operation)
+    {
+        Session poses{};
+        if (!poses.load_snapshot_metadata(source.entry))
+            return proc::OperationError{ "invalid_result", "Could not read the imported RESSO poses", {} };
+        const bool initial = source.parameters.at("session_io_initial_poses").get<bool>();
+        auto result = proc::ApplyStep2PoseResult(
+            session.point_clouds_container, poses.point_clouds_container, source.parameters.at("session_io_pose_scope"), initial);
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+        return {};
+    }
+    if (source.kind == "native_session" && imported_io == proc::import_session_observations_operation)
     {
         std::vector<std::map<int, Eigen::Vector3d>> imported;
         const auto& clouds = session.point_clouds_container;

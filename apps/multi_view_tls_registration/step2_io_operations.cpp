@@ -291,13 +291,17 @@ namespace HDMapping::Processing
                 }
                 if (!poses.update_poses_from_RESSO({}, path, true, true))
                     return io_error("session_import_failed", "The RESSO file does not contain exactly the selected scan names");
+                source.parameters["session_io_pose_scope"] = { { "scan_indices", selected } };
+                source.parameters["session_io_initial_poses"] = mode == "initial";
                 for (std::size_t i = 0; i < selected.size(); ++i)
                 {
                     auto pose = poses.point_clouds[i].m_pose;
                     if (mode == "inverse")
                         pose = pose.inverse();
-                    if (!pose.matrix().allFinite())
-                        return io_error("invalid_parameter", "The RESSO file contains an invalid pose");
+                    const auto determinant = pose.linear().determinant();
+                    if (!pose.matrix().allFinite() || !std::isfinite(determinant) || std::abs(determinant) <= 1e-12 ||
+                        pose.translation().cwiseAbs().maxCoeff() > std::numeric_limits<float>::max())
+                        return io_error("invalid_parameter", "The RESSO file requires finite, invertible poses");
                     auto& scan = scans[selected[i]];
                     if (mode == "initial")
                         scan.m_initial_pose = pose;

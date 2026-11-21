@@ -75,13 +75,19 @@ namespace HDMapping::Processing
             return Eigen::Affine3d(matrix);
         }
 
-        SegmentEditResult commit(PointClouds& clouds, std::vector<std::size_t> indices, const std::vector<Eigen::Affine3d>& poses)
+        SegmentEditResult commit(
+            PointClouds& clouds, std::vector<std::size_t> indices, const std::vector<Eigen::Affine3d>& poses, bool initial = false)
         {
             if (poses.size() != indices.size() || !std::ranges::all_of(poses, validPose))
                 return OperationError{ "invalid_pose", "The pose edit requires finite, invertible poses", {} };
             for (std::size_t i = 0; i < indices.size(); ++i)
             {
                 auto& scan = clouds.point_clouds[indices[i]];
+                if (initial)
+                {
+                    scan.m_initial_pose = poses[i];
+                    continue;
+                }
                 scan.m_pose = poses[i];
                 scan.pose = pose_tait_bryan_from_affine_matrix(scan.m_pose);
                 scan.gui_translation[0] = static_cast<float>(scan.pose.px);
@@ -205,7 +211,7 @@ namespace HDMapping::Processing
         return commit(clouds, std::move(indices), poses);
     }
 
-    SegmentEditResult ApplyStep2PoseResult(PointClouds& live, const PointClouds& result, const json& scope)
+    SegmentEditResult ApplyStep2PoseResult(PointClouds& live, const PointClouds& result, const json& scope, bool initial)
     {
         auto indices = readScope(scope, live.point_clouds.size());
         if (indices.empty() || live.point_clouds.size() != result.point_clouds.size())
@@ -213,7 +219,7 @@ namespace HDMapping::Processing
         std::vector<Eigen::Affine3d> poses;
         poses.reserve(indices.size());
         for (const auto i : indices)
-            poses.push_back(result.point_clouds[i].m_pose);
-        return commit(live, std::move(indices), poses);
+            poses.push_back(initial ? result.point_clouds[i].m_initial_pose : result.point_clouds[i].m_pose);
+        return commit(live, std::move(indices), poses, initial);
     }
 } // namespace HDMapping::Processing

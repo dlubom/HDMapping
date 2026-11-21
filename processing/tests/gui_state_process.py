@@ -170,7 +170,13 @@ def check(binaries, directory):
         io_job("session.open", "live-session-open", "applied", target=applied, parameters=params)
         after_open = dict(applied, revision=applied["revision"] + 1)
         assert call("describe_state", {"target": after_open})["structuredContent"]["target"] == after_open
-        _, saved = io_job("session.save", "live-session-save", target=after_open)
+        scan = Path(json.loads(session.read_text())["laz_file_names"][0]["file_name"]).name
+        poses = directory / "scoped poses.reg"
+        poses.write_text(f"1\n{scan}\n1 0 0 12\n0 1 0 0\n0 0 1 0\n0 0 0 1\n")
+        io_job("session.import_poses", "live-session-poses", "applied", target=after_open, scope={"scan_indices": [0]},
+               parameters={"mode": "current", "paths": [str(poses)]})
+        after_import = dict(after_open, revision=after_open["revision"] + 1)
+        _, saved = io_job("session.save", "live-session-save", target=after_import)
         subprocess.run([binaries / "processing_publication_test", "--read", saved.parent.parent], check=True)
         _, exported = io_job("export_result", "headless-session-export", snapshot=restore["result"]["snapshot"],
                              scope={"scan_indices": [0]}, parameters={"format": "laz", "skip_zero_timestamps": False})
