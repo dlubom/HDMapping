@@ -149,6 +149,11 @@ endif()
 
 if(BUILD_WITH_MCP)
     include(cmake/processing_quality.cmake)
+    if(HDMAPPING_PROCESSING_SANITIZER STREQUAL "thread")
+        # The native reader instantiates oneTBB's task completion atomics in core_no_gui.
+        target_compile_options(core_no_gui PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(core_no_gui INTERFACE -fsanitize=thread)
+    endif()
     add_subdirectory(processing)
     add_subdirectory(apps/hdmapping_worker)
     add_subdirectory(apps/hdmapping_mcp)
