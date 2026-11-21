@@ -107,13 +107,16 @@ TEST_CASE("published Step 2 exports honor explicit hidden scans and snapshot vis
     }
     const auto observations = json::array(
         { json::array({ { { "scan_id", 0 }, { "local_coords", { 1, 2, 3 } } }, { { "scan_id", 1 }, { "local_coords", { 4, 5, 6 } } } }) });
+    auto metadata = DescribeSessionExchange(*session);
+    metadata["visible_scans"] = { 0 };
+    metadata["observations"] = observations;
     SessionCaptureSource source(
         session,
         [target]
         {
             return target;
         },
-        { { "visible_scans", { 0 } }, { "observations", observations } });
+        std::move(metadata));
     RunContext capture{ scratch.path / "input", {}, {} };
     const auto snapshot = std::get<SnapshotRef>(CaptureSnapshot(source, target.revision, capture.output_directory, capture));
     clouds.point_clouds[0].visible = false;

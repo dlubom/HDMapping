@@ -8356,7 +8356,6 @@ static nlohmann::json step2EditorInputs()
               scan.points_local.size(),
               scan.normal_vectors_local.size(),
               scan.local_trajectory.size(),
-              scan.visible,
               scan.fuse_inclination_from_IMU,
               scan.fixed_x,
               scan.fixed_y,
@@ -8436,6 +8435,7 @@ static nlohmann::json step2EditorInputs()
 static nlohmann::json step2CaptureParameters()
 {
     auto parameters = describeStep2Parameters(tls_registration);
+    parameters.update(proc::DescribeSessionExchange(session));
     auto selected = nlohmann::json::array();
     const auto& scans = session.point_clouds_container.point_clouds;
     for (std::size_t i = 0; i < scans.size(); ++i)

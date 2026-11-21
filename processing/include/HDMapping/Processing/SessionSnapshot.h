@@ -29,6 +29,9 @@ namespace HDMapping::Processing
         nlohmann::json tracks_;
     };
 
+    //! Metadata for Step 2 exchange formats, independent of private cache filenames.
+    nlohmann::json DescribeSessionExchange(const Session& session);
+
     struct SessionSnapshot
     {
         std::unique_ptr<Session> session;

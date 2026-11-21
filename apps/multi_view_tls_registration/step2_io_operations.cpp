@@ -206,13 +206,15 @@ namespace HDMapping::Processing
                     }
                 }
 
+                auto metadata = DescribeSessionExchange(*session);
+                metadata["session_open"] = true;
                 SessionCaptureSource capture(
                     std::move(session),
                     [this]
                     {
                         return Target();
                     },
-                    json{ { "session_open", true } },
+                    std::move(metadata),
                     std::move(tracks));
                 return capture.Materialize(directory, context);
             }
