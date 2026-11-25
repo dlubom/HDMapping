@@ -273,38 +273,20 @@ void build_rgd_init_job(int i, PointCloud::Job* job, std::vector<PointCloud::Buc
 void build_rgd_job(
     int i, PointCloud::Job* job, std::vector<PointCloud::PointBucketIndexPair>* index_pair, std::vector<PointCloud::Bucket>* buckets)
 {
-    for (uint64_t ii = job->index_begin_inclusive; ii < job->index_end_exclusive; ii++)
+    const auto& pairs = *index_pair;
+    for (uint64_t ind = job->index_begin_inclusive; ind < job->index_end_exclusive; ++ind)
     {
-        uint64_t ind = ii;
-        if (ind == 0)
+        const auto bucket_index = pairs[ind].index_of_bucket;
+        // Only the first and last points of each sorted run write its endpoints.
+        if (ind == 0 || pairs[ind - 1].index_of_bucket != bucket_index)
         {
-            uint64_t index_of_bucket = (*index_pair)[ind].index_of_bucket;
-            uint64_t index_of_bucket_1 = (*index_pair)[ind + 1].index_of_bucket;
-
-            (*buckets)[index_of_bucket].index_begin = ind;
-            if (index_of_bucket != index_of_bucket_1)
-            {
-                (*buckets)[index_of_bucket].index_end = ind + 1;
-                (*buckets)[index_of_bucket_1].index_end = ind + 1;
-            }
+            (*buckets)[bucket_index].index_begin = ind;
         }
-        else if (ind == (*buckets).size() - 1)
-        {
-            if ((*index_pair)[ind].index_of_bucket < (*buckets).size())
-            {
-                (*buckets)[(*index_pair)[ind].index_of_bucket].index_end = ind + 1;
-            }
-        }
-        else if (ind + 1 < (*index_pair).size())
-        {
-            uint64_t index_of_bucket = (*index_pair)[ind].index_of_bucket;
-            uint64_t index_of_bucket_1 = (*index_pair)[ind + 1].index_of_bucket;
 
-            if (index_of_bucket != index_of_bucket_1)
-            {
-                (*buckets)[index_of_bucket].index_end = ind + 1;
-                (*buckets)[index_of_bucket_1].index_begin = ind + 1;
-            }
+        const auto next = ind + 1;
+        if (next == pairs.size() || pairs[next].index_of_bucket != bucket_index)
+        {
+            (*buckets)[bucket_index].index_end = next;
         }
     }
 }

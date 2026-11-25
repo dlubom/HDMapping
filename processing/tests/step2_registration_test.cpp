@@ -1,3 +1,4 @@
+#include <Core/point_cloud.h>
 #include <Core/session.h>
 #include <HDMapping/Processing/Operation.h>
 #include <HDMapping/Processing/SessionSnapshot.h>
@@ -7,6 +8,25 @@
 #include <doctest/doctest.h>
 
 using namespace HDMapping::Processing;
+
+TEST_CASE("the regular grid retains complete bucket ranges across worker boundaries")
+{
+    PointCloud cloud;
+    cloud.points_local = { { 2.0, 0.0, 0.0 }, { 0.2, 0.0, 0.0 }, { 0.3, 0.0, 0.0 }, { 0.0, 0.0, 0.0 }, { 0.1, 0.0, 0.0 } };
+    cloud.rgd_params.bounding_box_extension = 0.0;
+    cloud.rgd_params.resolution_X = 1.0;
+    cloud.num_threads = 5;
+
+    REQUIRE(cloud.build_rgd());
+    REQUIRE(cloud.buckets.size() == 3);
+    CHECK(cloud.buckets[0].index_begin == 0);
+    CHECK(cloud.buckets[0].index_end == 4);
+    CHECK(cloud.buckets[0].number_of_points == 4);
+    CHECK(cloud.buckets[1].number_of_points == 0);
+    CHECK(cloud.buckets[2].index_begin == 4);
+    CHECK(cloud.buckets[2].index_end == 5);
+    CHECK(cloud.buckets[2].number_of_points == 1);
+}
 
 TEST_CASE("the worker publishes its Step 2 registration contract and rejects stale revisions")
 {
