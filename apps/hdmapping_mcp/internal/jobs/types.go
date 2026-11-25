@@ -82,10 +82,21 @@ const DetectLoopCandidates = "constraints.detect_candidates"
 // OpenSession admits external Step 2 input before a worker publishes the session.
 const OpenSession = "session.open"
 
+// OpenProject admits an external native multi-session project.
+const OpenProject = "project.open"
+
+// AddProjectSession captures external session input with an existing project.
+const AddProjectSession = "project.add_session"
+
+// IsExternalOpen reports whether the operation opens files without a base snapshot.
+func IsExternalOpen(operation string) bool {
+	return operation == OpenSession || operation == OpenProject
+}
+
 // SubmitRequest describes one heavy job. Access controls exclusive reservation,
 // independently of its source. Exactly one input is specified: a durable Snapshot,
 // a live CaptureSource reserved until Prepare returns, a raw Step 1 Recording,
-// or external files named by a session.open operation.
+// or external files named by an external opening.
 type SubmitRequest struct {
 	RequestKey    string           `json:"request_key"`
 	Operation     OperationRequest `json:"operation"`

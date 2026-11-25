@@ -348,7 +348,8 @@ namespace HDMapping::Processing
         const OperationExecutor& execute,
         const CaptureRecording& capture_recording,
         const CaptureReferences& capture_references,
-        const CaptureSessionOpen& capture_session_open)
+        const CaptureSessionOpen& capture_session_open,
+        const CaptureProjectInput& capture_project_input)
     {
         send_packet(send, { { "type", "hello" }, { "wire", wire_version }, { "version", identity.version }, { "pid", identity.pid } });
         std::string type;
@@ -357,6 +358,9 @@ namespace HDMapping::Processing
         std::optional<RecordingCommand> recording;
         std::optional<ReferenceCommand> references;
         std::optional<std::pair<OperationRequest, std::filesystem::path>> session_open;
+        std::optional<OperationRequest> project_input;
+        std::optional<SnapshotRef> project_base;
+        std::filesystem::path project_destination;
         try
         {
             const auto packet = read_packet(input);
@@ -385,6 +389,19 @@ namespace HDMapping::Processing
             {
                 session_open = parse_session_open(*packet);
             }
+            else if (type == "capture_step3_project" && capture_project_input)
+            {
+                const auto& operation = packet->at("operation");
+                const auto name = operation.at("operation").get<std::string>();
+                if ((name != "project.open" && name != "project.add_session") || !operation.at("scope").is_object() ||
+                    !operation.at("parameters").is_object())
+                    throw std::invalid_argument("Invalid project capture request");
+                project_input =
+                    OperationRequest{ name, parse_target(operation.at("target")), operation.at("scope"), operation.at("parameters") };
+                if (name == "project.add_session")
+                    project_base = parse_snapshot(packet->at("snapshot"));
+                project_destination = capture_destination(*packet);
+            }
         } catch (const std::exception& error)
         {
             send_error(send, { "invalid_request", error.what(), json::object() });
@@ -403,7 +420,8 @@ namespace HDMapping::Processing
                 send_error(send, *failure);
             }
             else if (const auto& kind = std::get<SnapshotContents>(result).kind; kind != SessionSnapshotPaths::kind &&
-                     kind != native_session_kind && kind != "step1_recording" && kind != "step1_prepared")
+                     kind != native_session_kind && kind != "native_project" && kind != "project" && kind != "step1_recording" &&
+                     kind != "step1_prepared")
             {
                 send_error(send, { "invalid_snapshot", "Unsupported snapshot kind", json::object() });
             }
@@ -446,6 +464,18 @@ namespace HDMapping::Processing
                 [&](RunContext& context)
                 {
                     return captured_snapshot(capture_session_open(session_open->first, context));
+                });
+            return;
+        }
+        if (project_input)
+        {
+            run_cancellable(
+                input,
+                send,
+                project_destination,
+                [&](RunContext& context)
+                {
+                    return captured_snapshot(capture_project_input(*project_input, project_base, context));
                 });
             return;
         }

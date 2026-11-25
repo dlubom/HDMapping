@@ -45,11 +45,14 @@
 
 #ifdef HDMAPPING_GUI_BRIDGE
 #include "project_capture.h"
+#include "project_operations.h"
 #include <HDMapping/Processing/GuiStateBridge.h>
 #include <HDMapping/Processing/GuiStateConnection.h>
 #endif
 #include "multi_session_factor_graph.h"
+#include "project_io.h"
 #include "raylib_utils.h"
+#include <HDMapping/SessionPaths.h>
 
 std::string winTitle = std::string("Step 3 (Multi session registration) ") + HDMAPPING_CONFIGURE_PROJECT_VERSION;
 
@@ -181,22 +184,18 @@ int old_index_gizmo = -1;
 
 double time_stamp_offset = 0.0;
 
-struct ProjectSettings
-{
-    std::vector<std::string> session_file_names;
-};
+ProjectSettings project_settings;
 
 // Project file opened or last saved; empty until then (Save project falls back to Save project as).
 std::string project_file_name;
 
-std::vector<Edge> edges;
+auto& edges = project_settings.edges;
 int index_active_edge = -1;
 //!< Last index_active_edge the edge list was scrolled to (loop_closure_gui()).
 int edge_list_scrolled_to = -1;
 bool manipulate_active_edge = false;
 bool edge_gizmo = false;
 
-ProjectSettings project_settings;
 std::vector<Session> sessions;
 
 int viewer_reduce_rendered_trajectory = 1;
@@ -232,6 +231,7 @@ namespace
     using json = nlohmann::json;
     std::unique_ptr<proc::GuiStateBridge> guiState;
     std::unique_ptr<proc::GuiStateConnection> guiConnection;
+    proc::ProjectSessionSources projectSources;
 } // namespace
 #endif
 
@@ -1312,83 +1312,6 @@ void save_trajectories(
     }
 }
 
-static nlohmann::json projectSettingsJson(const ProjectSettings& _project_settings)
-{
-    nlohmann::json jj;
-
-    nlohmann::json jsession_file_names;
-    for (const auto& pc : _project_settings.session_file_names)
-    {
-        nlohmann::json jfn{ { "session_file_name", pc } };
-        jsession_file_names.push_back(jfn);
-    }
-    jj["session_file_names"] = jsession_file_names;
-
-    nlohmann::json jloop_closure_edges;
-    for (const auto& edge : edges)
-    {
-        nlohmann::json jloop_closure_edge{
-            { "px", edge.relative_pose_tb.px },
-            { "py", edge.relative_pose_tb.py },
-            { "pz", edge.relative_pose_tb.pz },
-            { "om", edge.relative_pose_tb.om },
-            { "fi", edge.relative_pose_tb.fi },
-            { "ka", edge.relative_pose_tb.ka },
-            { "w_px", edge.relative_pose_tb_weights.px },
-            { "w_py", edge.relative_pose_tb_weights.py },
-            { "w_pz", edge.relative_pose_tb_weights.pz },
-            { "w_om", edge.relative_pose_tb_weights.om },
-            { "w_fi", edge.relative_pose_tb_weights.fi },
-            { "w_ka", edge.relative_pose_tb_weights.ka },
-            { "index_from", edge.index_from },
-            { "index_to", edge.index_to },
-            { "is_fixed_px", edge.is_fixed_px },
-            { "is_fixed_py", edge.is_fixed_py },
-            { "is_fixed_pz", edge.is_fixed_pz },
-            { "is_fixed_om", edge.is_fixed_om },
-            { "is_fixed_fi", edge.is_fixed_fi },
-            { "is_fixed_ka", edge.is_fixed_ka },
-            { "index_session_from", edge.index_session_from },
-            { "index_session_to", edge.index_session_to },
-        };
-        jloop_closure_edges.push_back(jloop_closure_edge);
-    }
-    jj["loop_closure_edges"] = jloop_closure_edges;
-
-    return jj;
-}
-
-bool save_project_settings(const std::string& file_name, const ProjectSettings& _project_settings)
-{
-    std::cout << "saving file: '" << file_name << "'\n";
-    const auto jj = projectSettingsJson(_project_settings);
-    std::ofstream fs(file_name);
-    if (!fs.good())
-        return false;
-    fs << jj.dump(2);
-    fs.close();
-
-    return true;
-}
-
-void update_timestamp_offset()
-{
-    std::cout << "update_timestamp" << std::endl;
-    time_stamp_offset = std::numeric_limits<double>::max();
-
-    for (const auto& s : sessions)
-    {
-        if (!s.point_clouds_container.point_clouds.empty() && !s.point_clouds_container.point_clouds[0].local_trajectory.empty())
-        {
-            double ts = s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first;
-            if (ts < time_stamp_offset)
-                time_stamp_offset = ts;
-        }
-    }
-
-    std::cout << "new time_stamp_offset = " << time_stamp_offset << std::endl;
-}
-
 bool revert(std::vector<Session>& sessions)
 {
     markProjectChanged();
@@ -1411,6 +1334,18 @@ bool revert_to_initial(std::vector<Session>& sessions)
     return true;
 }
 
+static bool isManagedProjectFile(const fs::path& file)
+{
+    std::error_code ec;
+    auto path = fs::weakly_canonical(file, ec);
+    if (ec)
+        return false;
+    for (auto parent = path.parent_path(); parent != parent.root_path(); parent = parent.parent_path())
+        if (fs::is_regular_file(parent / "snapshot.json", ec) && fs::is_regular_file(parent.parent_path() / "result.json", ec))
+            return true;
+    return false;
+}
+
 bool save_results(std::vector<Session>& sessions)
 {
     std::string failed;
@@ -1422,6 +1357,11 @@ bool save_results(std::vector<Session>& sessions)
             if (Session::is_point_cloud_file(session.session_file_name))
             {
                 std::cout << "not saving poses of point cloud session: " << session.session_file_name << std::endl;
+                continue;
+            }
+            if (isManagedProjectFile(sessionPathFromText(session.point_clouds_container.poses_file_name)))
+            {
+                failed += "'" + session.point_clouds_container.poses_file_name + "' (published result)\n";
                 continue;
             }
             std::cout << "saving result to: " << session.point_clouds_container.poses_file_name << std::endl;
@@ -1498,82 +1438,71 @@ Eigen::Vector3d GLWidgetGetOGLPos(int x, int y, const ObservationPicking& observ
     return pos;
 }
 
-bool loadProject(const std::string& file_name, ProjectSettings& _project_settings)
+static void updateProjectTitle(const std::string& file_name)
 {
-    std::cout << "Opening project file: '" << file_name << "'\n";
+    project_file_name = file_name;
+    const auto title = winTitle + " - " + truncPath(file_name);
+    SetWindowTitle(title.c_str());
+}
 
+static void refreshVisibleSessions()
+{
+    visible_sessions.clear();
+    for (std::size_t index = 0; index < sessions.size(); ++index)
+        if (sessions[index].visible)
+            visible_sessions.insert(static_cast<int>(index));
+    number_visible_sessions = static_cast<int>(visible_sessions.size());
+    first_session_index = visible_sessions.empty() ? -1 : *visible_sessions.begin();
+    second_session_index = visible_sessions.empty() ? -1 : *visible_sessions.rbegin();
+}
+
+static void resetProjectSelection()
+{
+    session_drag_preview_poses.clear();
+    index_active_edge = edge_list_scrolled_to = -1;
+    manipulate_active_edge = edge_gizmo = false;
+    is_loop_closure_gui = false;
+    index_gizmo = old_index_gizmo = -1;
+    index_gt = -1;
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+    {
+        sessions[i].is_gizmo = false;
+        if (sessions[i].is_ground_truth)
+            index_gt = static_cast<int>(i);
+    }
+    old_index_gt = index_gt;
+    refreshVisibleSessions();
+    index_loop_closure_source = index_loop_closure_target = 0;
+}
+
+static void showProjectError(const std::exception& error)
+{
+    pfd::message("Project I/O", error.what(), pfd::choice::ok, pfd::icon::error);
+}
+
+bool loadProject(const std::string& file_name)
+{
     try
     {
-        std::ifstream fs(file_name);
-        if (!fs.good())
-            return false;
-        nlohmann::json data = nlohmann::json::parse(fs);
-        fs.close();
-
-        ProjectSettings loaded;
-        std::vector<Edge> loaded_edges;
-
-        std::cout << "Contained sessions:\n";
-
-        for (const auto& fn_json : data["session_file_names"])
-        {
-            const std::string fn = fn_json["session_file_name"];
-            loaded.session_file_names.push_back(fn);
-            std::cout << "'" << fn << "'";
-            if (!fs::exists(fn))
-                std::cout << "  (WARNING: session file does not exist! Please manually adapt path)";
-            std::cout << "\n";
-        }
-
-        for (const auto& edge_json : data["loop_closure_edges"])
-        {
-            Edge edge;
-            edge.index_from = edge_json["index_from"];
-            edge.index_to = edge_json["index_to"];
-            edge.is_fixed_fi = edge_json["is_fixed_fi"];
-            edge.is_fixed_ka = edge_json["is_fixed_ka"];
-            edge.is_fixed_om = edge_json["is_fixed_om"];
-            edge.is_fixed_px = edge_json["is_fixed_px"];
-            edge.is_fixed_py = edge_json["is_fixed_py"];
-            edge.is_fixed_pz = edge_json["is_fixed_pz"];
-            edge.relative_pose_tb.fi = edge_json["fi"];
-            edge.relative_pose_tb.ka = edge_json["ka"];
-            edge.relative_pose_tb.om = edge_json["om"];
-            edge.relative_pose_tb.px = edge_json["px"];
-            edge.relative_pose_tb.py = edge_json["py"];
-            edge.relative_pose_tb.pz = edge_json["pz"];
-            edge.relative_pose_tb_weights.fi = edge_json["w_fi"];
-            edge.relative_pose_tb_weights.ka = edge_json["w_ka"];
-            edge.relative_pose_tb_weights.om = edge_json["w_om"];
-            edge.relative_pose_tb_weights.px = edge_json["w_px"];
-            edge.relative_pose_tb_weights.py = edge_json["w_py"];
-            edge.relative_pose_tb_weights.pz = edge_json["w_pz"];
-            edge.index_session_from = edge_json["index_session_from"];
-            edge.index_session_to = edge_json["index_session_to"];
-            loaded_edges.push_back(edge);
-        }
-
-        _project_settings = std::move(loaded);
-        edges = std::move(loaded_edges);
-        std::cout << "Found " << edges.size() << "edges\nOpening done\n";
-    } catch (std::exception& e)
+        auto loaded = ReadProjectSettings(sessionPathFromText(file_name));
+#ifdef HDMAPPING_GUI_BRIDGE
+        if (guiState)
+            guiState->Open();
+        projectSources.clear();
+#endif
+        project_settings = std::move(loaded);
+        sessions.clear();
+        resetProjectSelection();
+        invalidateSessionRenderers();
+        loaded_sessions = false;
+        time_stamp_offset = 0.0;
+        updateProjectTitle(file_name);
+        return true;
+    } catch (const std::exception& error)
     {
-        std::cout << "can't load project settings: " << e.what() << std::endl;
+        showProjectError(error);
         return false;
     }
-
-#ifdef HDMAPPING_GUI_BRIDGE
-    if (guiState)
-        guiState->Open();
-#endif
-    project_file_name = file_name;
-    std::string newTitle = winTitle + " - " + truncPath(file_name);
-    SetWindowTitle(newTitle.c_str());
-
-    loaded_sessions = false;
-    time_stamp_offset = 0.0;
-
-    return true;
 }
 
 void openProject()
@@ -1583,17 +1512,22 @@ void openProject()
 
     if (input_file_name.size() > 0)
     {
-        loadProject(fs::path(input_file_name).string(), project_settings);
+        loadProject(input_file_name);
     }
 }
 
 void saveProjectTo(const std::string& output_file_name)
 {
-    if (save_project_settings(fs::path(output_file_name).string(), project_settings))
+    try
     {
-        project_file_name = output_file_name;
-        std::string newTitle = winTitle + " - " + truncPath(output_file_name);
-        SetWindowTitle(newTitle.c_str());
+        const auto path = sessionPathFromText(output_file_name);
+        if (isManagedProjectFile(path))
+            throw std::invalid_argument("Choose a project file outside the published result.");
+        WriteProjectSettings(path, project_settings);
+        updateProjectTitle(output_file_name);
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
     }
 }
 
@@ -1608,49 +1542,70 @@ void saveProjectAs()
 
 void saveProject()
 {
-    if (project_file_name.empty())
+    if (project_file_name.empty() || isManagedProjectFile(sessionPathFromText(project_file_name)))
         saveProjectAs();
     else
         saveProjectTo(project_file_name);
 }
 
-void addSession()
+void loadSessions();
+void finishLoadingSessions();
+
+static Session readSessionForGui(const std::string& path)
 {
-    // A single point cloud (*.laz, *.las) is loaded as an in-memory session, see Session::load_from_point_cloud
-    static const std::vector<std::string> session_or_point_cloud_filter = {
-        "Session or point cloud (*.mjs, *.json, *.laz, *.las)", "*.mjs *.json *.laz *.las", "All files", "*"
-    };
-    auto input_file_names = mandeye::fd::OpenFileDialog("Add session(s)", session_or_point_cloud_filter, true);
+    return ReadProjectSession(
+        sessionPathText(fs::absolute(sessionPathFromText(path))),
+        { is_decimate, { bucket_x, bucket_y, bucket_z }, calculate_offset, false });
+}
 
-    if (input_file_names.size() > 0)
+bool addSessionFile(const std::string& path)
+{
+    try
     {
-        for (const auto& input_file_name : input_file_names)
+#ifdef HDMAPPING_GUI_BRIDGE
+        const auto absolute = sessionPathText(fs::absolute(sessionPathFromText(path)).lexically_normal());
+        if (std::ranges::any_of(
+                sessions,
+                [&absolute](const Session& session)
+                {
+                    const auto source = projectSources.find(session.session_file_name);
+                    return source != projectSources.end() && source->second == absolute;
+                }))
+            return false;
+#endif
+        if (!loaded_sessions)
         {
-            std::cout << "Adding session file: '" << input_file_name << "'" << std::endl;
-            project_settings.session_file_names.push_back(input_file_name);
+            if (!AddProjectSessionPath(project_settings, path))
+                return false;
+            markProjectChanged();
+            return true;
         }
-
-        loaded_sessions = false;
-        time_stamp_offset = 0.0;
+        // Preserve the current sessions and any unsaved poses.
+        auto session = readSessionForGui(path);
+        sessions.reserve(sessions.size() + 1);
+        if (!AddProjectSessionPath(project_settings, path))
+            return false;
+        if (session.is_ground_truth)
+            SetProjectGroundTruth(sessions, -1);
+        sessions.push_back(std::move(session));
+        return true;
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+        return false;
     }
 }
 
-void appendSession(const std::string& ps);
-void finishLoadingSessions();
-void loadSessions();
-
-// Adds a session file to the project unless it is already there; returns whether it was added.
-bool addSessionFile(const std::string& path)
+void addSession()
 {
-    const auto& names = project_settings.session_file_names;
-    if (std::find(names.begin(), names.end(), path) != names.end())
-    {
-        std::cout << "Session file already in project: '" << path << "'" << std::endl;
-        return false;
-    }
-    std::cout << "Adding session file: '" << path << "'" << std::endl;
-    project_settings.session_file_names.push_back(path);
-    return true;
+    static const std::vector<std::string> filter = {
+        "Session or point cloud (*.mjs, *.json, *.laz, *.las)", "*.mjs *.json *.laz *.las", "All files", "*"
+    };
+    bool added = false;
+    for (const auto& file : mandeye::fd::OpenFileDialog("Add session(s)", filter, true))
+        added |= addSessionFile(file);
+    if (added && loaded_sessions)
+        finishLoadingSessions();
 }
 
 // Next file dialog opens in the folder of a file loaded without one (drag & drop, command line).
@@ -1681,7 +1636,7 @@ void loadDroppedFiles()
         if (ext_of(path) == ".mjp")
         {
             setLocationHintFromFile(path);
-            loadProject(path.string(), project_settings);
+            loadProject(sessionPathText(path));
             return;
         }
     }
@@ -1711,120 +1666,68 @@ void loadDroppedFiles()
     setLocationHintFromFile(added.back());
 
     if (loaded_sessions)
-    {
-        for (const auto& ps : added)
-            appendSession(ps);
         finishLoadingSessions();
-    }
     else
-    {
-        time_stamp_offset = 0.0;
         loadSessions();
-    }
 }
 
-void appendSession(const std::string& ps)
+// Refresh the window after committing a complete revision of the project.
+static void refreshProjectSessions()
 {
+    resetProjectSelection();
+    for (auto& session : sessions)
     {
-        Session session;
-        session.load(fs::path(ps).string(), is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset);
-
-        // making sure irelevant session specific settings that could affect rendering are off
-        session.point_clouds_container.xz_intersection = false;
-        session.point_clouds_container.yz_intersection = false;
-        session.point_clouds_container.xy_intersection = false;
-        session.point_clouds_container.xz_grid_10x10 = false;
-        session.point_clouds_container.xz_grid_1x1 = false;
-        session.point_clouds_container.xz_grid_01x01 = false;
-        session.point_clouds_container.yz_grid_10x10 = false;
-        session.point_clouds_container.yz_grid_1x1 = false;
-        session.point_clouds_container.yz_grid_01x01 = false;
-        session.point_clouds_container.xy_grid_10x10 = false;
-        session.point_clouds_container.xy_grid_1x1 = false;
-        session.point_clouds_container.xy_grid_01x01 = false;
-
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.point_size = point_size;
-
-        sessions.push_back(session);
-        if (session.is_ground_truth)
-            index_gt = sessions.size() - 1;
+        auto& clouds = session.point_clouds_container;
+        clouds.xz_intersection = gui_xz_intersection;
+        clouds.yz_intersection = gui_yz_intersection;
+        clouds.xy_intersection = gui_xy_intersection;
+        clouds.intersection_width = gui_intersection_width;
+        clouds.xz_grid_10x10 = gui_xz_grid_10x10;
+        clouds.xz_grid_1x1 = gui_xz_grid_1x1;
+        clouds.xz_grid_01x01 = gui_xz_grid_01x01;
+        clouds.yz_grid_10x10 = gui_yz_grid_10x10;
+        clouds.yz_grid_1x1 = gui_yz_grid_1x1;
+        clouds.yz_grid_01x01 = gui_yz_grid_01x01;
+        clouds.xy_grid_10x10 = gui_xy_grid_10x10;
+        clouds.xy_grid_1x1 = gui_xy_grid_1x1;
+        clouds.xy_grid_01x01 = gui_xy_grid_01x01;
+        for (auto& scan : clouds.point_clouds)
+            scan.point_size = point_size;
     }
-}
-
-// Reorders (ground truth first), recolors and re-uploads the loaded sessions.
-void finishLoadingSessions()
-{
-    markProjectChanged();
-    // reorder
-    std::vector<Session> sessions_reorder;
-    std::vector<std::string> session_file_names_reordered;
-
-    std::map<int, int> map_reorder;
-    // project_settings.session_file_names.
-    int new_index = 0;
-    for (size_t i = 0; i < sessions.size(); i++)
-    {
-        if (sessions[i].is_ground_truth)
-        {
-            sessions_reorder.push_back(sessions[i]);
-            session_file_names_reordered.push_back(project_settings.session_file_names[i]);
-            map_reorder[i] = new_index++;
-        }
-    }
-    for (size_t i = 0; i < sessions.size(); i++)
-    {
-        if (!sessions[i].is_ground_truth)
-        {
-            sessions_reorder.push_back(sessions[i]);
-            session_file_names_reordered.push_back(project_settings.session_file_names[i]);
-            map_reorder[i] = new_index++;
-        }
-    }
-    sessions = sessions_reorder;
-    project_settings.session_file_names = session_file_names_reordered;
-
-    for (auto& e : edges)
-    {
-        e.index_session_from = map_reorder[e.index_session_from];
-        e.index_session_to = map_reorder[e.index_session_to];
-    }
-
-    std::cout << "sessions reordered, ground truth should be in front" << std::endl;
-    for (const auto& s : sessions)
-    {
-        std::cout << "session: '" << s.session_file_name << "' ground truth [" << int(s.is_ground_truth) << "]" << std::endl;
-    }
-
     assignDistinctSessionColors(sessions);
     invalidateSessionRenderers();
-
-    // update time_stamp_offset
-    std::cout << "update time_stamp_offset" << std::endl;
-    for (const auto& s : sessions)
+    time_stamp_offset = 0.0;
+    // Preserve Step 3's existing latest starting timestamp on load.
+    for (const auto& session : sessions)
     {
-        if (s.point_clouds_container.point_clouds.size() > 0)
-        {
-            if (s.point_clouds_container.point_clouds[0].local_trajectory.size() > 0)
-            {
-                if (s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first > time_stamp_offset)
-                {
-                    time_stamp_offset = s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first;
-                }
-            }
-        }
+        const auto& scans = session.point_clouds_container.point_clouds;
+        if (!scans.empty() && !scans.front().local_trajectory.empty())
+            time_stamp_offset = std::max(time_stamp_offset, scans.front().local_trajectory.front().timestamps.first);
     }
+}
+
+void finishLoadingSessions()
+{
+    OrderProjectGroundTruthFirst(project_settings, sessions);
+    refreshProjectSessions();
+    markProjectChanged();
 }
 
 void loadSessions()
 {
-    sessions.clear();
-    session_drag_preview_poses.clear();
-    for (const auto& ps : project_settings.session_file_names)
-        appendSession(ps);
-    loaded_sessions = true;
-
-    finishLoadingSessions();
+    try
+    {
+        std::vector<Session> loaded;
+        for (const auto& path : project_settings.session_file_names)
+            loaded.push_back(readSessionForGui(path));
+        ValidateProjectScans(project_settings, loaded);
+        sessions = std::move(loaded);
+        loaded_sessions = true;
+        finishLoadingSessions();
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+    }
 }
 
 void generate_loop_closures(const std::vector<Session>& sessions, std::vector<Edge>& edges)
@@ -2301,11 +2204,9 @@ void settings_gui()
             {
                 if ((old_index_gt != index_gt) || (old_index_gizmo != index_gizmo))
                 {
+                    SetProjectGroundTruth(sessions, index_gt);
                     for (size_t i = 0; i < sessions.size(); i++)
-                    {
-                        sessions[i].is_ground_truth = (i == index_gt);
                         sessions[i].is_gizmo = (i == index_gizmo);
-                    }
 
                     // set rotation center to gizmo
                     if (index_gizmo >= 0 && index_gizmo < sessions.size() &&
@@ -2346,89 +2247,7 @@ void settings_gui()
 
             ImGui::NewLine();
 
-            if (project_settings.session_file_names.size() == sessions.size())
-            {
-                number_visible_sessions = 0;
-
-                bool first_session_index_found = false;
-                visible_sessions = {};
-                for (size_t index = 0; index < sessions.size(); index++)
-                {
-                    if (sessions[index].visible)
-                    {
-                        visible_sessions.emplace(static_cast<int>(index));
-                        number_visible_sessions++;
-                        if (!first_session_index_found)
-                        {
-                            first_session_index = index;
-                            second_session_index = index;
-                            first_session_index_found = true;
-                        }
-                        else
-                        {
-                            second_session_index = index;
-                        }
-                    }
-                }
-
-                if (!is_loop_closure_gui)
-                {
-                    ImGui::SetNextItemWidth(ImGuiNumberWidth);
-                    ImGui::InputInt("Number of iterations", &nr_iter);
-                    if (nr_iter < 1)
-                        nr_iter = 1;
-
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position x [px]", &motion_model_weights.px, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position y [py]", &motion_model_weights.py, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position z [pz]", &motion_model_weights.pz, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation om [om]", &motion_model_weights.om, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation fi [fi]", &motion_model_weights.fi, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation ka [ka]", &motion_model_weights.ka, 0.0, 0.0, "%.3f");
-
-                    std::string bn = "Optimize (number of iterations: " + std::to_string(nr_iter) + ")";
-
-                    if (ImGui::Button(bn.c_str()))
-                    {
-                        for (int i = 0; i < nr_iter; i++)
-                        {
-                            std::cout << "Iteration [" << i + 1 << "] of: " << nr_iter << std::endl;
-                            optimize(sessions, edges, motion_model_weights);
-                        }
-                        optimized = true;
-                        markProjectChanged();
-                    }
-
-                    // if (optimized)
-                    //{
-                    ImGui::SameLine();
-                    if (ImGui::Button("Revert"))
-                        revert(sessions);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Save results"))
-                        save_results(sessions);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Revert to initial"))
-                        revert_to_initial(sessions);
-                    //}
-
-                    if (ImGui::Button("Generate loop closures"))
-                    {
-                        generate_loop_closures(sessions, edges);
-                    }
-
-                    if (ImGui::Button("ICP all edges"))
-                    {
-                        icp_all_edges(sessions, edges, search_radius);
-                    }
-                    ImGui::SameLine();
-                    ImGui::InputDouble("search_radius", &search_radius);
-                    if (search_radius < 0.01)
-                        search_radius = 0.01;
-                }
-            }
+            refreshVisibleSessions();
         }
     }
 
@@ -2487,6 +2306,23 @@ namespace
 
     proc::MutationResult mutateProject(const proc::OperationRequest& request)
     {
+        if (request.operation == "project.remove_session" || request.operation == "project.set_ground_truth")
+        {
+            if (!session_drag_preview_poses.empty())
+                return proc::OperationError{ "state_busy", "Finish the active pose edit before editing the project", json::object() };
+            try
+            {
+                proc::EditProject(request, project_settings, sessions);
+                if (request.operation == "project.remove_session")
+                    refreshProjectSessions();
+                else
+                    index_gt = old_index_gt = request.scope.at("session_index").get<int>();
+                return describeProject();
+            } catch (const std::exception& error)
+            {
+                return proc::OperationError{ "invalid_parameters", error.what(), json::object() };
+            }
+        }
         if (request.operation != "step3.set_parameters" || !request.scope.empty() || request.parameters.empty())
             return proc::OperationError{ "invalid_request", "Expected project parameters and an empty scope", json::object() };
         auto iterations = ndt.number_of_iterations;
@@ -2519,23 +2355,106 @@ namespace
         return describeProject();
     }
 
+    json projectSaveJob = json::object();
+    bool projectSavePending = false;
+    std::string projectSaveError;
+
+    void submitProjectSave()
+    {
+        static std::uint64_t sequence = 0;
+        const auto target = guiState->Target();
+        projectSaveJob = json::object();
+        projectSaveError.clear();
+        projectSavePending = guiConnection->RequestJob(
+            "jobs.submit",
+            { { "request_key", target.state_id + "-project-save-" + std::to_string(++sequence) },
+              { "operation",
+                { { "operation", "project.save" },
+                  { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                  { "scope", json::object() },
+                  { "parameters", json::object() } } },
+              { "capture_source", target.state_id },
+              { "source", "gui" },
+              { "access", "read" } });
+        if (!projectSavePending)
+            projectSaveError = "Could not submit project save";
+    }
+
+    void pollProjectSave()
+    {
+        if (auto reply = guiConnection->TakeJobReply())
+        {
+            projectSavePending = false;
+            if (const auto* error = std::get_if<proc::OperationError>(&*reply))
+            {
+                projectSaveError = error->message;
+                projectSaveJob = json::object();
+            }
+            else
+                projectSaveJob = std::get<json>(std::move(*reply));
+        }
+        const auto status = projectSaveJob.value("status", std::string{});
+        if (!projectSavePending && (status == "preparing" || status == "queued" || status == "running" || status == "cancelling"))
+        {
+            static auto next_poll = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() >= next_poll)
+            {
+                projectSavePending = guiConnection->RequestJob("jobs.get", projectSaveJob.at("job_id"));
+                next_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+            }
+        }
+    }
+
+    void drawProjectSave()
+    {
+        if (projectSaveJob.empty() && !projectSavePending && projectSaveError.empty())
+            return;
+        ImGui::Begin("Complete project save", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        const auto status = projectSaveJob.value("status", std::string{});
+        ImGui::TextUnformatted(status.empty() ? (projectSavePending ? "Submitting" : projectSaveError.c_str()) : status.c_str());
+        if (projectSaveJob.contains("error"))
+            ImGui::TextWrapped("%s", projectSaveJob.at("error").value("message", "").c_str());
+        if (status == "completed" && projectSaveJob.contains("result"))
+        {
+            const auto& snapshot = projectSaveJob.at("result").at("snapshot");
+            const auto path = sessionPathFromText(snapshot.at("manifest_path").get<std::string>()).parent_path() / "project.mjp";
+            ImGui::TextWrapped("%s", sessionPathText(path).c_str());
+        }
+        ImGui::End();
+    }
+
     void connectProject()
     {
         guiState = std::make_unique<proc::GuiStateBridge>(proc::GuiStateCallbacks{
             describeProject,
             mutateProject,
-            [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
+            {},
+            [](const proc::ArtifactManifest& artifact) -> std::optional<proc::OperationError>
             {
-                if (sessions.size() != project_settings.session_file_names.size() || !session_drag_preview_poses.empty())
+                auto restored = proc::LoadProjectSnapshot(artifact.snapshot);
+                if (const auto* error = std::get_if<proc::OperationError>(&restored))
+                    return *error;
+                auto& project = std::get<proc::ProjectState>(restored);
+                project_settings = std::move(project.settings);
+                sessions = std::move(project.sessions);
+                projectSources = std::move(project.sources);
+                loaded_sessions = true;
+                refreshProjectSessions();
+                updateProjectTitle(sessionPathText(artifact.snapshot.manifest_path.parent_path() / "project.mjp"));
+                return std::nullopt;
+            },
+            [](const proc::OperationRequest& request) -> std::unique_ptr<proc::CaptureSource>
+            {
+                if (request.operation == "project.open")
+                {
+                    static const std::vector<Session> empty;
+                    return std::make_unique<ProjectCapture>(request.target, empty, json::object(), json::object());
+                }
+                if (!proc::IsProjectOperation(request.operation) || sessions.size() != project_settings.session_file_names.size() ||
+                    !session_drag_preview_poses.empty())
                     return {};
                 return std::make_unique<ProjectCapture>(
-                    std::move(target), sessions, projectSettingsJson(project_settings), projectParameters());
-            },
-            [](const proc::ArtifactManifest&) -> std::optional<proc::OperationError>
-            {
-                return proc::OperationError{ "incompatible_result",
-                                             "A published registration session cannot replace a multi-session project",
-                                             json::object() };
+                    request.target, sessions, ProjectSettingsJson(project_settings), projectParameters(), false, projectSources);
             } });
         guiConnection = std::make_unique<proc::GuiStateConnection>(*guiState, "multi_session_registration_step_3");
     }
@@ -2555,6 +2474,7 @@ void display()
         guiState->Changed();
     const auto before = guiState->Target();
     guiConnection->Poll();
+    pollProjectSave();
     previous = before == guiState->Target() ? current : observed();
 #endif
     syncSessionRenderers(sessions);
@@ -3022,6 +2942,7 @@ void display()
 
     ShowMainDockSpace();
 #ifdef HDMAPPING_GUI_BRIDGE
+    drawProjectSave();
     if (guiState->Reserved())
     {
         if (IsFileDropped())
@@ -3324,6 +3245,10 @@ void display()
             if (ImGui::IsItemHovered() && !project_file_name.empty())
                 ImGui::SetTooltip("Current project: %s", project_file_name.c_str());
 
+#ifdef HDMAPPING_GUI_BRIDGE
+            if (ImGui::MenuItem("Save complete project", nullptr, nullptr, loaded_sessions && !sessions.empty() && !projectSavePending))
+                submitProjectSave();
+#endif
             ImGui::Separator();
 
             if (ImGui::MenuItem("Add session(s)", "Ctrl+A"))
@@ -4108,26 +4033,12 @@ void display()
 
                 if (session_marked_for_removal[idx])
                 {
-                    std::cout << "Removing session: " << project_settings.session_file_names[idx] << std::endl;
-
-                    project_settings.session_file_names.erase(project_settings.session_file_names.begin() + idx);
-
-                    if (idx < sessions.size())
-                    {
-                        sessions.erase(sessions.begin() + idx);
-                        session_drag_preview_poses.clear();
-                    }
+                    RemoveProjectSession(project_settings, sessions, idx);
                 }
             }
             session_marked_for_removal.clear();
-
-            if (!sessions.empty())
-                update_timestamp_offset();
-            else
-            {
-                loaded_sessions = false;
-                time_stamp_offset = 0.0;
-            }
+            refreshProjectSessions();
+            markProjectChanged();
 
             ImGui::CloseCurrentPopup();
         }
@@ -4319,7 +4230,7 @@ int main(int argc, char* argv[])
         if (!project_file.empty())
         {
             setLocationHintFromFile(project_file);
-            loadProject(project_file, project_settings);
+            loadProject(project_file);
         }
         if (!session_files.empty())
             setLocationHintFromFile(session_files.back());

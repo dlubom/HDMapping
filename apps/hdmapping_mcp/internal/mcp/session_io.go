@@ -43,26 +43,7 @@ func addSessionIOTools(server *sdk.Server, call func(context.Context, string, an
 
 func sessionIORequest(operation string, input step2MutationInput) (jobs.SubmitRequest, error) {
 	if operation == jobs.OpenSession {
-		if input.Snapshot != nil {
-			return jobs.SubmitRequest{}, errors.New("session.open requires external files")
-		}
-		if input.Target != nil {
-			return (step1Input{RequestKey: input.RequestKey, Target: input.Target, Scope: input.Scope, Parameters: input.Parameters}).submit(operation, jobs.AccessMutate)
-		}
-		parameters, err := json.Marshal(input.Parameters)
-		if err != nil {
-			return jobs.SubmitRequest{}, fmt.Errorf("encode open parameters: %w", err)
-		}
-		scope, err := json.Marshal(input.Scope)
-		if err != nil {
-			return jobs.SubmitRequest{}, fmt.Errorf("encode open scope: %w", err)
-		}
-		if input.Scope == nil {
-			scope = json.RawMessage("{}")
-		}
-		return jobs.SubmitRequest{RequestKey: input.RequestKey, Source: jobs.SourceMCP, Access: jobs.AccessMutate,
-			Operation: jobs.OperationRequest{Operation: operation, Scope: scope, Parameters: parameters,
-				Target: jobs.TargetRef{StateID: fmt.Sprintf("step2:%x", sha256.Sum256([]byte(input.RequestKey)))}}}, nil
+		return externalOpenRequest(operation, "step2", input)
 	}
 	access := jobs.AccessRead
 	if operation == "session.import_poses" || operation == "session.import_observations" {
@@ -70,4 +51,27 @@ func sessionIORequest(operation string, input step2MutationInput) (jobs.SubmitRe
 	}
 	return (step1Input{RequestKey: input.RequestKey, Target: input.Target, Snapshot: input.Snapshot,
 		Scope: input.Scope, Parameters: input.Parameters}).submit(operation, access)
+}
+
+func externalOpenRequest(operation, statePrefix string, input step2MutationInput) (jobs.SubmitRequest, error) {
+	if input.Snapshot != nil {
+		return jobs.SubmitRequest{}, errors.New("opening requires external files")
+	}
+	if input.Target != nil {
+		return (step1Input{RequestKey: input.RequestKey, Target: input.Target, Scope: input.Scope, Parameters: input.Parameters}).submit(operation, jobs.AccessMutate)
+	}
+	parameters, err := json.Marshal(input.Parameters)
+	if err != nil {
+		return jobs.SubmitRequest{}, fmt.Errorf("encode open parameters: %w", err)
+	}
+	scope, err := json.Marshal(input.Scope)
+	if err != nil {
+		return jobs.SubmitRequest{}, fmt.Errorf("encode open scope: %w", err)
+	}
+	if input.Scope == nil {
+		scope = json.RawMessage("{}")
+	}
+	return jobs.SubmitRequest{RequestKey: input.RequestKey, Source: jobs.SourceMCP, Access: jobs.AccessMutate,
+		Operation: jobs.OperationRequest{Operation: operation, Scope: scope, Parameters: parameters,
+			Target: jobs.TargetRef{StateID: fmt.Sprintf("%s:%x", statePrefix, sha256.Sum256([]byte(input.RequestKey)))}}}, nil
 }

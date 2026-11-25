@@ -3,6 +3,7 @@
 
 #include <HDMapping/Processing/RuntimeProtocol.h>
 
+#include "project_operations.h"
 #include "recording_capture.h"
 
 #include <cerrno>
@@ -138,7 +139,11 @@ int main(int argc, char** argv)
                 return CaptureSnapshot(source, target.revision, context.output_directory, context);
             },
             CaptureStep1References,
-            CaptureStep2Open);
+            CaptureStep2Open,
+            [](const OperationRequest& request, const std::optional<SnapshotRef>& base, RunContext& context)
+            {
+                return base ? CaptureProjectAdd(request, *base, context) : CaptureProjectOpen(request, context);
+            });
         return 0;
     } catch (const std::exception& error)
     {

@@ -4,6 +4,7 @@
 #include "NativeSessionResult.h"
 #include "ResultPublisherIO.h"
 #include "SnapshotStorage.h"
+#include "project_operations.h"
 
 #include <algorithm>
 #include <fstream>
@@ -242,9 +243,10 @@ namespace HDMapping::Processing
                 throw std::runtime_error(error->message);
             }
             auto contents = std::get<SnapshotContents>(std::move(snapshot));
-            if (contents.kind != native_session_kind && (contents.kind != session_export_kind || !contents.dependencies.empty()))
+            if (contents.kind != native_session_kind && contents.kind != native_project_kind &&
+                (contents.kind != session_export_kind || !contents.dependencies.empty()))
             {
-                throw std::runtime_error("Publication requires a native session or a self-contained session export");
+                throw std::runtime_error("Publication requires a native session, project or self-contained session export");
             }
             ArtifactManifest artifact{ id, identity, std::move(ref), { path }, contents.dependencies };
             for (const auto& name : header.at("files").items())
@@ -326,7 +328,11 @@ namespace HDMapping::Processing
     }
 
     RunResult PublishResult(
-        const fs::path& staging_directory, const fs::path& destination, const PublishOptions& options, const PublicationIO& io)
+        const fs::path& staging_directory,
+        const fs::path& destination,
+        const PublishOptions& options,
+        const PublicationIO& io,
+        std::stop_token stop)
     {
         bool committed = false;
         try
@@ -357,12 +363,14 @@ namespace HDMapping::Processing
             {
                 throw PublicationConflict("Publication attempt identity was already used");
             }
-            auto [artifact, contents] = read_artifact(stage, id);
+            auto [artifact, contents] = read_artifact(stage, id, stop);
             if (contents.kind == native_session_kind)
             {
                 ValidateNativeSessionReferences(contents, artifact);
                 VerifyNativeSessionRead(contents.entry);
             }
+            if (contents.kind == native_project_kind)
+                ValidateNativeProject(contents, artifact, true, stop);
             artifact.snapshot.manifest_path = published / snapshot_manifest;
             for (auto& file : artifact.files)
             {
@@ -382,12 +390,16 @@ namespace HDMapping::Processing
             io.move(stage, prepared, false);
             input.owned = false;
             SyncSnapshotPath(work, true);
+            if (stop.stop_requested())
+                throw std::runtime_error("Publication cancelled");
             if (exists)
             {
                 TemporaryDirectory unpublished{ published, false };
                 io.move(prepared, published, false);
                 unpublished.owned = true;
                 SyncSnapshotPath(final, true);
+                if (stop.stop_requested())
+                    throw std::runtime_error("Publication cancelled");
                 io.move(head, final / result_manifest, true);
                 unpublished.owned = false;
             }
@@ -404,13 +416,14 @@ namespace HDMapping::Processing
             return failure("publication_conflict", error);
         } catch (const std::exception& error)
         {
-            return failure(committed ? "publication_durability_unknown" : "publication_failed", error);
+            return failure(
+                committed ? "publication_durability_unknown" : (stop.stop_requested() ? "cancelled" : "publication_failed"), error);
         }
     }
 
-    RunResult PublishResult(const fs::path& stage, const fs::path& destination, const PublishOptions& options)
+    RunResult PublishResult(const fs::path& stage, const fs::path& destination, const PublishOptions& options, std::stop_token stop)
     {
-        return PublishResult(stage, destination, options, { write_manifest, MovePublishedPath });
+        return PublishResult(stage, destination, options, { write_manifest, MovePublishedPath }, stop);
     }
 
     std::optional<OperationError> DiscardResultStaging(const fs::path& staging_directory, const fs::path& destination)
@@ -501,6 +514,8 @@ namespace HDMapping::Processing
             auto [artifact, contents] = read_artifact(generation, id);
             if (contents.kind == native_session_kind)
                 ValidateNativeSessionReferences(contents, artifact);
+            if (contents.kind == native_project_kind)
+                ValidateNativeProject(contents, artifact, false);
             return artifact;
         } catch (const std::exception& error)
         {

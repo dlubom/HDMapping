@@ -149,7 +149,7 @@ func (g *guiJobs) apply(j jobs.JobRecord) string {
 }
 func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotRef, error) {
 	if j.Request.Snapshot != nil || j.Request.Recording != nil ||
-		(j.Request.Operation.Operation == jobs.OpenSession && j.Request.CaptureSource == "") {
+		(jobs.IsExternalOpen(j.Request.Operation.Operation) && j.Request.CaptureSource == "") {
 		return g.Supervisor.Prepare(ctx, j)
 	}
 	g.mu.Lock()
@@ -161,7 +161,7 @@ func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotR
 	// Use a separate input directory. The worker publishes into a fresh job
 	// directory and its recovery protocol owns that directory exclusively.
 	prefix := "inputs-"
-	if j.Request.Operation.Operation == jobs.OpenSession {
+	if jobs.IsExternalOpen(j.Request.Operation.Operation) || j.Request.Operation.Operation == jobs.AddProjectSession {
 		prefix = "opening-"
 	}
 	dir := filepath.Join(g.Directory, prefix+string(j.ID))
@@ -185,7 +185,7 @@ func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotR
 	if err != nil || !filepath.IsLocal(rel) {
 		return snapshot, errors.New("GUI capture manifest outside reserved directory")
 	}
-	if j.Request.Operation.Operation == jobs.OpenSession {
+	if jobs.IsExternalOpen(j.Request.Operation.Operation) || j.Request.Operation.Operation == jobs.AddProjectSession {
 		defer func() {
 			if err := os.RemoveAll(dir); err != nil {
 				fmt.Fprintln(os.Stderr, err)

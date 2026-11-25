@@ -66,6 +66,8 @@ def check(binaries, directory):
             else:
                 raise TimeoutError(program)
             ids.add(opening["state_id"])
+            if step == "step3":
+                project_opening = opening
             update = {"step": step, "target": opening, "parameters": parameters}
             changed = call("set_state_parameters", update)["structuredContent"]["target"]
             assert changed["state_id"] == opening["state_id"] and changed["revision"] > opening["revision"]
@@ -184,6 +186,37 @@ def check(binaries, directory):
         assert manifest["parameters"]["scan_indices"] == [0]
         assert (exported.parent / manifest["entry"]).read_bytes()[:4] == b"LASF"
         print("Step 2 MCP session open, auto-apply, native save and scoped export", flush=True)
+        project_file = directory / "fixture.mjp"
+        project_file.write_text(json.dumps({"session_file_names": [{"session_file_name": str(session)}], "loop_closure_edges": None}))
+        headless, _ = io_job("project.open", "headless-project-open", parameters={"path": str(project_file)})
+        io_job("project.save", "headless-project-save", snapshot=headless["result"]["snapshot"])
+        own_target = next(state for state in call("list_open_states", {})["structuredContent"]["states"]
+                          if state["state_id"] == project_opening["state_id"])
+        job, _ = io_job("project.open", "live-project-open", "applied",
+                        target=own_target, parameters={"path": str(project_file)})
+        current = dict(own_target, revision=own_target["revision"] + 1)
+        assert call("describe_state", {"target": current})["structuredContent"]["metadata"]["step"] == 3
+        second_archive = directory / "other session"
+        subprocess.run([binaries / "processing_publication_test", "--make-input", second_archive, "13"], check=True)
+        second_session = second_archive / "session.mjs"
+        second_before = second_session.read_bytes()
+        io_job("project.add_session", "live-project-add", "applied", target=current, parameters={"path": str(second_session)})
+        current = dict(current, revision=current["revision"] + 1)
+        assert len(call("describe_state", {"target": current})["structuredContent"]["metadata"]["sessions"]) == 2
+        update = {"target": current, "scope": {"session_index": 1}}
+        changed = call("project.set_ground_truth", update)["structuredContent"]["state"]
+        assert changed["metadata"]["sessions"][1]["ground_truth"]
+        assert call("project.remove_session", update)["isError"]
+        _, saved = io_job("project.save", "live-project-save", target=changed["target"])
+        saved_manifest = json.loads(saved.read_text())
+        project = saved.parent / saved_manifest["entry"]
+        paths = [(project.parent / s["session_file_name"]) for s in json.loads(project.read_text())["session_file_names"]]
+        assert len(paths) == 2 and all(path.is_file() for path in paths)
+        assert json.loads(paths[1].read_text())["Session Settings"]["ground_truth"]
+        assert second_session.read_bytes() == second_before
+        removed = call("project.remove_session", {"target": changed["target"], "scope": {"session_index": 1}})
+        assert len(removed["structuredContent"]["state"]["metadata"]["sessions"]) == 1
+        print("Step 3 project open, add, ground truth, native save and revision-checked removal", job["job_id"], flush=True)
         assert len(ids) == 4
     finally:
         adapter.stdin.close()

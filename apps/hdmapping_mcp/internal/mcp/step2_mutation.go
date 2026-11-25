@@ -10,10 +10,10 @@ import (
 
 type step2MutationInput struct {
 	RequestKey string            `json:"request_key,omitempty" jsonschema:"Stable retry key. Required for durable jobs."`
-	Target     *jobs.TargetRef   `json:"target,omitempty" jsonschema:"Live Step 2 opening and exact revision. Supply either target or snapshot."`
-	Snapshot   *jobs.SnapshotRef `json:"snapshot,omitempty" jsonschema:"Durable Step 2 session snapshot and its exact target and revision."`
-	Scope      map[string]any    `json:"scope,omitempty" jsonschema:"Operation-specific scope from the Step 2 operation catalog."`
-	Parameters map[string]any    `json:"parameters,omitempty" jsonschema:"Operation-specific parameters from the Step 2 operation catalog."`
+	Target     *jobs.TargetRef   `json:"target,omitempty" jsonschema:"Live opening and exact revision. Supply either target or snapshot."`
+	Snapshot   *jobs.SnapshotRef `json:"snapshot,omitempty" jsonschema:"Durable snapshot and its exact target and revision."`
+	Scope      map[string]any    `json:"scope,omitempty" jsonschema:"Operation-specific scope from the operation catalog."`
+	Parameters map[string]any    `json:"parameters,omitempty" jsonschema:"Operation-specific parameters from the operation catalog."`
 }
 
 type step2MutationResponse struct {

@@ -18,5 +18,6 @@ namespace HDMapping::Processing
         const std::filesystem::path& staging_directory,
         const std::filesystem::path& destination,
         const PublishOptions& options,
-        const PublicationIO& io);
+        const PublicationIO& io,
+        std::stop_token stop = {});
 } // namespace HDMapping::Processing

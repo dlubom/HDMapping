@@ -17,14 +17,34 @@ target_link_libraries(processing_session_snapshot PUBLIC processing_ops)
 hdmapping_processing_target(processing_session_snapshot)
 list(APPEND _runtime_sources src/SessionSnapshot.cpp)
 
-add_library(processing_result STATIC src/ResultPublisher.cpp src/NativeSessionResult.cpp)
+set(_step3_dir "${PROJECT_SOURCE_DIR}/apps/multi_session_registration")
+set(_native_result_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp src/NativeSessionWriter.cpp
+    src/NativeProjectResult.cpp "${_step3_dir}/project_io.cpp")
+add_library(processing_result STATIC ${_native_result_sources})
+target_include_directories(processing_result PRIVATE "${_step3_dir}")
 target_include_directories(processing_result SYSTEM PRIVATE
-    "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include" "${EIGEN3_INCLUDE_DIR}")
+    "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include" "${EIGEN3_INCLUDE_DIR}"
+    "${LASZIP_INCLUDE_DIR}/LASzip/include")
 target_compile_definitions(processing_result PRIVATE WITH_GUI=0)
 target_link_libraries(processing_result PUBLIC processing_ops)
 hdmapping_processing_target(processing_result)
 target_link_libraries(processing_session_snapshot PUBLIC processing_result)
-list(APPEND _runtime_sources src/ResultPublisher.cpp src/NativeSessionResult.cpp)
+list(APPEND _runtime_sources ${_native_result_sources})
+if(MSVC)
+    target_compile_options(processing_result PRIVATE /bigobj)
+endif()
+
+set(_project_sources "${_step3_dir}/project_operations.cpp" "${_step3_dir}/project_capture.cpp")
+add_library(processing_project STATIC ${_project_sources})
+target_include_directories(processing_project PUBLIC "${_step3_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(processing_project SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/shared/include")
+target_compile_definitions(processing_project PRIVATE WITH_GUI=0)
+target_link_libraries(processing_project PUBLIC processing_session_snapshot)
+hdmapping_processing_target(processing_project)
+if(MSVC)
+    target_compile_options(processing_project PRIVATE /bigobj)
+endif()
+list(APPEND _runtime_sources ${_project_sources})
 
 set(_step1_dir "${PROJECT_SOURCE_DIR}/apps/lidar_odometry_step_1")
 add_library(processing_step1_engine STATIC
@@ -97,7 +117,7 @@ add_library(processing_step1 STATIC ${_step1_sources})
 target_include_directories(processing_step1 PUBLIC "${_step1_dir}")
 target_include_directories(processing_step1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(processing_step1 SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/json/include")
-target_link_libraries(processing_step1 PUBLIC processing_result processing_step1_engine processing_step2)
+target_link_libraries(processing_step1 PUBLIC processing_result processing_step1_engine processing_step2 processing_project)
 hdmapping_processing_target(processing_step1)
 if(MSVC)
     target_compile_options(processing_step1 PRIVATE /bigobj)
@@ -112,13 +132,9 @@ target_link_libraries(processing_gui_state PUBLIC processing_result)
 hdmapping_processing_target(processing_gui_state)
 list(APPEND _runtime_sources ${_gui_sources})
 
-set(_gui_capture_sources
-    "${PROJECT_SOURCE_DIR}/apps/multi_session_registration/project_capture.cpp")
-list(APPEND _runtime_sources ${_gui_capture_sources})
-
 if(BUILD_TESTING)
     add_executable(processing_state_test
-        tests/state_revision_test.cpp tests/gui_capture_test.cpp tests/runtime_test_main.cpp ${_gui_capture_sources})
+        tests/state_revision_test.cpp tests/gui_capture_test.cpp tests/runtime_test_main.cpp)
     target_include_directories(processing_state_test SYSTEM PRIVATE
         "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include" "${EIGEN3_INCLUDE_DIR}"
         "${PROJECT_SOURCE_DIR}/core/include" "${PROJECT_SOURCE_DIR}/shared/include"
@@ -246,6 +262,17 @@ if(BUILD_TESTING)
     add_test(NAME processing-session-io COMMAND processing_session_io_test)
     set_tests_properties(processing-session-io PROPERTIES LABELS processing-session-io TIMEOUT 90)
     list(APPEND _runtime_sources tests/session_io_operations_test.cpp)
+
+    add_executable(processing_project_io_test tests/project_io_test.cpp tests/runtime_test_main.cpp)
+    target_include_directories(processing_project_io_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_link_libraries(processing_project_io_test PRIVATE processing_step1 core_no_gui)
+    if(MSVC)
+        target_compile_options(processing_project_io_test PRIVATE /bigobj)
+    endif()
+    hdmapping_processing_target(processing_project_io_test)
+    add_test(NAME processing-project-io COMMAND processing_project_io_test)
+    set_tests_properties(processing-project-io PROPERTIES LABELS processing-project-io TIMEOUT 90)
+    list(APPEND _runtime_sources tests/project_io_test.cpp)
 endif()
 
 if(HDMAPPING_PROCESSING_TIDY)

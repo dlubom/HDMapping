@@ -136,7 +136,7 @@ TEST_CASE("A project capture restores each unsaved child pose and cloud after re
     for (std::size_t i = 0; i < entries.size(); ++i)
     {
         const auto entry = project.entry.parent_path() / sessionPathFromText(entries.at(i).at("session_file_name").get<std::string>());
-        auto restored = checked(proc::LoadSessionSnapshot({ entry.parent_path() / "snapshot.json", target }));
+        auto restored = checked(proc::LoadSessionSnapshot({ entry.parent_path() / "snapshot.json", proc::ProjectChildTarget(target, i) }));
         const auto& scans = restored.session->point_clouds_container.point_clouds;
         REQUIRE(scans.size() == 1);
         CHECK(scans[0].m_pose.translation().z() == 21.375 + static_cast<double>(i));

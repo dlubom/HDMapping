@@ -21,6 +21,9 @@ namespace HDMapping::Processing
 
     using CaptureSessionOpen = std::function<std::variant<SnapshotRef, OperationError>(const OperationRequest&, RunContext&)>;
 
+    using CaptureProjectInput =
+        std::function<std::variant<SnapshotRef, OperationError>(const OperationRequest&, const std::optional<SnapshotRef>&, RunContext&)>;
+
     //! Serve one worker command. After a run starts, the supervisor sends cancel or closes input after the terminal packet.
     void ServeWorker(
         std::istream& input,
@@ -31,5 +34,6 @@ namespace HDMapping::Processing
         const OperationExecutor& execute,
         const CaptureRecording& capture_recording = {},
         const CaptureReferences& capture_references = {},
-        const CaptureSessionOpen& capture_session_open = {});
+        const CaptureSessionOpen& capture_session_open = {},
+        const CaptureProjectInput& capture_project_input = {});
 } // namespace HDMapping::Processing

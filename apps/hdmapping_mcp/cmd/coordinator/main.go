@@ -120,7 +120,7 @@ func dispatch(scheduler *jobs.Scheduler, processes *guiJobs) protocol.Handler {
 				return nil, fmt.Errorf("parameters: %w", err)
 			}
 			live := request.Snapshot == nil && request.Recording == nil &&
-				(request.Operation.Operation != jobs.OpenSession || request.CaptureSource != "")
+				(!jobs.IsExternalOpen(request.Operation.Operation) || request.CaptureSource != "")
 			if live {
 				if request.CaptureSource != request.Operation.Target.StateID {
 					return nil, errors.New("live capture requires its target state ID")

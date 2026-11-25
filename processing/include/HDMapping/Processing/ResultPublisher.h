@@ -15,10 +15,13 @@ namespace HDMapping::Processing
     };
 
     //! Consume a private sibling .hdmapping-result-stage-<id> built with CaptureSnapshot
-    //! (kind native_session or session_export). The id is unique for each attempt. Shared inputs must be pinned
+    //! (kind native_session, native_project or session_export). The id is unique for each attempt. Shared inputs must be pinned
     //! independently of job cleanup. Replacement compares the current artifact id.
     RunResult PublishResult(
-        const std::filesystem::path& staging_directory, const std::filesystem::path& destination, const PublishOptions& options = {});
+        const std::filesystem::path& staging_directory,
+        const std::filesystem::path& destination,
+        const PublishOptions& options = {},
+        std::stop_token stop = {});
 
     //! Discard an attempt's staging only after its writer has exited. The caller owns the attempt id.
     std::optional<OperationError> DiscardResultStaging(

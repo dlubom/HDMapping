@@ -214,9 +214,9 @@ func normalize(req SubmitRequest) (SubmitRequest, error) {
 		return req, errors.New("invalid job access")
 	}
 	switch {
-	case req.Operation.Operation == OpenSession:
+	case IsExternalOpen(req.Operation.Operation):
 		if req.Snapshot != nil || req.Recording != nil || req.Access != AccessMutate {
-			return req, errors.New("session.open requires external input and mutate access")
+			return req, errors.New("opening requires external input and mutate access")
 		}
 	case req.Recording != nil:
 		if req.Snapshot != nil || req.CaptureSource != "" {

@@ -42,6 +42,9 @@ func (s *Supervisor) Prepare(ctx context.Context, job jobs.JobRecord) (jobs.Snap
 	if job.Request.Operation.Operation == jobs.OpenSession {
 		return s.captureInput(ctx, job, "capture_step2_open")
 	}
+	if operation := job.Request.Operation.Operation; operation == jobs.OpenProject || operation == jobs.AddProjectSession {
+		return s.captureInput(ctx, job, "capture_step3_project")
+	}
 	if job.Request.Recording != nil {
 		return s.captureInput(ctx, job, "capture_step1_recording")
 	}

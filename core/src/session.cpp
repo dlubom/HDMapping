@@ -63,24 +63,26 @@ bool Session::is_point_cloud_file(const std::string& file_name)
 bool Session::load_from_point_cloud(
     const std::string& file_name, bool is_decimate, double bucket_x, double bucket_y, double bucket_z, bool calculate_offset)
 {
-    this->session_file_name = file_name;
-    std::cout << "Loading point cloud as session: '" << file_name << "'" << std::endl;
+    const auto path = session_input_path(file_name);
+    const auto utf8 = sessionPathText(path);
+    this->session_file_name = utf8;
+    std::cout << "Loading point cloud as session: '" << utf8 << "'" << std::endl;
 
-    if (!fs::exists(file_name))
+    if (!fs::exists(path))
     {
-        std::cout << "point cloud file does not exist: '" << file_name << "'" << std::endl;
+        std::cout << "point cloud file does not exist: '" << utf8 << "'" << std::endl;
         return false;
     }
 
     if (!point_clouds_container.load_whu_tls(
-            { file_name }, is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset, this->load_cache_mode) ||
+            { utf8 }, is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset, this->load_cache_mode, true) ||
         point_clouds_container.point_clouds.empty() || point_clouds_container.point_clouds[0].points_local.empty())
     {
-        std::cout << "can't load point cloud: '" << file_name << "'" << std::endl;
+        std::cout << "can't load point cloud: '" << utf8 << "'" << std::endl;
         return false;
     }
 
-    working_directory = fs::path(file_name).parent_path().string();
+    working_directory = sessionPathText(path.parent_path());
 
     // No poses files: the session exists only in memory
     point_clouds_container.poses_file_name = "";

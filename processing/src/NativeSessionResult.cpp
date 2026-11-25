@@ -153,7 +153,7 @@ namespace HDMapping::Processing
         }
     }
 
-    void VerifyNativeSessionRead(const fs::path& entry)
+    std::size_t VerifyNativeSessionRead(const fs::path& entry)
     {
         Session session;
         if (!session.load_published(entry))
@@ -184,6 +184,7 @@ namespace HDMapping::Processing
                 throw std::runtime_error("Native ground control point refers to a missing trajectory node");
             }
         }
+        return scans.size();
     }
 
     SnapshotContents CopyNativeSession(
