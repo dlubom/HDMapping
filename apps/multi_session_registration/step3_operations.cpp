@@ -318,7 +318,7 @@ namespace HDMapping::Processing
 
         void run_ndt(const OperationRequest& request, std::vector<Session>& sessions)
         {
-            keys(request.parameters, { "method" }, { "bucket_size_m", "threads", "iterations", "compute_mean_and_cov_for_bucket" });
+            keys(request.parameters, { "method" }, { "bucket_size_m", "threads", "iterations" });
             const auto selected = ndt_indices(request.scope, sessions);
             if (std::ranges::count_if(
                     selected,
@@ -338,7 +338,6 @@ namespace HDMapping::Processing
                 integer(request.parameters.value("threads", json(engine.number_of_threads)), 1, std::numeric_limits<int>::max());
             engine.number_of_iterations =
                 integer(request.parameters.value("iterations", json(engine.number_of_iterations)), 1, std::numeric_limits<int>::max());
-            const bool mean_and_cov = request.parameters.value("compute_mean_and_cov_for_bucket", false);
             if (selected.size() == 1 && sessions[selected.front()].is_ground_truth)
                 return;
             for (const auto i : selected)
@@ -367,7 +366,7 @@ namespace HDMapping::Processing
             bool solved;
             try
             {
-                solved = engine.optimize(working, false, mean_and_cov, true);
+                solved = engine.optimize(working, false, false, true);
             } catch (...)
             {
                 restore_sessions();
@@ -723,8 +722,7 @@ namespace HDMapping::Processing
                         { { "method", { { "const", "ndt" } } },
                           { "bucket_size_m", tuple(metres, 3, "NDT bucket dimensions in metres") },
                           { "threads", positive_int },
-                          { "iterations", positive_int },
-                          { "compute_mean_and_cov_for_bucket", boolean } },
+                          { "iterations", positive_int } },
                         { "method" }),
                     object(registration_icp, { "method" }) } } },
               artifact,

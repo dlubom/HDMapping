@@ -304,7 +304,6 @@ static void optimizeProjectFromGui()
 
 void ndt_gui()
 {
-    static bool compute_mean_and_cov_for_bucket = false;
     if (ImGui::Begin("Normal Distributions Transform", &is_ndt_gui, ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::InputFloat3("Bucket size [m] (x, y,z)", ndt.bucket_size);
@@ -343,14 +342,14 @@ void ndt_gui()
                 { { "method", "ndt" },
                   { "bucket_size_m", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
                   { "threads", ndt.number_of_threads },
-                  { "iterations", ndt.number_of_iterations },
-                  { "compute_mean_and_cov_for_bucket", compute_mean_and_cov_for_bucket } });
+                  { "iterations", ndt.number_of_iterations } });
         }
         ImGui::EndDisabled();
         ImGui::End();
     }
 
 #if 0
+    static bool compute_mean_and_cov_for_bucket = false;
     ImGui::Checkbox("ndt fix_first_node (add I to first pose in Hessian)", &ndt.is_fix_first_node);
 
     ImGui::Checkbox("ndt Gauss-Newton", &ndt.is_gauss_newton);

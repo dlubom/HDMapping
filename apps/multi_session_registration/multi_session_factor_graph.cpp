@@ -502,7 +502,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
@@ -511,7 +511,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 1;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
@@ -520,7 +520,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 2;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
@@ -529,7 +529,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 3;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
@@ -538,7 +538,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 4;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
@@ -547,7 +547,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                 {
                     const int ir = static_cast<int>(tripletListB.size());
                     int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 5;
-                    tripletListA.emplace_back(ir + 0, ic, 1000000000000);
+                    tripletListA.emplace_back(ir + 0, ic, 1e12);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
