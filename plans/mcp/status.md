@@ -10,7 +10,7 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 
 **Decyzja właściciela 2026-11-16 — P02.** Właściciel dopuścił rozpoczęcie P02 na wspólnej gałęzi od `2a92ad363a0b0603e81d2381076975223c835788`, gdy P01 miało 6/8 PASS. Wówczas odłożył ponowienie macOS ARM64 ON/OFF dla P01. [Raport P01](results/P01.md#decyzja-właściciela--rozpoczęcie-p02)
 
-**Domknięcie 2026-11-25.** Właściciel odwołał zakaz ponawiania historycznych runów P01 i P05. Zaliczone joby macOS ARM64 domknęły macierze P01, P05 i P14 na ich własnych SHA. P15 jest następną kartą.
+**Domknięcie 2026-11-25.** Właściciel odwołał zakaz ponawiania historycznych runów P01 i P05. Zaliczone joby macOS ARM64 domknęły macierze P01, P05 i P14 na ich własnych SHA. Te wyniki stanowiły bazę odbioru P15.
 
 - Repozytorium do zapisu: `dlubom/HDMapping`.
 - Branch planu: `mcp/implementation-plan`.
@@ -34,7 +34,7 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 - **P12 PASSED** dla `ec3e9f860f3bb2f8880cc469150b220362f82484`. Macierz **8/8 PASS**. CTest lokalnie 17/17 ON i 5/5 OFF. Jawne edycje, transformacja i reset póz korzystają ze wspólnego C++ oraz kontroli rewizji. Parking potwierdził auto-apply, selektywność, natywny Save As i ponowny odczyt. Następny prompt dotyczy wyłącznie P13. [Raport P12](results/P12.md)
 - **P13 PASSED** dla `c06b6ec4133b83b38e8b4f620ebf34c8325b9173`. Macierz **8/8 PASS** na Windows Server x64, macOS ARM64, Ubuntu bundled i Debian ON/OFF. Lokalny CTest 18/18 ON i 5/5 OFF. ASan/UBSan i pełny TSan po 12/12, w tym I/O sesji i rejestracja Step 2. Parking potwierdził natywny MJS, wybór z ukrytym skanem, cykl E57 i bajtową zgodność obu trybów CLI. Przeszedł odczyt sześciu pobranych archiwów. Następny prompt dotyczy wyłącznie P14. [Raport P13](results/P13.md#odbiór-po-włączeniu-poprawki-build_rgd)
 - **P14 PASSED** dla `372ad2aa04b54e360059727c9c39298fba317ce4`. Macierz **8/8 PASS** po zaliczeniu macOS ARM64 ON z CTest 19/19 i odczytem archiwum DMG. ASan/UBSan i pełny TSan po 13/13. Projekt OmniWarsaw otworzył się po natywnym zapisie dwóch sesji po 14 skanów, z ground truth i więzem. Źródłowe pozy pozostały bajtowo identyczne. Przeszła próba przerwania pełnego zapisu. Następny prompt dotyczy wyłącznie P15. [Raport P14](results/P14.md)
-- **P15 INCOMPLETE** dla `5af3e6b1b3ad052cc7546be4735fd373d677b5e8` w trakcie Actions. Lokalny CTest 20/20 ON i 5/5 OFF, Go, relokacja oraz porównanie OmniWarsaw z bazą przeszły. Zamknięcie okna i ponowne połączenie zachowały zadanie, a wynik otworzył się natywnie. Odbiór platform i sanitizerów jest w toku. [Raport P15](results/P15.md)
+- **P15 PASSED** dla `5af3e6b1b3ad052cc7546be4735fd373d677b5e8`. Macierz **8/8 PASS**, CTest 20/20 ON i 5/5 OFF, pełny ASan/UBSan i osobny pełny TSan po 14/14. Rzeczywiste nakładanie OmniWarsaw potwierdziło 9032/15 731 punktów do 0,30 m. ICP i graf porównano z bazą. Optymalizacja trwała po zamknięciu GUI i ponownym połączeniu klienta. Natywne wyniki zachowały ground truth i pliki źródłowe. Następny prompt dotyczy wyłącznie P16. [Raport P15](results/P15.md)
 - **P00 INCOMPLETE.** Otwarte pozostają historyczne próby hostów Windows i Ubuntu, Linux TSan P00, bazowy projekt z potwierdzonym nakładaniem sesji oraz zapis i odczyt wyniku optymalizacji GUI kroku 2. Claude Desktop przypada na P17. [Raport P00](results/P00.md#pozostałe-braki-kwalifikacji-p00)
 - Odroczenie nie zmienia wyników kontroli ani wymagań przenośności i nie upoważnia do usuwania istniejących kontroli CI. Braki danych pozostają otwarte; nie są dowodem zgodności przyszłych zmian przetwarzania.
 - Kolejne czaty stosują [zasady przekazania](README.md).
@@ -56,7 +56,7 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 | P12 | PASSED | [P12](results/P12.md) |
 | P13 | PASSED | [P13](results/P13.md) |
 | P14 | PASSED | [P14](results/P14.md) |
-| P15 | INCOMPLETE | [P15](results/P15.md) |
+| P15 | PASSED | [P15](results/P15.md) |
 | P16 | NOT STARTED | — |
 | P17 | NOT STARTED | — |
 
