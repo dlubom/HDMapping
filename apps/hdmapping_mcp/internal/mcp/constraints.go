@@ -25,6 +25,7 @@ type constraintResponse struct {
 type constraintState struct {
 	Target   jobs.TargetRef `json:"target"`
 	Metadata struct {
+		Step        int              `json:"step"`
 		ActiveEdges []map[string]any `json:"active_edges"`
 	} `json:"metadata"`
 }
@@ -60,7 +61,7 @@ func addConstraintTools(server *sdk.Server, call func(context.Context, string, a
 					if err := call(ctx, "states.describe", describeState{Target: *input.Target}, &state); err != nil {
 						return nil, out, err
 					}
-					if state.Metadata.ActiveEdges == nil {
+					if state.Metadata.Step == 3 || state.Metadata.ActiveEdges == nil {
 						return nil, out, errors.New("target is not a Step 2 session")
 					}
 					out.Target, out.ActiveEdges = &state.Target, &state.Metadata.ActiveEdges

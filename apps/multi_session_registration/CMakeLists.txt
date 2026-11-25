@@ -5,7 +5,6 @@ project(multi_session_registration_step_3)
 # Source files
 set(SOURCES
     multi_session_registration.cpp
-    multi_session_factor_graph.cpp
     raylib_utils.cpp
 )
 
@@ -72,6 +71,7 @@ if(BUILD_WITH_MCP)
     target_compile_definitions(multi_session_registration_step_3 PRIVATE HDMAPPING_GUI_BRIDGE)
     target_link_libraries(multi_session_registration_step_3 processing_gui_state processing_project)
 else()
-    target_sources(multi_session_registration_step_3 PRIVATE project_io.cpp)
+    target_sources(multi_session_registration_step_3 PRIVATE project_io.cpp step3_operations.cpp multi_session_factor_graph.cpp)
+    target_include_directories(multi_session_registration_step_3 PRIVATE "${REPOSITORY_DIRECTORY}/processing/include")
 endif()
 hdmapping_install_app(multi_session_registration_step_3)

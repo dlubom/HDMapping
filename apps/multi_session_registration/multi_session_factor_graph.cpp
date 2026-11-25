@@ -1,7 +1,9 @@
 #include "multi_session_factor_graph.h"
 
 #include <Core/m_estimators.h>
-#include <Core/utils.hpp>
+#include <Core/transformations.h>
+
+#include <iostream>
 
 #include <python-scripts/constraints/relative_pose_tait_bryan_cw_jacobian.h>
 #include <python-scripts/constraints/relative_pose_tait_bryan_wc_jacobian.h>
@@ -9,14 +11,13 @@
 #include <python-scripts/point-to-feature-metrics/point_to_plane_tait_bryan_wc_jacobian.h>
 #include <python-scripts/point-to-point-metrics/point_to_point_source_to_target_tait_bryan_wc_jacobian.h>
 
+namespace
+{
+    constexpr float DEG_TO_RAD = 0.017453292519943295f;
+}
+
 bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, TaitBryanPose motion_model_weights)
 {
-    for (auto& session : sessions)
-    {
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.m_pose_temp = pc.m_pose;
-    }
-
     std::vector<int> sums;
     sums.push_back(0);
     int sum = 0;
@@ -29,7 +30,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
     for (size_t i = 0; i < sessions.size(); i++)
     {
-        sum += sessions[i].point_clouds_container.point_clouds.size();
+        sum += static_cast<int>(sessions[i].point_clouds_container.point_clouds.size());
         sums.push_back(sum);
 
         for (size_t j = 0; j < sessions[i].point_clouds_container.point_clouds.size(); j++)
@@ -44,7 +45,6 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
         }
     }
 
-    bool is_ok = true;
     std::vector<Eigen::Affine3d> m_poses;
     std::vector<Eigen::Affine3d> poses_motion_model;
     std::vector<int> index_trajectory;
@@ -56,7 +56,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
             m_poses.push_back(sessions[j].point_clouds_container.point_clouds[i].m_pose);
             poses_motion_model.push_back(sessions[j].point_clouds_container.point_clouds[i].m_initial_pose);
             // poses_motion_model.push_back(sessions[j].point_clouds_container.point_clouds[i].m_pose);
-            index_trajectory.push_back(j);
+            index_trajectory.push_back(static_cast<int>(j));
         }
     }
 
@@ -98,8 +98,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
         {
             Eigen::Affine3d m_rel = poses_motion_model[i - 1].inverse() * poses_motion_model[i];
             Edge edge;
-            edge.index_from = i - 1;
-            edge.index_to = i;
+            edge.index_from = static_cast<int>(i) - 1;
+            edge.index_to = static_cast<int>(i);
             edge.index_session_from = -1;
             edge.index_session_to = -1;
             edge.relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_rel);
@@ -227,12 +227,12 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                     normalize_angle(poses[all_edges[i].index_to].ka));
             }
 
-            int ir = tripletListB.size();
+            const int ir = static_cast<int>(tripletListB.size());
 
             int ic_1 = all_edges[i].index_from * 6;
             int ic_2 = all_edges[i].index_to * 6;
 
-            for (size_t row = 0; row < 6; row++)
+            for (int row = 0; row < 6; row++)
             {
                 tripletListA.emplace_back(ir + row, ic_1, -jacobian(row, 0));
                 tripletListA.emplace_back(ir + row, ic_1 + 1, -jacobian(row, 1));
@@ -266,7 +266,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
         if (is_fix_first_node)
         {
-            int ir = tripletListB.size();
+            const int ir = static_cast<int>(tripletListB.size());
             tripletListA.emplace_back(ir, 0, 1);
             tripletListA.emplace_back(ir + 1, 1, 1);
             tripletListA.emplace_back(ir + 2, 2, 1);
@@ -292,27 +292,28 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
             {
                 if (index_trajectory[i - 1] != index_trajectory[i])
                 {
-                    ir = tripletListB.size();
-                    tripletListA.emplace_back(ir, i * 6 + 0, 1);
-                    tripletListA.emplace_back(ir + 1, i * 6 + 1, 1);
-                    tripletListA.emplace_back(ir + 2, i * 6 + 2, 1);
-                    tripletListA.emplace_back(ir + 3, i * 6 + 3, 1);
-                    tripletListA.emplace_back(ir + 4, i * 6 + 4, 1);
-                    tripletListA.emplace_back(ir + 5, i * 6 + 5, 1);
+                    const int anchor_row = static_cast<int>(tripletListB.size());
+                    const int anchor_column = static_cast<int>(i) * 6;
+                    tripletListA.emplace_back(anchor_row, anchor_column, 1);
+                    tripletListA.emplace_back(anchor_row + 1, anchor_column + 1, 1);
+                    tripletListA.emplace_back(anchor_row + 2, anchor_column + 2, 1);
+                    tripletListA.emplace_back(anchor_row + 3, anchor_column + 3, 1);
+                    tripletListA.emplace_back(anchor_row + 4, anchor_column + 4, 1);
+                    tripletListA.emplace_back(anchor_row + 5, anchor_column + 5, 1);
 
-                    tripletListP.emplace_back(ir, ir, 0.0001);
-                    tripletListP.emplace_back(ir + 1, ir + 1, 0.0001);
-                    tripletListP.emplace_back(ir + 2, ir + 2, 0.0001);
-                    tripletListP.emplace_back(ir + 3, ir + 3, 0.0001);
-                    tripletListP.emplace_back(ir + 4, ir + 4, 0.0001);
-                    tripletListP.emplace_back(ir + 5, ir + 5, 0.0001);
+                    tripletListP.emplace_back(anchor_row, anchor_row, 0.0001);
+                    tripletListP.emplace_back(anchor_row + 1, anchor_row + 1, 0.0001);
+                    tripletListP.emplace_back(anchor_row + 2, anchor_row + 2, 0.0001);
+                    tripletListP.emplace_back(anchor_row + 3, anchor_row + 3, 0.0001);
+                    tripletListP.emplace_back(anchor_row + 4, anchor_row + 4, 0.0001);
+                    tripletListP.emplace_back(anchor_row + 5, anchor_row + 5, 0.0001);
 
-                    tripletListB.emplace_back(ir, 0, 0);
-                    tripletListB.emplace_back(ir + 1, 0, 0);
-                    tripletListB.emplace_back(ir + 2, 0, 0);
-                    tripletListB.emplace_back(ir + 3, 0, 0);
-                    tripletListB.emplace_back(ir + 4, 0, 0);
-                    tripletListB.emplace_back(ir + 5, 0, 0);
+                    tripletListB.emplace_back(anchor_row, 0, 0);
+                    tripletListB.emplace_back(anchor_row + 1, 0, 0);
+                    tripletListB.emplace_back(anchor_row + 2, 0, 0);
+                    tripletListB.emplace_back(anchor_row + 3, 0, 0);
+                    tripletListB.emplace_back(anchor_row + 4, 0, 0);
+                    tripletListB.emplace_back(anchor_row + 5, 0, 0);
                 }
             }
         }
@@ -322,7 +323,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
         for (size_t index = 0; index < indexes_ground_truth.size(); index++)
         {
-            int ir = tripletListB.size();
+            const int ir = static_cast<int>(tripletListB.size());
             int ic = indexes_ground_truth[index] * 6;
             tripletListA.emplace_back(ir, ic + 0, 1);
             tripletListA.emplace_back(ir + 1, ic + 1, 1);
@@ -383,7 +384,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                         std::cout << " delta_x " << delta_x << " delta_y " << delta_y << " delta_z " << delta_z << std::endl;
 
-                        int ir = tripletListB.size();
+                        const int ir = static_cast<int>(tripletListB.size());
                         int ic = index_pose * 6;
                         for (int row = 0; row < 3; row++)
                         {
@@ -455,7 +456,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                     p_t.y(),
                     p_t.z());
 
-                int ir = tripletListB.size();
+                const int ir = static_cast<int>(tripletListB.size());
                 int ic = sessions[j].ground_control_points.gpcs[jj].index_to_node_inner * 6 + sums[j] * 6;
 
                 for (int row = 0; row < 3; row++)
@@ -499,8 +500,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
             {
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_x || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
@@ -508,8 +509,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_y || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6 + 1;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 1;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
@@ -517,8 +518,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_z || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6 + 2;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 2;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
@@ -526,8 +527,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_om || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6 + 3;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 3;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
@@ -535,8 +536,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_fi || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6 + 4;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 4;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
@@ -544,17 +545,14 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
                 if (sessions[i].point_clouds_container.point_clouds[index_pose].fixed_ka || sessions[i].is_ground_truth)
                 {
-                    int ir = tripletListB.size();
-                    int ic = (index_pose + sums[i]) * 6 + 5;
+                    const int ir = static_cast<int>(tripletListB.size());
+                    int ic = (static_cast<int>(index_pose) + sums[i]) * 6 + 5;
                     tripletListA.emplace_back(ir + 0, ic, 1000000000000);
                     tripletListP.emplace_back(ir, ir, 1);
                     tripletListB.emplace_back(ir, 0, 0);
                 }
             }
         }
-
-        double error_imu = 0;
-        double error_imu_sum = 0;
 
         for (size_t j = 0; j < sessions.size(); j++)
         {
@@ -627,8 +625,8 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                     vzy,
                     vzz);
 
-                int ir = tripletListB.size();
-                int ic = (index_pose + sums[j]) * 6;
+                int ir = static_cast<int>(tripletListB.size());
+                int ic = (static_cast<int>(index_pose) + sums[j]) * 6;
                 tripletListA.emplace_back(ir + 0, ic + 3, -delta_jacobian(0, 3));
                 tripletListA.emplace_back(ir + 0, ic + 4, -delta_jacobian(0, 4));
 
@@ -673,9 +671,9 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                     vzy,
                     vzz);
 
-                ir = tripletListB.size();
+                ir = static_cast<int>(tripletListB.size());
                 // ic = index_pose * 6;
-                ic = (index_pose + sums[j]) * 6;
+                ic = (static_cast<int>(index_pose) + sums[j]) * 6;
 
                 tripletListA.emplace_back(ir + 0, ic + 3, -delta_jacobian(0, 3));
                 tripletListA.emplace_back(ir + 0, ic + 4, -delta_jacobian(0, 4));
@@ -693,7 +691,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
             auto& cps = sessions[j].control_points;
             auto& point_clouds_container = sessions[j].point_clouds_container;
 
-            for (int i = 0; i < cps.cps.size(); i++)
+            for (std::size_t i = 0; i < cps.cps.size(); i++)
             {
                 if (!cps.cps[i].is_z_0)
                 {
@@ -727,9 +725,9 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                         p_t.y(),
                         p_t.z());
 
-                    int ir = tripletListB.size();
+                    const int ir = static_cast<int>(tripletListB.size());
 
-                    //(index_pose + sums[j]) * 6;
+                    //(static_cast<int>(index_pose) + sums[j]) * 6;
                     int ic = (cps.cps[i].index_to_pose + sums[j]) * 6;
 
                     for (int row = 0; row < 3; row++)
@@ -784,7 +782,7 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
                         p_t.y(),
                         p_t.z());
 
-                    int ir = tripletListB.size();
+                    const int ir = static_cast<int>(tripletListB.size());
                     // int ic = cps.cps[i].index_to_pose * 6;
                     int ic = (cps.cps[i].index_to_pose + sums[j]) * 6;
 
@@ -839,89 +837,48 @@ bool optimize(std::vector<Session>& sessions, const std::vector<Edge>& edges, Ta
 
         Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA);
 
-        Eigen::SparseMatrix<double> x = solver.solve(AtPB);
+        if (solver.info() != Eigen::Success)
+            return false;
+        const Eigen::VectorXd h_x = solver.solve(Eigen::VectorXd(AtPB));
+        if (solver.info() != Eigen::Success || !h_x.allFinite())
+            return false;
 
-        std::vector<double> h_x;
-
-        for (int k = 0; k < x.outerSize(); ++k)
+        for (std::size_t i = 0; i < poses.size(); ++i)
         {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(x, k); it; ++it)
-            {
-                h_x.push_back(it.value());
-            }
+            if (sessions[index_trajectory[i]].is_ground_truth)
+                continue;
+            const auto offset = static_cast<Eigen::Index>(i) * 6;
+            poses[i].px += h_x[offset] * 0.1;
+            poses[i].py += h_x[offset + 1] * 0.1;
+            poses[i].pz += h_x[offset + 2] * 0.1;
+            poses[i].om += h_x[offset + 3] * 0.1;
+            poses[i].fi += h_x[offset + 4] * 0.1;
+            poses[i].ka += h_x[offset + 5] * 0.1;
         }
 
-        if (h_x.size() == 6 * poses.size())
+        for (std::size_t i = 0; i < m_poses.size(); ++i)
         {
-            int counter = 0;
-
-            for (size_t i = 0; i < poses.size(); i++)
-            {
-                TaitBryanPose pose = poses[i];
-                pose.px += h_x[counter++] * 0.1;
-                pose.py += h_x[counter++] * 0.1;
-                pose.pz += h_x[counter++] * 0.1;
-                pose.om += h_x[counter++] * 0.1;
-                pose.fi += h_x[counter++] * 0.1;
-                pose.ka += h_x[counter++] * 0.1;
-
-                poses[i].px = pose.px;
-                poses[i].py = pose.py;
-                poses[i].pz = pose.pz;
-                poses[i].om = pose.om;
-                poses[i].fi = pose.fi;
-                poses[i].ka = pose.ka;
-            }
-        }
-        else
-        {
-            std::cout << "optimizing with tait bryan FAILED" << std::endl;
-            std::cout << "h_x.size(): " << h_x.size() << " should be: " << 6 * poses.size() << std::endl;
-            is_ok = false;
-            break;
+            if (is_wc)
+                m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]);
+            else if (is_cw)
+                m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]).inverse();
         }
 
-        if (is_ok)
+        for (std::size_t i = 0; i < m_poses.size(); ++i)
         {
-            for (size_t i = 0; i < m_poses.size(); i++)
-            {
-                if (is_wc)
-                    m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]);
-                else if (is_cw)
-                    m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]).inverse();
-            }
-        }
-
-        if (is_ok)
-        {
-            int index = 0;
-            for (size_t i = 0; i < m_poses.size(); i++)
-            {
-                if (i > 0)
-                {
-                    if (index_trajectory[i - 1] != index_trajectory[i])
-                        index = 0;
-                }
-                // if (!sessions[index_trajectory[i]].is_ground_truth)
-                //{
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].m_pose = m_poses[i];
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose =
-                    pose_tait_bryan_from_affine_matrix(sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].m_pose);
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_translation[0] =
-                    sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.px;
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_translation[1] =
-                    sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.py;
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_translation[2] =
-                    sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.pz;
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_rotation[0] =
-                    rad2deg(sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.om);
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_rotation[1] =
-                    rad2deg(sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.fi);
-                sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].gui_rotation[2] =
-                    rad2deg(sessions[index_trajectory[i]].point_clouds_container.point_clouds[index].pose.ka);
-                //}
-                index++;
-            }
+            const int session_index = index_trajectory[i];
+            auto& session = sessions[session_index];
+            if (session.is_ground_truth)
+                continue;
+            auto& scan = session.point_clouds_container.point_clouds[i - sums[session_index]];
+            scan.m_pose = m_poses[i];
+            scan.pose = pose_tait_bryan_from_affine_matrix(scan.m_pose);
+            scan.gui_translation[0] = static_cast<float>(scan.pose.px);
+            scan.gui_translation[1] = static_cast<float>(scan.pose.py);
+            scan.gui_translation[2] = static_cast<float>(scan.pose.pz);
+            scan.gui_rotation[0] = static_cast<float>(rad2deg(scan.pose.om));
+            scan.gui_rotation[1] = static_cast<float>(rad2deg(scan.pose.fi));
+            scan.gui_rotation[2] = static_cast<float>(rad2deg(scan.pose.ka));
         }
     }
     return true;

@@ -1,11 +1,15 @@
 #include "project_operations.h"
 
 #include "project_capture.h"
+#include "step3_operations.h"
 #include <HDMapping/Processing/ResultPublisher.h>
 #include <HDMapping/Processing/SessionSnapshot.h>
 #include <HDMapping/SessionPaths.h>
 
 #include <algorithm>
+#include <array>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 
@@ -59,6 +63,51 @@ namespace HDMapping::Processing
             return CaptureSnapshot(source, target.revision, context.output_directory, context);
         }
 
+        //! Persist a project graph read result without publishing mutated project state.
+        class ConstraintReport final : public CaptureSource
+        {
+        public:
+            ConstraintReport(TargetRef target, json report)
+                : target_(std::move(target))
+                , report_(std::move(report))
+            {
+            }
+
+            TargetRef Target() const override
+            {
+                return target_;
+            }
+
+            CaptureResult Materialize(const fs::path& directory, RunContext& context) override
+            {
+                if (context.stop.stop_requested())
+                    return OperationError{ "cancelled", "Project constraint report cancelled", json::object() };
+                std::ofstream file(directory / "constraints.json", std::ios::binary);
+                file.exceptions(std::ios::failbit | std::ios::badbit);
+                file << report_.dump(2);
+                file.close();
+                return SnapshotContents{ "project_constraints", "constraints.json", json::object(), {} };
+            }
+
+        private:
+            TargetRef target_;
+            json report_;
+        };
+
+        RunResult publish_constraints(const TargetRef& target, json report, RunContext& context)
+        {
+            ConstraintReport source(target, std::move(report));
+            const auto captured = CaptureSnapshot(source, target.revision, context.output_directory / "project-constraints", context);
+            if (const auto* error = std::get_if<OperationError>(&captured))
+                return *error;
+            const auto& snapshot = std::get<SnapshotRef>(captured);
+            return ArtifactManifest{ "project-constraints",
+                                     target,
+                                     snapshot,
+                                     { snapshot.manifest_path, snapshot.manifest_path.parent_path() / "constraints.json" },
+                                     {} };
+        }
+
         RunResult publish(const ProjectState& state, const TargetRef& target, RunContext& context)
         {
             const auto stage = context.output_directory / ".hdmapping-result-stage-project";
@@ -90,18 +139,22 @@ namespace HDMapping::Processing
             return object_schema({ { "session_index", { { "type", "integer" }, { "minimum", minimum } } } }, { "session_index" });
         };
         const json artifact = { { "type", "object" } };
-        return {
+        std::vector<OperationDescriptor> operations{
             { std::string(open), empty, path, artifact, OperationClass::Heavy },
             { std::string(save), empty, empty, artifact, OperationClass::Heavy },
             { std::string(add), empty, path, artifact, OperationClass::Heavy },
             { std::string(remove), index(0), empty, artifact, OperationClass::Mutate },
             { std::string(ground_truth), index(-1), empty, artifact, OperationClass::Mutate },
         };
+        auto graph = DescribeStep3Operations();
+        operations.insert(operations.end(), std::make_move_iterator(graph.begin()), std::make_move_iterator(graph.end()));
+        return operations;
     }
 
     bool IsProjectOperation(std::string_view operation)
     {
-        return operation == open || operation == save || operation == add || operation == remove || operation == ground_truth;
+        return operation == open || operation == save || operation == add || operation == remove || operation == ground_truth ||
+            IsStep3Operation(operation);
     }
 
     std::variant<SnapshotRef, OperationError> CaptureProjectOpen(const OperationRequest& request, RunContext& context)
@@ -203,7 +256,25 @@ namespace HDMapping::Processing
                     state.sessions.push_back(std::move(*std::get<SessionSnapshot>(loaded).session));
                     state.sessions.back().session_file_name = name;
                 }
-                state.sessions.back().visible = child.at("visible").get<bool>();
+                auto& session = state.sessions.back();
+                auto& scans = session.point_clouds_container.point_clouds;
+                if (child.contains("previous_poses"))
+                {
+                    const auto& previous = child.at("previous_poses");
+                    if (!previous.is_array() || previous.size() != scans.size())
+                        throw std::invalid_argument("Project previous pose inventory disagrees with the session");
+                    for (std::size_t scan = 0; scan < scans.size(); ++scan)
+                    {
+                        const auto matrix = previous.at(scan).get<std::array<double, 16>>();
+                        scans[scan].m_pose_temp.matrix() = Eigen::Map<const Eigen::Matrix4d>(matrix.data());
+                        if (!scans[scan].m_pose_temp.matrix().allFinite())
+                            throw std::invalid_argument("Project previous pose is not finite");
+                    }
+                }
+                else
+                    for (auto& scan : scans)
+                        scan.m_pose_temp = scan.m_pose;
+                session.visible = child.at("visible").get<bool>();
                 state.sources.emplace(state.sessions.back().session_file_name, child.at("source").get<std::string>());
             }
             ValidateProjectScans(state.settings, state.sessions);
@@ -243,6 +314,12 @@ namespace HDMapping::Processing
             }
             else if (request.operation == remove || request.operation == ground_truth)
                 EditProject(request, state.settings, state.sessions);
+            else if (IsStep3Operation(request.operation))
+            {
+                auto report = RunStep3(request, state.settings, state.sessions, context);
+                if (!report.is_null())
+                    return publish_constraints(request.target, std::move(report), context);
+            }
             else if (request.operation != save || !request.parameters.empty() || !request.scope.empty())
                 throw std::invalid_argument("Invalid project save request");
             state.parameters.erase("project_import");

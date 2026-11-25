@@ -4,6 +4,8 @@
 
 #include <HDMapping/SessionPaths.h>
 
+#include <algorithm>
+#include <array>
 #include <fstream>
 
 namespace proc = HDMapping::Processing;
@@ -75,11 +77,19 @@ proc::CaptureResult ProjectCapture::Materialize(const fs::path& directory, proc:
         }
         paths.push_back({ { "session_file_name", sessionPathText(entry.lexically_relative(directory)) } });
         const auto original = sources_.find(session.session_file_name);
+        auto previous_poses = nlohmann::json::array();
+        for (const auto& scan : session.point_clouds_container.point_clouds)
+        {
+            std::array<double, 16> matrix;
+            std::copy_n(scan.m_pose_temp.matrix().data(), matrix.size(), matrix.begin());
+            previous_poses.push_back(matrix);
+        }
         children.push_back(
             { { "state_id", identity.state_id },
               { "revision", identity.revision },
               { "source", original == sources_.end() ? session.session_file_name : original->second },
-              { "visible", session.visible } });
+              { "visible", session.visible },
+              { "previous_poses", std::move(previous_poses) } });
         if (context.progress)
             context.progress({ "write_project_sessions", paths.size(), sessions_.size(), {} });
     }

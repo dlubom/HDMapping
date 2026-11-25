@@ -136,6 +136,8 @@ Session ReadProjectSession(const std::string& path, const ProjectLoadOptions& op
         : session.load(path, options.decimate, options.buckets[0], options.buckets[1], options.buckets[2], options.calculate_offset);
     if (!loaded || session.point_clouds_container.point_clouds.empty())
         throw std::runtime_error("Could not load project session: " + path);
+    for (auto& scan : session.point_clouds_container.point_clouds)
+        scan.m_pose_temp = scan.m_pose;
     return session;
 }
 
@@ -181,9 +183,13 @@ void ValidateProjectScanIndices(const ProjectSettings& settings, const std::vect
 {
     for (const auto& edge : settings.edges)
     {
+        if (edge.index_session_from < 0 || edge.index_session_to < 0 ||
+            static_cast<std::size_t>(edge.index_session_from) >= scan_counts.size() ||
+            static_cast<std::size_t>(edge.index_session_to) >= scan_counts.size())
+            throw std::invalid_argument("Invalid project constraint session index");
         if (edge.index_from < 0 || edge.index_to < 0 ||
-            static_cast<std::size_t>(edge.index_from) >= scan_counts.at(static_cast<std::size_t>(edge.index_session_from)) ||
-            static_cast<std::size_t>(edge.index_to) >= scan_counts.at(static_cast<std::size_t>(edge.index_session_to)))
+            static_cast<std::size_t>(edge.index_from) >= scan_counts[static_cast<std::size_t>(edge.index_session_from)] ||
+            static_cast<std::size_t>(edge.index_to) >= scan_counts[static_cast<std::size_t>(edge.index_session_to)])
             throw std::invalid_argument("Invalid project constraint scan index");
     }
 }

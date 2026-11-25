@@ -38,6 +38,20 @@ set(CORE_MATH_SOURCES
 )
 
 add_library(core_math STATIC ${CORE_MATH_SOURCES})
+if(BUILD_WITH_MCP AND NOT HDMAPPING_PROCESSING_SANITIZER STREQUAL "none")
+    # Exercise the Step 3 numerical kernels, including their worker threads.
+    # processing executables already link the matching sanitizer runtime.
+    if(HDMAPPING_PROCESSING_SANITIZER STREQUAL "thread")
+        set(_step3_math_sanitizer thread)
+    elseif(HDMAPPING_PROCESSING_SANITIZER STREQUAL "address-undefined")
+        set(_step3_math_sanitizer address,undefined)
+    endif()
+    if(_step3_math_sanitizer)
+        set_source_files_properties(src/ndt.cpp src/pair_wise_iterative_closest_point.cpp PROPERTIES
+            COMPILE_OPTIONS "-fsanitize=${_step3_math_sanitizer};-fno-sanitize-recover=all;-fno-omit-frame-pointer")
+        target_link_options(core_math INTERFACE "-fsanitize=${_step3_math_sanitizer}")
+    endif()
+endif()
 target_compile_definitions(core_math PRIVATE WITH_GUI=0)
 target_link_libraries(core_math PRIVATE PROJ::proj spdlog::spdlog vqf Fusion wgs84_do_puwg92 plycpp WGS84toCartesian ${PLATFORM_MISCELLANEOUS_LIBS})
 target_include_directories(core_math PRIVATE

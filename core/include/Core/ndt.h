@@ -139,7 +139,11 @@ public:
         bool compute_only_mahalanobis_distance,
         bool compute_mean_and_cov_for_bucket,
         double* mean_mahalanobis = nullptr);
-    bool optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis_distance, bool compute_mean_and_cov_for_bucket);
+    bool optimize(
+        std::vector<Session>& sessions,
+        bool compute_only_mahalanobis_distance,
+        bool compute_mean_and_cov_for_bucket,
+        bool apply_poses = false);
 
     std::vector<Eigen::SparseMatrix<double>> compute_covariance_matrices_and_rms(std::vector<PointCloud>& point_clouds, double& rms);
 

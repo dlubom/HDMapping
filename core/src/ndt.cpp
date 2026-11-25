@@ -1,5 +1,7 @@
 #include <pch/pch.h>
 
+#include <memory>
+
 #include <Core/ndt.h>
 #include <Core/point_clouds.h>
 #include <Core/structures.h>
@@ -2746,44 +2748,32 @@ bool NDT::optimize(
     return true;
 }
 
-bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis_distance, bool compute_mean_and_cov_for_bucket)
+bool NDT::optimize(
+    std::vector<Session>& sessions, bool compute_only_mahalanobis_distance, bool compute_mean_and_cov_for_bucket, bool apply_poses)
 {
     std::cout << "optimize sessions" << std::endl;
 
     auto start = std::chrono::system_clock::now();
 
-    Session tmp_session;
-
-    if (sessions.size() > 1)
+    std::vector<PointCloud> original_ground_truth;
+    const auto restore_scans = [&original_ground_truth](std::vector<PointCloud>* scans)
     {
-        if (sessions[0].is_ground_truth)
-        {
-            tmp_session = sessions[0];
-            PointClouds point_clouds_container;
+        scans->swap(original_ground_truth);
+    };
+    std::unique_ptr<std::vector<PointCloud>, decltype(restore_scans)> ground_truth(nullptr, restore_scans);
 
-            std::vector<PointCloud> point_clouds;
-
-            std::vector<Eigen::Vector3d> points_local;
-
-            for (const auto& pc : sessions[0].point_clouds_container.point_clouds)
-            {
-                for (const auto& p : pc.points_local)
-                {
-                    Eigen::Vector3d pg = pc.m_pose * p;
-                    points_local.push_back(pg);
-                }
-            }
-
-            PointCloud pc;
-            pc.points_local = points_local;
-            pc.m_initial_pose = Eigen::Affine3d::Identity();
-            pc.m_pose = Eigen::Affine3d::Identity();
-
-            point_clouds.push_back(pc);
-            point_clouds_container.point_clouds = point_clouds;
-
-            sessions[0].point_clouds_container = point_clouds_container;
-        }
+    if (sessions.size() > 1 && sessions[0].is_ground_truth)
+    {
+        auto& scans = sessions[0].point_clouds_container.point_clouds;
+        std::vector<PointCloud> merged(1);
+        auto& scan = merged.front();
+        for (const auto& original : scans)
+            for (const auto& point : original.points_local)
+                scan.points_local.push_back(original.m_pose * point);
+        scan.m_initial_pose = scan.m_pose;
+        original_ground_truth.swap(scans);
+        scans.swap(merged);
+        ground_truth.reset(&scans);
     }
 
     OptimizationAlgorithm optimization_algorithm;
@@ -2878,6 +2868,7 @@ bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis
         }
     }
 
+    bool solved = false;
     for (int iter = 0; iter < number_of_iterations; iter++)
     {
         std::cout << "building points_global_external begin" << std::endl;
@@ -3252,25 +3243,12 @@ bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis
         std::cout << "start solving AtPA=AtPB" << std::endl;
         Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA_ndt);
 
-        std::cout << "x = solver.solve(AtPB)" << std::endl;
-        Eigen::SparseMatrix<double> x = solver.solve(AtPB_ndt);
-
-        std::vector<double> h_x;
-        std::cout << "redult: row,col,value" << std::endl;
-        for (int k = 0; k < x.outerSize(); ++k)
+        Eigen::VectorXd h_x;
+        if (solver.info() == Eigen::Success)
+            h_x = solver.solve(Eigen::VectorXd(AtPB_ndt));
+        if (solver.info() == Eigen::Success && h_x.allFinite())
         {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(x, k); it; ++it)
-            {
-                if (it.value() == it.value())
-                {
-                    h_x.push_back(it.value());
-                    std::cout << it.row() << "," << it.col() << "," << it.value() << std::endl;
-                }
-            }
-        }
-
-        if (h_x.size() == num_point_clouds * number_of_unknowns)
-        {
+            solved = true;
             std::cout << "AtPA=AtPB SOLVED" << std::endl;
             int counter = 0;
 
@@ -3405,32 +3383,8 @@ bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis
                     pc.gui_rotation[1] = rad2deg(pose_src.fi);
                     pc.gui_rotation[2] = rad2deg(pose_src.ka);
 
-                    /*
-                    if (is_wc)
-                    {
-                            // if (!s.is_ground_truth)
-                            //{
-                            pc.m_pose = m_pose; // ToDo check if !pc.fixed needed
-                                                                    //}
-                    }
-                    else
-                    {
-                            // if (!s.is_ground_truth)
-                            //{
-                            pc.m_pose = m_pose.inverse(); // ToDo check if !pc.fixed needed
-                                                                                      //}
-                    }
-
-                    if (!pc.fixed)
-                    {
-                            pc.pose = pose_tait_bryan_from_affine_matrix(pc.m_pose);
-                            pc.gui_translation[0] = pc.pose.px;
-                            pc.gui_translation[1] = pc.pose.py;
-                            pc.gui_translation[2] = pc.pose.pz;
-                            pc.gui_rotation[0] = rad2deg(pc.pose.om);
-                            pc.gui_rotation[1] = rad2deg(pc.pose.fi);
-                            pc.gui_rotation[2] = rad2deg(pc.pose.ka);
-                    }*/
+                    if (apply_poses)
+                        pc.m_pose = affine_matrix_from_pose_tait_bryan(pose_src);
                 }
             }
             if (is_levenberg_marguardt)
@@ -3456,35 +3410,32 @@ bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis
 
     //////////
 
-    if (sessions.size() > 1)
+    if (ground_truth)
     {
-        if (sessions[0].is_ground_truth)
+        const Eigen::Affine3d pose_inv0 = ground_truth->front().m_pose.inverse();
+        ground_truth.reset();
+
+        for (int i = 1; i < sessions.size(); i++)
         {
-            Eigen::Affine3d pose_inv0 = sessions[0].point_clouds_container.point_clouds[0].m_pose.inverse();
-
-            sessions[0].point_clouds_container = tmp_session.point_clouds_container;
-
-            for (int i = 1; i < sessions.size(); i++)
+            for (int j = 0; j < sessions[i].point_clouds_container.point_clouds.size(); j++)
             {
-                for (int j = 0; j < sessions[i].point_clouds_container.point_clouds.size(); j++)
-                {
-                    sessions[i].point_clouds_container.point_clouds[j].m_pose =
-                        sessions[i].point_clouds_container.point_clouds[j].m_pose * pose_inv0;
-                    sessions[i].point_clouds_container.point_clouds[j].pose =
-                        pose_tait_bryan_from_affine_matrix(sessions[i].point_clouds_container.point_clouds[j].m_pose);
-                    sessions[i].point_clouds_container.point_clouds[j].gui_translation[0] =
-                        sessions[i].point_clouds_container.point_clouds[j].pose.px;
-                    sessions[i].point_clouds_container.point_clouds[j].gui_translation[1] =
-                        sessions[i].point_clouds_container.point_clouds[j].pose.py;
-                    sessions[i].point_clouds_container.point_clouds[j].gui_translation[2] =
-                        sessions[i].point_clouds_container.point_clouds[j].pose.pz;
-                    sessions[i].point_clouds_container.point_clouds[j].gui_rotation[0] =
-                        rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.om);
-                    sessions[i].point_clouds_container.point_clouds[j].gui_rotation[1] =
-                        rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.fi);
-                    sessions[i].point_clouds_container.point_clouds[j].gui_rotation[2] =
-                        rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.ka);
-                }
+                sessions[i].point_clouds_container.point_clouds[j].m_pose = apply_poses
+                    ? pose_inv0 * sessions[i].point_clouds_container.point_clouds[j].m_pose
+                    : sessions[i].point_clouds_container.point_clouds[j].m_pose * pose_inv0;
+                sessions[i].point_clouds_container.point_clouds[j].pose =
+                    pose_tait_bryan_from_affine_matrix(sessions[i].point_clouds_container.point_clouds[j].m_pose);
+                sessions[i].point_clouds_container.point_clouds[j].gui_translation[0] =
+                    sessions[i].point_clouds_container.point_clouds[j].pose.px;
+                sessions[i].point_clouds_container.point_clouds[j].gui_translation[1] =
+                    sessions[i].point_clouds_container.point_clouds[j].pose.py;
+                sessions[i].point_clouds_container.point_clouds[j].gui_translation[2] =
+                    sessions[i].point_clouds_container.point_clouds[j].pose.pz;
+                sessions[i].point_clouds_container.point_clouds[j].gui_rotation[0] =
+                    rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.om);
+                sessions[i].point_clouds_container.point_clouds[j].gui_rotation[1] =
+                    rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.fi);
+                sessions[i].point_clouds_container.point_clouds[j].gui_rotation[2] =
+                    rad2deg(sessions[i].point_clouds_container.point_clouds[j].pose.ka);
             }
         }
     }
@@ -3495,7 +3446,7 @@ bool NDT::optimize(std::vector<Session>& sessions, bool compute_only_mahalanobis
 
     std::cout << "ndt execution time [ms]: " << elapsed.count() << std::endl;
 
-    return true;
+    return !apply_poses || solved;
 }
 
 std::vector<Eigen::SparseMatrix<double>> NDT::compute_covariance_matrices_and_rms(std::vector<PointCloud>& point_clouds, double& rms)

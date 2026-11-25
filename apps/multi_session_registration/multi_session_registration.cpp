@@ -1,3 +1,4 @@
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -19,7 +20,6 @@
 #include <Core/icp.h>
 #include <Core/ndt.h>
 #include <Core/observation_picking.h>
-#include <Core/pair_wise_iterative_closest_point.h>
 #include <Core/pfd_wrapper.hpp>
 #include <Core/registration_plane_feature.h>
 #include <Core/session.h>
@@ -49,9 +49,8 @@
 #include <HDMapping/Processing/GuiStateBridge.h>
 #include <HDMapping/Processing/GuiStateConnection.h>
 #endif
-#include "multi_session_factor_graph.h"
-#include "project_io.h"
 #include "raylib_utils.h"
+#include "step3_operations.h"
 #include <HDMapping/SessionPaths.h>
 
 std::string winTitle = std::string("Step 3 (Multi session registration) ") + HDMAPPING_CONFIGURE_PROJECT_VERSION;
@@ -161,7 +160,6 @@ int second_session_index = -1;
 double search_radius = 0.3;
 int nr_iter = 100;
 bool loaded_sessions = false;
-bool optimized = false;
 bool gizmo_all_sessions = false;
 //!< Stashed Gizmo update when ImGuizmo::IsUsing(). index is sessionId
 std::map<size_t, std::vector<Eigen::Affine3d>> session_drag_preview_poses;
@@ -224,11 +222,14 @@ bool gui_xy_grid_01x01 = false;
 TaitBryanPose motion_model_weights = { 0.01, 0.01, 0.01, 0.1, 0.1, 0.1 };
 ///////////////////////////////////////////////////////////////////////////////////
 
-#ifdef HDMAPPING_GUI_BRIDGE
 namespace proc = HDMapping::Processing;
+using nlohmann::json;
+
+#ifdef HDMAPPING_GUI_BRIDGE
 namespace
 {
-    using json = nlohmann::json;
+    bool projectJobActive();
+    void submitProjectJob(const proc::OperationRequest& request, bool mutate);
     std::unique_ptr<proc::GuiStateBridge> guiState;
     std::unique_ptr<proc::GuiStateConnection> guiConnection;
     proc::ProjectSessionSources projectSources;
@@ -241,6 +242,64 @@ static void markProjectChanged()
     if (guiState)
         guiState->Changed();
 #endif
+}
+
+static void showProjectError(const std::exception& error);
+
+static bool editProjectFromGui(std::string operation, json scope, json parameters)
+{
+    try
+    {
+        proc::EditStep3({ std::move(operation), {}, std::move(scope), std::move(parameters) }, project_settings, sessions);
+        markProjectChanged();
+        return true;
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+        return false;
+    }
+}
+
+static bool projectWorkAvailable()
+{
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (projectJobActive())
+        return false;
+#endif
+    return loaded_sessions && !sessions.empty() && session_drag_preview_poses.empty();
+}
+
+static void runProjectFromGui(std::string operation, json scope, json parameters)
+{
+    const proc::OperationRequest request{ std::move(operation), {}, std::move(scope), std::move(parameters) };
+#ifdef HDMAPPING_GUI_BRIDGE
+    submitProjectJob(request, true);
+#else
+    try
+    {
+        proc::RunStep3(request, project_settings, sessions, {});
+        markProjectChanged();
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+    }
+#endif
+}
+
+static std::array<double, 6> poseComponents(const TaitBryanPose& pose)
+{
+    return { pose.px, pose.py, pose.pz, pose.om, pose.fi, pose.ka };
+}
+
+static void optimizeProjectFromGui()
+{
+    auto indices = json::array();
+    for (std::size_t i = 0; i < edges.size(); ++i)
+        indices.push_back(i);
+    runProjectFromGui(
+        "optimize_project",
+        { { "edge_indices", std::move(indices) } },
+        { { "motion_model_sigmas", poseComponents(motion_model_weights) }, { "iterations", nr_iter } });
 }
 
 void ndt_gui()
@@ -266,20 +325,28 @@ void ndt_gui()
             ndt.number_of_iterations = 1;
         ImGui::PopItemWidth();
 
+        ImGui::BeginDisabled(!projectWorkAvailable());
         if (ImGui::Button("NDT optimization"))
         {
-            for (auto& s : sessions)
-            {
-                s.is_gizmo = false;
-            }
+            for (auto& session : sessions)
+                session.is_gizmo = false;
+            index_gizmo = old_index_gizmo = -1;
 
-            double rms_initial = 0.0;
-            double rms_final = 0.0;
-            double mui = 0.0;
-
-            ndt.optimize(sessions, false, compute_mean_and_cov_for_bucket);
-            markProjectChanged();
+            auto pairs = json::array();
+            for (std::size_t from = 0; from < sessions.size(); ++from)
+                for (std::size_t to = from + 1; to < sessions.size(); ++to)
+                    pairs.push_back({ { "from", from }, { "to", to } });
+            auto scope = sessions.size() == 1 ? json{ { "session_indices", { 0 } } } : json{ { "session_pairs", std::move(pairs) } };
+            runProjectFromGui(
+                "project.register_sessions",
+                std::move(scope),
+                { { "method", "ndt" },
+                  { "bucket_size_m", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+                  { "threads", ndt.number_of_threads },
+                  { "iterations", ndt.number_of_iterations },
+                  { "compute_mean_and_cov_for_bucket", compute_mean_and_cov_for_bucket } });
         }
+        ImGui::EndDisabled();
         ImGui::End();
     }
 
@@ -482,120 +549,12 @@ void setActiveEdge(const int i)
         setGizmoFromActiveEdge();
 }
 
-// Shared by icp_active_edge() and loop_closure_gui()'s plain "ICP" button: when either
-// endpoint session of the active edge is ground truth, fills source_out/target_out with the
-// other scan's points and the ground-truth scan's points trimmed to that scan's bounding box
-// (so a large ground-truth cloud doesn't drag in unrelated overlapping geometry), and returns
-// true. Returns false if neither/both sessions are ground truth -- caller handles that case.
-bool ground_truth_icp_source_target(std::vector<Eigen::Vector3d>& source_out, std::vector<Eigen::Vector3d>& target_out)
+static void refineProjectEdge(double radius, int iterations, int scans_before = 0, int scans_after = 0)
 {
-    bool is_with_ground_truth = sessions[edges[index_active_edge].index_session_from].is_ground_truth ||
-        sessions[edges[index_active_edge].index_session_to].is_ground_truth;
-
-    if (!is_with_ground_truth)
-        return false;
-
-    int index_session_from = -1;
-    int index_session_to = -1;
-    int index_from = -1;
-    int index_to = -1;
-
-    if (sessions[edges[index_active_edge].index_session_from].is_ground_truth)
-    {
-        index_session_from = edges[index_active_edge].index_session_from;
-        index_session_to = edges[index_active_edge].index_session_to;
-        index_from = edges[index_active_edge].index_from;
-        index_to = edges[index_active_edge].index_to;
-    }
-    else
-    {
-        index_session_from = edges[index_active_edge].index_session_to;
-        index_session_to = edges[index_active_edge].index_session_from;
-        index_from = edges[index_active_edge].index_to;
-        index_to = edges[index_active_edge].index_from;
-    }
-
-    double x_min = 1000000000000.0;
-    double y_min = 1000000000000.0;
-    double z_min = 1000000000000.0;
-    double x_max = -1000000000000.0;
-    double y_max = -1000000000000.0;
-    double z_max = -1000000000000.0;
-
-    auto& points_to = sessions[index_session_to].point_clouds_container.point_clouds[index_to];
-
-    for (const auto& p : points_to.points_local)
-    {
-        auto pg = points_to.m_pose * p;
-        if (pg.x() < x_min)
-            x_min = pg.x();
-        if (pg.y() < y_min)
-            y_min = pg.y();
-        if (pg.z() < z_min)
-            z_min = pg.z();
-
-        if (pg.x() > x_max)
-            x_max = pg.x();
-        if (pg.y() > y_max)
-            y_max = pg.y();
-        if (pg.z() > z_max)
-            z_max = pg.z();
-    }
-    auto& points_from = sessions[index_session_from].point_clouds_container.point_clouds[index_from];
-    std::vector<Eigen::Vector3d> ground_truth;
-    for (const auto& p : points_from.points_local)
-    {
-        auto pg = points_from.m_pose * p;
-        if (pg.x() > x_min && pg.x() < x_max)
-        {
-            if (pg.y() > y_min && pg.y() < y_max)
-            {
-                if (pg.z() > z_min && pg.z() < z_max)
-                    ground_truth.push_back(p);
-            }
-        }
-    }
-
-    // index_session_to/index_to here (not edges[index_active_edge]'s raw fields): those
-    // get swapped above when the *target* (not source) side of the edge is the ground
-    // truth session, and source must track that swap too, or it silently ends up
-    // aligning the ground-truth scan against a filtered copy of itself.
-    source_out = sessions[index_session_to].point_clouds_container.point_clouds[index_to].points_local;
-    target_out = std::move(ground_truth);
-    return true;
-}
-
-// Shared body of the fixed-search-radius ICP buttons in loop_closure_gui(): registers the
-// active edge's two scans, via ground_truth_icp_source_target() when applicable.
-void icp_active_edge(float search_radius, int number_of_iterations = 30)
-{
-    markProjectChanged();
-    std::cout << "Iterative Closest Point" << std::endl;
-    if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
-        sessions[edges[index_active_edge].index_session_to].is_ground_truth)
-    {
-        std::cout << "Two sessions are ground truth!!! ICP is disabled" << std::endl;
-        return;
-    }
-
-    PairWiseICP icp;
-    auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-    std::vector<Eigen::Vector3d> source;
-    std::vector<Eigen::Vector3d> target;
-
-    if (!ground_truth_icp_source_target(source, target))
-    {
-        source = sessions[edges[index_active_edge].index_session_to]
-                     .point_clouds_container.point_clouds[edges[index_active_edge].index_to]
-                     .points_local;
-        target = sessions[edges[index_active_edge].index_session_from]
-                     .point_clouds_container.point_clouds[edges[index_active_edge].index_from]
-                     .points_local;
-    }
-
-    if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-        edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
+    runProjectFromGui(
+        "project.constraints.run_icp",
+        { { "edge_indices", { index_active_edge } } },
+        { { "search_radius_m", radius }, { "iterations", iterations }, { "scans_before", scans_before }, { "scans_after", scans_after } });
 }
 
 void on_loop_closure_gui_open()
@@ -629,16 +588,10 @@ void loop_closure_gui()
         }
         ImGui::Text("Visible sessions %s", ss.str().c_str());
 
+        ImGui::BeginDisabled(!projectWorkAvailable());
         if (ImGui::Button("Optimize GRAPH"))
-        {
-            for (int i = 0; i < 100; i++)
-            {
-                std::cout << "Iteration [" << i + 1 << "] of: " << 100 << std::endl;
-                optimize(sessions, edges, motion_model_weights);
-            }
-            optimized = true;
-            markProjectChanged();
-        }
+            optimizeProjectFromGui();
+        ImGui::EndDisabled();
 
         ImGui::Checkbox("update_rotation_center", &update_rotation_center);
 
@@ -744,9 +697,8 @@ void loop_closure_gui()
             edge.relative_pose_tb_weights.fi = 1000000.0;
             edge.relative_pose_tb_weights.ka = 1000000.0;
 
-            edges.push_back(edge);
-
-            index_active_edge = edges.size() - 1;
+            if (editProjectFromGui("project.constraints.add", json::object(), { { "edge", proc::ProjectEdgesJson({ edge }).at(0) } }))
+                setActiveEdge(static_cast<int>(edges.size()) - 1);
         }
 
         std::string number_active_edges = "number_edges: " + std::to_string(edges.size());
@@ -807,10 +759,9 @@ void loop_closure_gui()
 
         // Deleted after the loop so the list is not modified while it is drawn. The active edge keeps pointing at
         // the same edge; deleting the active edge itself leaves manipulate mode, as "remove active edge" does.
-        if (delete_edge_index != -1)
+        if (delete_edge_index != -1 &&
+            editProjectFromGui("project.constraints.remove", { { "edge_index", delete_edge_index } }, json::object()))
         {
-            edges.erase(edges.begin() + delete_edge_index);
-
             if (delete_edge_index == index_active_edge)
             {
                 edge_gizmo = false;
@@ -873,111 +824,9 @@ void loop_closure_gui()
                     setGizmoFromActiveEdge();
                 if (!edge_gizmo)
                 {
+                    ImGui::BeginDisabled(!projectWorkAvailable());
                     if (ImGui::Button("ICP"))
-                    {
-                        markProjectChanged();
-                        std::cout << "Iterative Closest Point" << std::endl;
-                        if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
-                            sessions[edges[index_active_edge].index_session_to].is_ground_truth)
-                        {
-                            std::cout << "Two sessions are ground truth!!! ICP is disabled" << std::endl;
-                        }
-                        else
-                        {
-                            std::vector<Eigen::Vector3d> source;
-                            std::vector<Eigen::Vector3d> target;
-
-                            if (ground_truth_icp_source_target(source, target))
-                            {
-                                int number_of_iterations = 10;
-                                PairWiseICP icp;
-                                auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-                                if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-                                    edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
-                            }
-                            else
-                            {
-                                int number_of_iterations = 10;
-                                PairWiseICP icp;
-                                auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-                                std::vector<Eigen::Vector3d> source;
-                                auto& e = edges[index_active_edge];
-                                for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-                                {
-                                    int index_src = e.index_to + i;
-                                    if (index_src >= 0 &&
-                                        index_src <
-                                            sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.size())
-                                    {
-                                        Eigen::Affine3d m_src = sessions[edges[index_active_edge].index_session_to]
-                                                                    .point_clouds_container.point_clouds.at(index_src)
-                                                                    .m_pose;
-                                        for (int k = 0; k < sessions[edges[index_active_edge].index_session_to]
-                                                                .point_clouds_container.point_clouds[index_src]
-                                                                .points_local.size();
-                                             k++)
-                                        {
-                                            Eigen::Vector3d p_g = m_src *
-                                                sessions[edges[index_active_edge].index_session_to]
-                                                    .point_clouds_container.point_clouds[index_src]
-                                                    .points_local[k];
-                                            source.push_back(p_g);
-                                        }
-                                        // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-                                    }
-                                }
-                                std::vector<Eigen::Vector3d> target;
-
-                                for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-                                {
-                                    int index_trg = e.index_from + i;
-                                    if (index_trg >= 0 &&
-                                        index_trg < sessions[edges[index_active_edge].index_session_from]
-                                                        .point_clouds_container.point_clouds.size())
-                                    {
-                                        Eigen::Affine3d m_trg = sessions[edges[index_active_edge].index_session_from]
-                                                                    .point_clouds_container.point_clouds.at(index_trg)
-                                                                    .m_pose;
-                                        for (int k = 0; k < sessions[edges[index_active_edge].index_session_from]
-                                                                .point_clouds_container.point_clouds[index_trg]
-                                                                .points_local.size();
-                                             k++)
-                                        {
-                                            Eigen::Vector3d p_g = m_trg *
-                                                sessions[edges[index_active_edge].index_session_from]
-                                                    .point_clouds_container.point_clouds[index_trg]
-                                                    .points_local[k];
-                                            target.push_back(p_g);
-                                        }
-                                        // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-                                    }
-                                }
-
-                                Eigen::Affine3d m_src_inv = sessions[edges[index_active_edge].index_session_to]
-                                                                .point_clouds_container.point_clouds[e.index_to]
-                                                                .m_pose.inverse();
-
-                                for (auto& p : source)
-                                {
-                                    p = m_src_inv * p;
-                                }
-
-                                Eigen::Affine3d m_trg_inv = sessions[edges[index_active_edge].index_session_from]
-                                                                .point_clouds_container.point_clouds[e.index_from]
-                                                                .m_pose.inverse();
-
-                                for (auto& p : target)
-                                {
-                                    p = m_trg_inv * p;
-                                }
-
-                                if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-                                    edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
-                            }
-                        }
-                    }
+                        refineProjectEdge(search_radius, 10, num_edge_extended_before, num_edge_extended_after);
                     ImGui::SameLine();
                     ImGui::InputDouble("search_radius", &search_radius);
                     if (search_radius < 0.01)
@@ -985,20 +834,21 @@ void loop_closure_gui()
 
                     /////////////////////////////////
                     if (ImGui::Button("ICP [search radius 2m]"))
-                        icp_active_edge(2.0f);
+                        refineProjectEdge(2.0, 30);
 
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 1m]"))
-                        icp_active_edge(1.0f);
+                        refineProjectEdge(1.0, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.5m]"))
-                        icp_active_edge(0.5f);
+                        refineProjectEdge(0.5, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.25m]"))
-                        icp_active_edge(0.25f);
+                        refineProjectEdge(0.25, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.1m]"))
-                        icp_active_edge(0.1f);
+                        refineProjectEdge(0.1, 30);
+                    ImGui::EndDisabled();
 #if 0
                     if (ImGui::Button("Save src"))
                     {
@@ -1312,28 +1162,6 @@ void save_trajectories(
     }
 }
 
-bool revert(std::vector<Session>& sessions)
-{
-    markProjectChanged();
-    for (auto& session : sessions)
-    {
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.m_pose = pc.m_pose_temp;
-    }
-    return true;
-}
-
-bool revert_to_initial(std::vector<Session>& sessions)
-{
-    markProjectChanged();
-    for (auto& session : sessions)
-    {
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.m_pose = pc.m_initial_pose;
-    }
-    return true;
-}
-
 static bool isManagedProjectFile(const fs::path& file)
 {
     std::error_code ec;
@@ -1456,11 +1284,18 @@ static void refreshVisibleSessions()
     second_session_index = visible_sessions.empty() ? -1 : *visible_sessions.rbegin();
 }
 
+static void resetProjectEdgeSelection()
+{
+    index_active_edge = edge_list_scrolled_to = -1;
+    manipulate_active_edge = edge_gizmo = false;
+    refreshVisibleSessions();
+    index_loop_closure_source = index_loop_closure_target = 0;
+}
+
 static void resetProjectSelection()
 {
     session_drag_preview_poses.clear();
-    index_active_edge = edge_list_scrolled_to = -1;
-    manipulate_active_edge = edge_gizmo = false;
+    resetProjectEdgeSelection();
     is_loop_closure_gui = false;
     index_gizmo = old_index_gizmo = -1;
     index_gt = -1;
@@ -1471,8 +1306,6 @@ static void resetProjectSelection()
             index_gt = static_cast<int>(i);
     }
     old_index_gt = index_gt;
-    refreshVisibleSessions();
-    index_loop_closure_source = index_loop_closure_target = 0;
 }
 
 static void showProjectError(const std::exception& error)
@@ -1727,151 +1560,6 @@ void loadSessions()
     } catch (const std::exception& error)
     {
         showProjectError(error);
-    }
-}
-
-void generate_loop_closures(const std::vector<Session>& sessions, std::vector<Edge>& edges)
-{
-    markProjectChanged();
-    edges.clear();
-    // Implementation for generating loop closures
-
-    // bool found_edge = false;
-
-    for (int i1 = 0; i1 < sessions.size(); i1++)
-    {
-        for (int j1 = 0; j1 < sessions[i1].point_clouds_container.point_clouds.size(); j1++)
-        {
-            Eigen::Affine3d pose_i = sessions[i1].point_clouds_container.point_clouds[j1].m_pose;
-
-            for (int i2 = i1 + 1; i2 < sessions.size(); i2++)
-            {
-                for (int j2 = 0; j2 < sessions[i2].point_clouds_container.point_clouds.size(); j2++)
-                {
-                    Eigen::Affine3d pose_j = sessions[i2].point_clouds_container.point_clouds[j2].m_pose;
-
-                    if ((pose_i.translation() - pose_j.translation()).norm() < 10.0) // Example threshold for proximity
-                    {
-                        // found_edge = true;
-                        //  Create a loop closure edge between pose_i and pose_j
-                        /*Edge edge;
-                        edge.index_session_from = i1;
-                        edge.index_from = j1;
-                        edge.index_session_to = i2;
-                        edge.index_to = j2;
-
-                            // Initialize other edge parameters as needed
-                            edges.push_back(edge);*/
-
-                        Edge edge;
-
-                        edge.index_session_from = i1;
-                        edge.index_session_to = i2;
-
-                        edge.index_from = j1;
-                        edge.index_to = j2;
-
-                        std::cout << "Found loop closure edge between session " << i1 << " (pose " << j1 << ") and session " << i2
-                                  << " (pose " << j2 << ")" << std::endl;
-
-                        edge.relative_pose_tb = pose_tait_bryan_from_affine_matrix(
-                            sessions[edge.index_session_from].point_clouds_container.point_clouds[edge.index_from].m_pose.inverse() *
-                            sessions[edge.index_session_to].point_clouds_container.point_clouds[edge.index_to].m_pose);
-
-                        edge.relative_pose_tb_weights.px = 1.0;
-                        edge.relative_pose_tb_weights.py = 1.0;
-                        edge.relative_pose_tb_weights.pz = 1.0;
-                        edge.relative_pose_tb_weights.om = 1.0;
-                        edge.relative_pose_tb_weights.fi = 1.0;
-                        edge.relative_pose_tb_weights.ka = 1.0;
-
-                        edges.push_back(edge);
-
-                        // j1 += 20;
-                        // j2 += 20;
-                    }
-                }
-            } // for(int i2 = i1 + 1; i2 < sessions.size(); i2++)
-        } // for(int j1 = 0; j1 < sessions[i1].point_clouds_container.point_clouds.size(); j1++)
-    } // for(int i1 = 0; i1 < sessions.size(); i1++)
-}
-
-void icp_all_edges(std::vector<Session>& sessions, std::vector<Edge>& edges, float sr)
-{
-    markProjectChanged();
-    std::cout << "icp_all_edges" << std::endl;
-
-    int number_of_iterations = 10;
-
-    for (size_t index_active_edge = 0; index_active_edge < edges.size(); index_active_edge++)
-    {
-        PairWiseICP icp;
-        auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-        std::vector<Eigen::Vector3d> source;
-        auto& e = edges[index_active_edge];
-        for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-        {
-            int index_src = e.index_to + i;
-            if (index_src >= 0 &&
-                index_src < sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.size())
-            {
-                Eigen::Affine3d m_src =
-                    sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.at(index_src).m_pose;
-                for (int k = 0; k <
-                     sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[index_src].points_local.size();
-                     k++)
-                {
-                    Eigen::Vector3d p_g = m_src *
-                        sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[index_src].points_local[k];
-                    source.push_back(p_g);
-                }
-                // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-            }
-        }
-        std::vector<Eigen::Vector3d> target;
-
-        for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-        {
-            int index_trg = e.index_from + i;
-            if (index_trg >= 0 &&
-                index_trg < sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.size())
-            {
-                Eigen::Affine3d m_trg =
-                    sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.at(index_trg).m_pose;
-                for (int k = 0; k < sessions[edges[index_active_edge].index_session_from]
-                                        .point_clouds_container.point_clouds[index_trg]
-                                        .points_local.size();
-                     k++)
-                {
-                    Eigen::Vector3d p_g = m_trg *
-                        sessions[edges[index_active_edge].index_session_from]
-                            .point_clouds_container.point_clouds[index_trg]
-                            .points_local[k];
-                    target.push_back(p_g);
-                }
-                // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-            }
-        }
-
-        Eigen::Affine3d m_src_inv =
-            sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[e.index_to].m_pose.inverse();
-
-        for (auto& p : source)
-        {
-            p = m_src_inv * p;
-        }
-
-        Eigen::Affine3d m_trg_inv =
-            sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds[e.index_from].m_pose.inverse();
-
-        for (auto& p : target)
-        {
-            p = m_trg_inv * p;
-        }
-
-        if (icp.compute(source, target, sr, number_of_iterations, m_pose))
-            edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
     }
 }
 
@@ -2301,7 +1989,11 @@ namespace
                   { "scans", sessions[i].point_clouds_container.point_clouds.size() } });
         return { {},
                  projectParameters(),
-                 { { "step", 3 }, { "path", project_file_name }, { "sessions", std::move(children) }, { "edges", edges.size() } } };
+                 { { "step", 3 },
+                   { "path", project_file_name },
+                   { "sessions", std::move(children) },
+                   { "edges", edges.size() },
+                   { "active_edges", proc::ProjectEdgesJson(edges) } } };
     }
 
     proc::MutationResult mutateProject(const proc::OperationRequest& request)
@@ -2317,6 +2009,24 @@ namespace
                     refreshProjectSessions();
                 else
                     index_gt = old_index_gt = request.scope.at("session_index").get<int>();
+                return describeProject();
+            } catch (const std::exception& error)
+            {
+                return proc::OperationError{ "invalid_parameters", error.what(), json::object() };
+            }
+        }
+        if (proc::IsStep3Edit(request.operation))
+        {
+            if (!session_drag_preview_poses.empty() || (edge_gizmo && ImGuizmo::IsUsing()))
+                return proc::OperationError{ "state_busy", "Finish the active pose edit before editing the project", json::object() };
+            try
+            {
+                proc::EditStep3(request, project_settings, sessions);
+                if (request.operation == "project.constraints.remove" || request.operation == "project.constraints.replace" ||
+                    (index_active_edge >= 0 && !canEdgeBeActivated(index_active_edge)))
+                    resetProjectEdgeSelection();
+                else if (index_active_edge >= 0 && manipulate_active_edge)
+                    setActiveEdge(index_active_edge);
                 return describeProject();
             } catch (const std::exception& error)
             {
@@ -2355,72 +2065,122 @@ namespace
         return describeProject();
     }
 
-    json projectSaveJob = json::object();
-    bool projectSavePending = false;
-    std::string projectSaveError;
+    json projectJob = json::object();
+    bool projectJobPending = false;
+    std::string projectJobError;
 
-    void submitProjectSave()
+    bool projectJobActive()
     {
-        static std::uint64_t sequence = 0;
-        const auto target = guiState->Target();
-        projectSaveJob = json::object();
-        projectSaveError.clear();
-        projectSavePending = guiConnection->RequestJob(
-            "jobs.submit",
-            { { "request_key", target.state_id + "-project-save-" + std::to_string(++sequence) },
-              { "operation",
-                { { "operation", "project.save" },
-                  { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
-                  { "scope", json::object() },
-                  { "parameters", json::object() } } },
-              { "capture_source", target.state_id },
-              { "source", "gui" },
-              { "access", "read" } });
-        if (!projectSavePending)
-            projectSaveError = "Could not submit project save";
+        const auto status = projectJob.value("status", std::string{});
+        return projectJobPending || status == "preparing" || status == "queued" || status == "running" || status == "cancelling" ||
+            projectJob.value("gui_apply_status", std::string{}) == "pending";
     }
 
-    void pollProjectSave()
+    void submitProjectJob(const proc::OperationRequest& request, bool mutate)
+    {
+        if (projectJobActive())
+            return;
+        static std::uint64_t sequence = 0;
+        const auto target = guiState->Target();
+        projectJob = json::object();
+        projectJobError.clear();
+        projectJobPending = guiConnection->RequestJob(
+            "jobs.submit",
+            { { "request_key", target.state_id + "-step3-" + std::to_string(++sequence) },
+              { "operation",
+                { { "operation", request.operation },
+                  { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                  { "scope", request.scope },
+                  { "parameters", request.parameters } } },
+              { "capture_source", target.state_id },
+              { "source", "gui" },
+              { "access", mutate ? "mutate" : "read" } });
+        if (!projectJobPending)
+            projectJobError = "Could not submit project job";
+    }
+
+    void pollProjectJob()
     {
         if (auto reply = guiConnection->TakeJobReply())
         {
-            projectSavePending = false;
+            projectJobPending = false;
             if (const auto* error = std::get_if<proc::OperationError>(&*reply))
-            {
-                projectSaveError = error->message;
-                projectSaveJob = json::object();
-            }
+                projectJobError = error->message;
             else
-                projectSaveJob = std::get<json>(std::move(*reply));
+            {
+                projectJobError.clear();
+                projectJob = std::get<json>(std::move(*reply));
+            }
         }
-        const auto status = projectSaveJob.value("status", std::string{});
-        if (!projectSavePending && (status == "preparing" || status == "queued" || status == "running" || status == "cancelling"))
+        if (!projectJobPending && projectJobActive())
         {
             static auto next_poll = std::chrono::steady_clock::now();
             if (std::chrono::steady_clock::now() >= next_poll)
             {
-                projectSavePending = guiConnection->RequestJob("jobs.get", projectSaveJob.at("job_id"));
+                projectJobPending = guiConnection->RequestJob("jobs.get", projectJob.at("job_id"));
                 next_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
             }
         }
     }
 
-    void drawProjectSave()
+    void drawProjectJob()
     {
-        if (projectSaveJob.empty() && !projectSavePending && projectSaveError.empty())
+        if (projectJob.empty() && !projectJobPending && projectJobError.empty())
             return;
-        ImGui::Begin("Complete project save", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-        const auto status = projectSaveJob.value("status", std::string{});
-        ImGui::TextUnformatted(status.empty() ? (projectSavePending ? "Submitting" : projectSaveError.c_str()) : status.c_str());
-        if (projectSaveJob.contains("error"))
-            ImGui::TextWrapped("%s", projectSaveJob.at("error").value("message", "").c_str());
-        if (status == "completed" && projectSaveJob.contains("result"))
+        ImGui::Begin("Step 3 processing", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        const auto status = projectJob.value("status", std::string{});
+        const auto id = projectJob.value("job_id", std::string{});
+        ImGui::TextUnformatted(status.empty() ? (projectJobPending ? "Submitting" : "Failed") : status.c_str());
+        if (!id.empty())
+            ImGui::Text("Job %s", id.c_str());
+        if (projectJob.contains("progress") && projectJob.at("progress").is_object())
         {
-            const auto& snapshot = projectSaveJob.at("result").at("snapshot");
+            const auto& progress = projectJob.at("progress");
+            const auto stage = progress.value("stage", std::string{});
+            if (!stage.empty())
+                ImGui::TextUnformatted(stage.c_str());
+        }
+        const auto apply = projectJob.value("gui_apply_status", std::string{});
+        if (!apply.empty() && apply != "not_requested")
+            ImGui::Text("Workspace update: %s", apply.c_str());
+        if (projectJob.contains("error"))
+            ImGui::TextWrapped("%s", projectJob.at("error").value("message", "").c_str());
+        if (!projectJobError.empty())
+            ImGui::TextWrapped("%s", projectJobError.c_str());
+        if (status == "completed" && projectJob.contains("result"))
+        {
+            const auto& snapshot = projectJob.at("result").at("snapshot");
             const auto path = sessionPathFromText(snapshot.at("manifest_path").get<std::string>()).parent_path() / "project.mjp";
             ImGui::TextWrapped("%s", sessionPathText(path).c_str());
         }
+        if (!projectJobPending && (status == "preparing" || status == "queued" || status == "running") && ImGui::Button("Cancel job"))
+            projectJobPending = guiConnection->RequestJob("jobs.cancel", id);
+        if (!projectJobActive() && ImGui::Button("Dismiss"))
+        {
+            projectJob = json::object();
+            projectJobError.clear();
+        }
         ImGui::End();
+    }
+
+    bool sameProjectSessions(const proc::ProjectState& project)
+    {
+        if (sessions.size() != project.sessions.size())
+            return false;
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+        {
+            const auto& name = sessions[i].session_file_name;
+            const auto source = projectSources.find(name);
+            const auto new_source = project.sources.find(project.sessions[i].session_file_name);
+            if (new_source == project.sources.end() || new_source->second != (source == projectSources.end() ? name : source->second))
+                return false;
+        }
+        return true;
+    }
+
+    std::array<int, 4> projectEdgeEndpoints(const Edge& edge)
+    {
+        return { edge.index_session_from, edge.index_from, edge.index_session_to, edge.index_to };
     }
 
     void connectProject()
@@ -2435,11 +2195,29 @@ namespace
                 if (const auto* error = std::get_if<proc::OperationError>(&restored))
                     return *error;
                 auto& project = std::get<proc::ProjectState>(restored);
+                const bool keep_loop_editor = is_loop_closure_gui && sameProjectSessions(project);
+                const int previous_edge = index_active_edge;
+                std::optional<std::array<int, 4>> previous_endpoints;
+                if (keep_loop_editor && canEdgeBeActivated(previous_edge))
+                    previous_endpoints = projectEdgeEndpoints(edges[previous_edge]);
+                const bool previous_manipulation = manipulate_active_edge;
+                const bool previous_gizmo = edge_gizmo;
                 project_settings = std::move(project.settings);
                 sessions = std::move(project.sessions);
                 projectSources = std::move(project.sources);
                 loaded_sessions = true;
                 refreshProjectSessions();
+                if (keep_loop_editor && (number_visible_sessions == 1 || number_visible_sessions == 2))
+                {
+                    is_loop_closure_gui = true;
+                    if (previous_endpoints && canEdgeBeActivated(previous_edge) &&
+                        *previous_endpoints == projectEdgeEndpoints(edges[previous_edge]))
+                    {
+                        manipulate_active_edge = previous_manipulation;
+                        edge_gizmo = previous_gizmo;
+                        setActiveEdge(previous_edge);
+                    }
+                }
                 updateProjectTitle(sessionPathText(artifact.snapshot.manifest_path.parent_path() / "project.mjp"));
                 return std::nullopt;
             },
@@ -2451,7 +2229,7 @@ namespace
                     return std::make_unique<ProjectCapture>(request.target, empty, json::object(), json::object());
                 }
                 if (!proc::IsProjectOperation(request.operation) || sessions.size() != project_settings.session_file_names.size() ||
-                    !session_drag_preview_poses.empty())
+                    !session_drag_preview_poses.empty() || (edge_gizmo && ImGuizmo::IsUsing()))
                     return {};
                 return std::make_unique<ProjectCapture>(
                     request.target, sessions, ProjectSettingsJson(project_settings), projectParameters(), false, projectSources);
@@ -2474,7 +2252,7 @@ void display()
         guiState->Changed();
     const auto before = guiState->Target();
     guiConnection->Poll();
-    pollProjectSave();
+    pollProjectJob();
     previous = before == guiState->Target() ? current : observed();
 #endif
     syncSessionRenderers(sessions);
@@ -2942,7 +2720,7 @@ void display()
 
     ShowMainDockSpace();
 #ifdef HDMAPPING_GUI_BRIDGE
-    drawProjectSave();
+    drawProjectJob();
     if (guiState->Reserved())
     {
         if (IsFileDropped())
@@ -3246,8 +3024,8 @@ void display()
                 ImGui::SetTooltip("Current project: %s", project_file_name.c_str());
 
 #ifdef HDMAPPING_GUI_BRIDGE
-            if (ImGui::MenuItem("Save complete project", nullptr, nullptr, loaded_sessions && !sessions.empty() && !projectSavePending))
-                submitProjectSave();
+            if (ImGui::MenuItem("Save complete project", nullptr, nullptr, loaded_sessions && !sessions.empty() && !projectJobActive()))
+                submitProjectJob({ "project.save", {}, json::object(), json::object() }, false);
 #endif
             ImGui::Separator();
 
@@ -3814,7 +3592,8 @@ void display()
                 ImGui::EndTooltip();
             }
 
-            // bool prev_is_loop_closure_gui
+            if (ImGui::MenuItem("Optimize GRAPH", nullptr, false, projectWorkAvailable()))
+                optimizeProjectFromGui();
             ImGui::MenuItem(
                 "Manual Loop Closure", "Ctrl+M", &is_loop_closure_gui, (number_visible_sessions == 1 || number_visible_sessions == 2));
             if (ImGui::IsItemHovered())
