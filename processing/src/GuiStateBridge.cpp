@@ -329,7 +329,8 @@ namespace HDMapping::Processing
             return error("invalid_request", "Missing capture job ID");
         }
         auto existing = reservations_.find(job);
-        if (phase == "reserve")
+        const bool external = phase == "reserve_external_session";
+        if (phase == "reserve" || external)
         {
             if (!opened_ || target.state_id != target_.state_id)
             {
@@ -344,6 +345,10 @@ namespace HDMapping::Processing
             {
                 return error("invalid_request", "Unknown reservation access");
             }
+            if (external && (!callbacks_.AllowExternalSessionOpen || access != "mutate"))
+            {
+                return error("invalid_request", "The opening does not support external session imports");
+            }
             if (existing != reservations_.end() || reservations_.size() >= 64 ||
                 std::ranges::any_of(
                     reservations_,
@@ -355,7 +360,7 @@ namespace HDMapping::Processing
                 return error("state_busy", "Conflicting capture reservation");
             }
             std::unique_ptr<CaptureSource> source;
-            if (callbacks_.PinOperationCapture && params.contains("operation"))
+            if (!external && callbacks_.PinOperationCapture && params.contains("operation"))
             {
                 const auto& operation = params.at("operation");
                 if (parse_target(operation.at("target")) != target || !operation.at("scope").is_object() ||
@@ -364,15 +369,16 @@ namespace HDMapping::Processing
                 source = callbacks_.PinOperationCapture(
                     { operation.at("operation").get<std::string>(), target, operation.at("scope"), operation.at("parameters") });
             }
-            else
+            else if (!external)
                 source = callbacks_.PinCapture(target);
-            if (!source || source->Target() != target)
+            if (!external && (!source || source->Target() != target))
             {
                 return error("capture_failed", "The opening could not pin its data");
             }
             auto& reservation = reservations_[job];
             reservation.target = target;
             reservation.mutate = access == "mutate";
+            reservation.transferred.store(external);
             reservation.source = std::move(source);
             return json::object();
         }
@@ -387,7 +393,7 @@ namespace HDMapping::Processing
             reservations_.erase(existing);
             return json::object();
         }
-        if (phase != "write" || reservation.worker.joinable())
+        if (phase != "write" || reservation.worker.joinable() || !reservation.source)
         {
             return error("invalid_request", "Invalid or repeated capture phase");
         }

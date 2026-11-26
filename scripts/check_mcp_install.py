@@ -8,7 +8,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+
+
+PROJECTION_TEST = "--test-case=GNSS CRS projection persists its datum and preserves the WGS84 fix"
 
 
 def run(command, **kwargs):
@@ -74,6 +78,29 @@ def main():
         if digest != "310cdf3581b5dd5becfabd75823606e315b1f049f70e51fa23be05021dc4b107":
             raise RuntimeError(f"Unexpected bundled BoW vocabulary: {vocabulary}")
         print(f"PASS: relocated BoW vocabulary {digest}", flush=True)
+        if sys.platform == "darwin" and args.package_dir:
+            proj_data = relocated.resolve() / "share" / "proj"
+            if not (proj_data / "proj.db").is_file():
+                raise RuntimeError(f"Missing PROJ database in {proj_data}")
+            if args.mcp == "ON":
+                profile = r"""
+(version 1)
+(allow default)
+(deny network*)
+(deny file-read*
+    (require-all
+        (regex #"/proj[.]db($|-)")
+        (require-not (subpath (param "HDMAPPING_PROJ_DATA")))))
+"""
+                environment = {
+                    key: value for key, value in os.environ.items()
+                    if not key.startswith(("PROJ_", "DYLD_"))
+                }
+                probe = executable.with_name("processing_georeference_test")
+                run([
+                    "/usr/bin/sandbox-exec", "-D", f"HDMAPPING_PROJ_DATA={proj_data}",
+                    "-p", profile, probe, PROJECTION_TEST,
+                ], cwd=temporary, env=environment)
         if args.mcp == "ON":
             if not executable.is_file():
                 raise RuntimeError(f"Installed MCP is missing: {executable}")
@@ -96,8 +123,7 @@ def main():
                 georeference = next(test for test in tests if test["name"] == "processing-georeference")
                 probe = executable.with_name("processing_georeference_test.exe")
                 shutil.copy2(georeference["command"][0], probe)
-                run([probe, "--test-case=GNSS CRS projection persists its datum and preserves the WGS84 fix"],
-                    cwd=temporary)
+                run([probe, PROJECTION_TEST], cwd=temporary)
         elif executable.exists() or any(
             next(relocated.rglob(f"*{name}*"), None)
             for name in ("hdmapping_mcp", "hdmapping_coordinator", "hdmapping_worker")

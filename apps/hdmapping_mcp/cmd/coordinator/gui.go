@@ -36,7 +36,11 @@ type captureCommand struct {
 func capture(j jobs.JobRecord, phase, dir string) captureCommand {
 	c := captureCommand{Target: j.Request.Operation.Target, Job: j.ID, Access: j.Request.Access, Phase: phase, Directory: dir}
 	if phase == "reserve" {
-		c.Operation = &j.Request.Operation
+		if j.Request.Operation.Operation == jobs.OpenSession {
+			c.Phase = "reserve_external_session"
+		} else {
+			c.Operation = &j.Request.Operation
+		}
 	}
 	return c
 }
@@ -98,7 +102,7 @@ func (g *guiJobs) submit(ctx context.Context, scheduler *jobs.Scheduler, req job
 	g.wg.Go(func() {
 		if job.ID != "" {
 			var sourceDone <-chan struct{}
-			if reserved.ID != "" {
+			if reserved.ID != "" && req.Operation.Operation != jobs.OpenSession {
 				sourceDone = owner.Done()
 			}
 			terminal, waitErr := scheduler.WaitForSource(context.Background(), job.ID, sourceDone)
@@ -148,8 +152,9 @@ func (g *guiJobs) apply(j jobs.JobRecord) string {
 	return "applied"
 }
 func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotRef, error) {
-	if j.Request.Snapshot != nil || j.Request.Recording != nil ||
-		(jobs.IsExternalOpen(j.Request.Operation.Operation) && j.Request.CaptureSource == "") {
+	operation := j.Request.Operation.Operation
+	if j.Request.Snapshot != nil || j.Request.Recording != nil || operation == jobs.OpenSession ||
+		(operation == jobs.OpenProject && j.Request.CaptureSource == "") {
 		return g.Supervisor.Prepare(ctx, j)
 	}
 	g.mu.Lock()
@@ -161,7 +166,7 @@ func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotR
 	// Use a separate input directory. The worker publishes into a fresh job
 	// directory and its recovery protocol owns that directory exclusively.
 	prefix := "inputs-"
-	if jobs.IsExternalOpen(j.Request.Operation.Operation) || j.Request.Operation.Operation == jobs.AddProjectSession {
+	if operation == jobs.OpenProject || operation == jobs.AddProjectSession {
 		prefix = "opening-"
 	}
 	dir := filepath.Join(g.Directory, prefix+string(j.ID))
@@ -185,7 +190,7 @@ func (g *guiJobs) Prepare(ctx context.Context, j jobs.JobRecord) (jobs.SnapshotR
 	if err != nil || !filepath.IsLocal(rel) {
 		return snapshot, errors.New("GUI capture manifest outside reserved directory")
 	}
-	if jobs.IsExternalOpen(j.Request.Operation.Operation) || j.Request.Operation.Operation == jobs.AddProjectSession {
+	if operation == jobs.OpenProject || operation == jobs.AddProjectSession {
 		defer func() {
 			if err := os.RemoveAll(dir); err != nil {
 				fmt.Fprintln(os.Stderr, err)

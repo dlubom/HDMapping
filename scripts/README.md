@@ -76,7 +76,9 @@ tests, the installed executable and Go bootstrap artifacts; use a fresh build
 directory and configure with `-DHDMAPPING_GO_EXECUTABLE=must-not-run-go` to prove
 OFF does not consult Go. To check an existing package instead of CMake install,
 also pass `--package-dir` and its relative `--package-executable`; the entire
-package is copied and relocated before testing. Temporary copies are removed.
+package is copied and relocated before testing. The macOS checks require the
+bundled PROJ database and the ON variant runs the native CRS test with external
+PROJ databases blocked. Temporary copies are removed.
 
 The existing platform workflows run ON/OFF on MCP branches and keep OFF for
 other builds. ON runs Go quality gates including the process tests and fuzzing

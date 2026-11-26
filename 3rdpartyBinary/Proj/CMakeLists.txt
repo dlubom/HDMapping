@@ -28,6 +28,15 @@ if(UNIX AND NOT WIN32)
         )
     endif()
 
+    if(APPLE)
+        # Resolve Homebrew's package symlink before locating data for the linked PROJ.
+        file(REAL_PATH "${PROJ_DIR}" _proj_config_dir)
+        get_filename_component(_proj_database "${_proj_config_dir}/../../../share/proj/proj.db" ABSOLUTE)
+        file(WRITE "${CMAKE_BINARY_DIR}/hdmapping-proj-database.txt" "${_proj_database}\n")
+        unset(_proj_config_dir)
+        unset(_proj_database)
+    endif()
+
 endif()
 
 # ----------------------------

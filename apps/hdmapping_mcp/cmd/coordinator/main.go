@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,12 +33,18 @@ func run() error {
 	if productVersion == "" {
 		return errors.New("product version missing; build through CMake")
 	}
-	if len(os.Args) != 3 || !filepath.IsAbs(os.Args[2]) {
-		return errors.New("expected serve or supervise with an absolute directory")
+	if len(os.Args) != 3 {
+		return errors.New("expected serve <absolute directory>, supervise <absolute directory>, or set-limit <number>")
 	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
+	}
+	if os.Args[1] == "set-limit" {
+		return setLimit(executable, os.Args[2])
+	}
+	if !filepath.IsAbs(os.Args[2]) {
+		return errors.New("expected serve or supervise with an absolute directory")
 	}
 	worker, err := protocol.Companion(executable, "hdmapping_coordinator", "hdmapping_worker")
 	if err != nil {
@@ -60,6 +67,26 @@ func run() error {
 	default:
 		return fmt.Errorf("unsupported coordinator mode %q", os.Args[1])
 	}
+}
+
+func setLimit(executable, value string) error {
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 || limit > jobs.MaxLimit {
+		return fmt.Errorf("limit must be 1..%d", jobs.MaxLimit)
+	}
+	dir, err := protocol.RuntimeDirectory()
+	if err != nil {
+		return err
+	}
+	client, err := protocol.NewClient(dir, productVersion, executable)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if err := client.Ensure(ctx); err != nil {
+		return err
+	}
+	return client.Call(ctx, "jobs.set_limit", limit, nil)
 }
 
 func serve(ctx context.Context, processes *supervisor.Supervisor) (err error) {
@@ -145,6 +172,12 @@ func dispatch(scheduler *jobs.Scheduler, processes *guiJobs) protocol.Handler {
 				return nil, fmt.Errorf("decode job filter: %w", err)
 			}
 			return scheduler.List(ctx, filter)
+		case "jobs.set_limit":
+			var limit int
+			if err := json.Unmarshal(body, &limit); err != nil {
+				return nil, fmt.Errorf("decode job limit: %w", err)
+			}
+			return nil, scheduler.SetLimit(ctx, limit)
 		default:
 			return processes.handle(ctx, method, body)
 		}

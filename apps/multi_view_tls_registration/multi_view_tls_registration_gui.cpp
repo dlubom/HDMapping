@@ -8867,7 +8867,9 @@ int main(int argc, char* argv[])
               },
               applyStep2Result,
               {},
-              presentLoopCandidates });
+              presentLoopCandidates,
+              {},
+              true });
         state_bridge = &bridge;
         proc::GuiStateConnection connection(bridge, "multi_view_tls_registration_step_2");
         registration_connection = &connection;

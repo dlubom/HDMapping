@@ -272,6 +272,13 @@ if grep -q '^1$' build/hdmapping-mcp-enabled.txt; then
     done
 fi
 cp "build/bin/hdmapping-orb-mur.fbow" "$BUNDLE_DIR/bin/" || exit 1
+if ! IFS= read -r PROJ_DATABASE < build/hdmapping-proj-database.txt || [ ! -f "$PROJ_DATABASE" ]; then
+    echo "Error: the PROJ database selected by CMake is missing. Configure with the complete PROJ package."
+    exit 1
+fi
+# The bundled dylib resolves its database relative to lib/.
+mkdir -p "$BUNDLE_DIR/share/proj"
+cp "$PROJ_DATABASE" "$BUNDLE_DIR/share/proj/proj.db"
 echo "  Total: $BINARY_COUNT executables copied"
 
 echo -e "${YELLOW}Step 3: Detecting and bundling dynamic libraries...${NC}"
@@ -335,9 +342,17 @@ else
     echo "  ⚠ README.txt not copied"
 fi
 
-echo -e "${YELLOW}Step 6: Code signing bundle...${NC}"
-# Ad-hoc signing for local use
-codesign --force --deep --sign - "$BUNDLE_DIR" 2>/dev/null && echo "  ✓ Bundle signed (ad-hoc)" || echo "  ⚠ Signing failed (bundle may still work)"
+echo -e "${YELLOW}Step 6: Verifying and signing bundled Mach-O files...${NC}"
+# install_name_tool can invalidate a Mach-O signature. Repair it after all fixups.
+for binary in "$BUNDLE_DIR/bin/"* "$BUNDLE_DIR/lib/"*.dylib; do
+    if [ -f "$binary" ] && [ ! -L "$binary" ] && file -b "$binary" | grep -q '^Mach-O'; then
+        if ! codesign --verify --strict "$binary" 2>/dev/null; then
+            codesign --force --sign - "$binary"
+            codesign --verify --strict "$binary"
+        fi
+    fi
+done
+echo "  ✓ Bundled Mach-O signatures verified"
 
 echo ""
 echo -e "${GREEN}=====================================${NC}"
@@ -352,6 +367,7 @@ echo "Structure:"
 echo "  $BUNDLE_DIR/"
 echo "    ├── bin/       ($BINARY_COUNT executables)"
 echo "    ├── lib/       ($DYLIB_COUNT libraries)"
+echo "    ├── share/proj/proj.db"
 echo "    └── README.txt"
 echo ""
 echo "To test the bundle:"

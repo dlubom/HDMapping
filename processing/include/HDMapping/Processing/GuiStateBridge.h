@@ -24,6 +24,8 @@ namespace HDMapping::Processing
         std::function<std::optional<OperationError>(const ArtifactManifest&)> PresentLoopCandidates = {};
         //! Read one bounded page from a project at the checked revision.
         std::function<nlohmann::json(const nlohmann::json&)> ListProjectItems = {};
+        //! The window can accept a session opened from external files without a base snapshot.
+        bool AllowExternalSessionOpen = false;
     };
 
     using GuiResponse = std::variant<nlohmann::json, OperationError>;

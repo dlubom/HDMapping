@@ -195,6 +195,7 @@ TEST_CASE("A reserved capture outlives the window and writes its pinned RAM data
     REQUIRE(entered.get_future().wait_for(5s) == std::future_status::ready);
     CHECK(bridge.Preparing());
     CHECK(materializer != owner);
+    CHECK(failure_code(call(bridge, "states.capture", write)) == "invalid_request");
     resume.set_value();
     const auto snapshot = std::get<json>(done.get_future().get());
     CHECK_FALSE(bridge.Preparing());
@@ -203,6 +204,28 @@ TEST_CASE("A reserved capture outlives the window and writes its pinned RAM data
     CHECK_FALSE(bridge.Reserved());
     CHECK_FALSE(ValidateSnapshot({ scratch.root / "snapshot" / "snapshot.json", target }));
     CHECK(snapshot.at("target") == target_to_json(target));
+}
+
+TEST_CASE("Opening external session input reserves an empty Step 2 without a snapshot")
+{
+    GuiStateCallbacks callbacks;
+    callbacks.AllowExternalSessionOpen = true;
+    GuiStateBridge bridge(std::move(callbacks));
+    const auto target = bridge.Target();
+    const auto reserve = capture_params(target, "reserve_external_session");
+    GuiStateBridge unsupported(GuiStateCallbacks{});
+    CHECK(
+        failure_code(call(unsupported, "states.capture", capture_params(unsupported.Target(), "reserve_external_session"))) ==
+        "invalid_request");
+    REQUIRE(std::holds_alternative<json>(call(bridge, "states.capture", reserve)));
+    CHECK(bridge.Reserved());
+    CHECK_FALSE(bridge.Preparing());
+    CHECK(failure_code(call(bridge, "states.capture", reserve)) == "state_busy");
+    CHECK(failure_code(call(bridge, "states.capture", capture_params(target, "write"))) == "invalid_request");
+    bridge.Close();
+    CHECK(std::holds_alternative<json>(call(bridge, "states.capture", capture_params(target, "release"))));
+    CHECK_FALSE(bridge.Reserved());
+    CHECK(failure_code(call(bridge, "states.capture", reserve)) == "state_closed");
 }
 
 TEST_CASE("Only a verified result receipt updates the exact current opening")
