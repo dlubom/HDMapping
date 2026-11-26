@@ -19,7 +19,7 @@ set(HD_CPU_OPTIMIZATION "AUTO" CACHE STRING "CPU optimization target (AUTO, INTE
 set_property(CACHE HD_CPU_OPTIMIZATION PROPERTY STRINGS AUTO INTEL AMD ARM GENERIC)
 
 # Options to enable / disable specific components
-option(BUILD_WITH_MCP "Build the local MCP runtime (in development)" OFF)
+option(BUILD_WITH_MCP "Build the local MCP runtime" ON)
 # Packaging scripts consume a normalized boolean, including -DBUILD_WITH_MCP=1/YES.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/hdmapping-mcp-enabled.txt" CONTENT "$<BOOL:${BUILD_WITH_MCP}>\n")
 option(BUILD_WITH_CLI_TOOLS "Build with command line tools" OFF)

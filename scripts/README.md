@@ -80,8 +80,10 @@ package is copied and relocated before testing. The macOS checks require the
 bundled PROJ database and the ON variant runs the native CRS test with external
 PROJ databases blocked. Temporary copies are removed.
 
-The existing platform workflows run ON/OFF on MCP branches and keep OFF for
-other builds. ON runs Go quality gates including the process tests and fuzzing
+MCP defaults to ON in fresh build directories. The product workflows use this
+default and also build with explicit OFF on MCP branches. Use
+`-DBUILD_WITH_MCP=OFF` for cross-compilation or macOS universal binaries. ON runs
+Go quality gates including the process tests and fuzzing
 of both the journal and IPC frame parsers. On Windows run
 `python scripts/run_mcp_checks.py --build-dir build --checks format lint test fuzz vuln controls`
 from a standalone console after configuring

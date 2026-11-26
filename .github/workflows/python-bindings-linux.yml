@@ -46,7 +46,7 @@ jobs:
           cmake -B ${{github.workspace}}/build_pybind \
             -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
             -DBUILD_WITH_UTILITY_APPLICATION=ON \
-            -DBUILD_WITH_PYBIND=ON
+            -DBUILD_WITH_PYBIND=ON -DBUILD_WITH_MCP=OFF
 
       - name: Build Python bindings
         run: cmake --build ${{github.workspace}}/build_pybind --target pybind_all --config ${{env.BUILD_TYPE}}

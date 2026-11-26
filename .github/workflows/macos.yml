@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["OFF"]') }}
+        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["ON"]') }}
     runs-on: macos-latest
 
     steps:
@@ -47,7 +47,7 @@ jobs:
             -DBUILD_WITH_UTILITY_APPLICATION=ON \
             -DFREEGLUT_COCOA=ON \
             -DHD_CPU_OPTIMIZATION=AUTO \
-            -DBUILD_TESTING=ON -DBUILD_WITH_MCP=${{ matrix.mcp }} ${{ matrix.mcp == 'OFF' && '-DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
+            -DBUILD_TESTING=ON ${{ matrix.mcp == 'OFF' && '-DBUILD_WITH_MCP=OFF -DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
 
       - name: Check MCP quality
         if: matrix.mcp == 'ON'
