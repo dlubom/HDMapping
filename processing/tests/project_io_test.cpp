@@ -288,8 +288,10 @@ TEST_CASE("P16 project export owns its selected exchange files and relocates a c
     CHECK(std::ranges::find(catalog, "project.export", &OperationDescriptor::id) != catalog.end());
     const auto tum = checked(run("tum", selected, { { "format", "trajectory_tum" } }));
     CHECK(tum.dependencies.empty());
+    auto tum_text = bytes(entry(tum));
+    std::erase(tum_text, '\r');
     CHECK(
-        bytes(entry(tum)) ==
+        tum_text ==
         "1.000000000 10.1250000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 1.0000000000\n"
         "2.000000000 10.1250000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 1.0000000000\n");
     const auto csv = checked(run("csv", selected, { { "format", "trajectory_csv" }, { "timestamps", "both" }, { "pose", "quaternion" } }));
