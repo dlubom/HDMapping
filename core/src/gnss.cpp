@@ -2,6 +2,7 @@
 
 #include <Core/gnss.h>
 #include <Core/nmea.h>
+#include <HDMapping/SessionPaths.h>
 
 #include <WGS84toCartesian/WGS84toCartesian.hpp>
 #include <wgs84_do_puwg92/wgs84_do_puwg92.h>
@@ -13,38 +14,50 @@
 #include <cstdlib>
 #include <laszip/laszip_api.h>
 #include <proj.h>
-const std::string Elipsooid = "WGS84Ellipsoid";
 
-// path to find
-const std::vector<std::string> PathCandidate{
-    std::filesystem::current_path().string(),
-    std::filesystem::current_path().string() + "/proj",
-    std::filesystem::current_path().string() + "/share/proj",
-    std::filesystem::current_path().string() + "/data/proj",
-    "/usr/local/share/proj",
-    "/usr/share/proj",
-    "C:/HDMapping",
-};
+#ifdef _WIN32
+#include <windows.h>
+
+namespace
+{
+    std::filesystem::path executableDirectory()
+    {
+        std::array<wchar_t, 32768> path{};
+        const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0 || length >= path.size())
+            return {};
+        return std::filesystem::path(path.data(), path.data() + length).parent_path();
+    }
+} // namespace
+#endif
+
+const std::string Elipsooid = "WGS84Ellipsoid";
 
 std::vector<std::string> GNSS::get_available_geoids()
 {
-    std::set<std::string> unique;
-    unique.insert(Elipsooid);
-
-    // Respect HD_MAPPING_PROJ environment variable if set. It can point to a directory
-    // containing geoid grid files (*.gtx). If present, search it first.
-    std::vector<std::string> paths = PathCandidate;
-    const char* env_proj = std::getenv("HD_MAPPING_ASSETS");
-    if (env_proj && std::string(env_proj).size() > 0)
+    namespace fs = std::filesystem;
+    std::set<std::string> unique{ Elipsooid };
+    const auto current = fs::current_path();
+    std::vector<fs::path> paths{
+        current,           current / "proj", current / "share" / "proj", current / "data" / "proj", "/usr/local/share/proj",
+        "/usr/share/proj", "C:/HDMapping",
+    };
+#ifdef _WIN32
+    if (const auto directory = executableDirectory(); !directory.empty())
+        paths.push_back(directory);
+    const auto* env_proj = _wgetenv(L"HD_MAPPING_ASSETS");
+#else
+    const auto* env_proj = std::getenv("HD_MAPPING_ASSETS");
+#endif
+    if (env_proj && env_proj[0] != 0)
     {
-        // insert at front so user-specified path is searched first
-        paths.insert(paths.begin(), std::string(env_proj));
-        std::cout << "HD_MAPPING_ASSETS set: " << env_proj << std::endl;
+        const fs::path directory(env_proj);
+        paths.insert(paths.begin(), directory);
+        std::cout << "HD_MAPPING_ASSETS set: " << sessionPathText(directory) << std::endl;
     }
 
-    for (const auto& path : paths)
+    for (const auto& proj_path : paths)
     {
-        std::filesystem::path proj_path(path);
         std::error_code ec;
         if (std::filesystem::exists(proj_path, ec) && !ec)
         {
@@ -63,11 +76,11 @@ std::vector<std::string> GNSS::get_available_geoids()
                 }
                 const auto& entry = *dir_it;
                 if (entry.is_regular_file(ec) && !ec && entry.path().extension() == ".gtx")
-                    if (entry.is_regular_file() && entry.path().extension() == ".gtx")
-                    {
-                        std::cout << "found geoid model: " << entry.path().string() << std::endl;
-                        unique.insert(entry.path().string());
-                    }
+                {
+                    auto filename = sessionPathText(entry.path());
+                    std::cout << "found geoid model: " << filename << std::endl;
+                    unique.insert(std::move(filename));
+                }
             }
         }
     }
@@ -77,21 +90,31 @@ std::vector<std::string> GNSS::get_available_geoids()
 
 #include <spdlog/spdlog.h>
 
-inline void split(std::string& str, char delim, std::vector<std::string>& out)
+namespace
 {
-    size_t start;
-    size_t end = 0;
-
-    while ((start = str.find_first_not_of(delim, end)) != std::string::npos)
+    bool readGnssFix(const std::string& line, GNSS::GlobalPose& fix)
     {
-        end = str.find(delim, start);
-        out.push_back(str.substr(start, end - start));
+        std::istringstream fields(line);
+        std::string age;
+        std::string time;
+        if (!(fields >> fix.timestamp >> fix.lat >> fix.lon >> fix.alt >> fix.hdop >> fix.satelites_tracked >> fix.undulation >> age >>
+              time >> fix.fix_quality))
+            return false;
+        // Receiver files may carry an unavailable age and a wall-clock HH:MM:SS.
+        if (age != "nan")
+            std::istringstream(age) >> fix.age;
+        std::istringstream(time) >> fix.time;
+        fix.h_wgs84 = fix.alt + fix.undulation;
+        return std::isfinite(fix.timestamp) && std::isfinite(fix.h_wgs84) && std::abs(fix.lat) <= 90.0 && std::abs(fix.lon) <= 180.0;
     }
-}
+} // namespace
 
 bool GNSS::load_data_from_gnss_and_convert_to_92(
     const std::vector<std::string>& input_file_names, Eigen::Vector3d& out_offset, bool localize)
 {
+    projected_crs.clear();
+    projected_vertical_datum.clear();
+
     // 54651848940 5156.43798828125 2009.1610107421875 122.1999969482421875 1.25 8 35.799999237060546875 nan 14:51:42 1
     // timestamp lat lon alt hdop satelites_tracked height age time fix_quality
 
@@ -109,46 +132,24 @@ bool GNSS::load_data_from_gnss_and_convert_to_92(
 
     for (const auto& fn : input_file_names)
     {
-        std::ifstream infile(fn);
+        std::ifstream infile(sessionPathFromText(fn));
         if (!infile.good())
         {
             std::cout << "problem with file: '" << fn << "'" << std::endl;
             return false;
         }
-        std::string s;
-
-        while (!infile.eof())
+        std::string line;
+        while (std::getline(infile, line))
         {
-            getline(infile, s);
-            std::vector<std::string> strs;
-            split(s, ' ', strs);
-
-            if (strs.size() >= 10)
-            {
-                GlobalPose gp;
-                std::istringstream(strs[0]) >> gp.timestamp;
-                std::istringstream(strs[1]) >> gp.lat;
-                std::istringstream(strs[2]) >> gp.lon;
-                std::istringstream(strs[3]) >> gp.alt;
-                std::istringstream(strs[4]) >> gp.hdop;
-                std::istringstream(strs[5]) >> gp.satelites_tracked;
-                std::istringstream(strs[6]) >> gp.height;
-                std::istringstream(strs[7]) >> gp.age;
-                std::istringstream(strs[8]) >> gp.time;
-                std::istringstream(strs[9]) >> gp.fix_quality;
-
-                double L = gp.lon;
-                double B = gp.lat;
-
-                wgs84_do_puwg92(B, L, &gp.enu_y, &gp.enu_x);
-                gp.enu_z = gp.alt;
-                if (Eigen::Vector3d(gp.enu_y, gp.enu_x, gp.alt).norm() > 0)
-                {
-                    gnss_poses.push_back(gp);
-                }
-            }
+            GlobalPose fix{};
+            if (!readGnssFix(line, fix))
+                continue;
+            fix.height = fix.undulation;
+            wgs84_do_puwg92(fix.lat, fix.lon, &fix.enu_y, &fix.enu_x);
+            fix.enu_z = fix.alt;
+            if (Eigen::Vector3d(fix.enu_y, fix.enu_x, fix.alt).norm() > 0)
+                gnss_poses.push_back(fix);
         }
-
         infile.close();
     }
 
@@ -217,39 +218,18 @@ bool GNSS::load_raw_data_from_gnss(const std::vector<std::string>& input_file_na
 
     for (const auto& fn : input_file_names)
     {
-        std::ifstream infile(fn);
+        std::ifstream infile(sessionPathFromText(fn));
         if (!infile.good())
         {
             std::cout << "problem with file: '" << fn << "'" << std::endl;
             return false;
         }
-        std::string s;
-        while (!infile.eof())
+        std::string line;
+        while (std::getline(infile, line))
         {
-            getline(infile, s);
-            std::vector<std::string> strs;
-            split(s, ' ', strs);
-
-            if (strs.size() >= 10)
-            {
-                GlobalPose gp;
-                std::istringstream(strs[0]) >> gp.timestamp;
-                std::istringstream(strs[1]) >> gp.lat;
-                std::istringstream(strs[2]) >> gp.lon;
-                std::istringstream(strs[3]) >> gp.alt;
-                std::istringstream(strs[4]) >> gp.hdop;
-                std::istringstream(strs[5]) >> gp.satelites_tracked;
-                std::istringstream(strs[6]) >> gp.undulation;
-                std::istringstream(strs[7]) >> gp.age;
-                std::istringstream(strs[8]) >> gp.time;
-                std::istringstream(strs[9]) >> gp.fix_quality;
-                if (std::isfinite(gp.lat) && std::isfinite(gp.lon) && std::isfinite(gp.alt) && gp.lat != 0.0 && gp.lon != 0.0 &&
-                    std::isfinite(gp.undulation))
-                {
-                    gp.h_wgs84 = gp.alt + gp.undulation;
-                    gnss_poses.push_back(gp);
-                }
-            }
+            GlobalPose fix{};
+            if (readGnssFix(line, fix) && fix.lat != 0.0 && fix.lon != 0.0)
+                gnss_poses.push_back(fix);
         }
         infile.close();
     }
@@ -266,6 +246,9 @@ bool GNSS::load_raw_data_from_gnss(const std::vector<std::string>& input_file_na
 
 bool GNSS::project_to_mercator_projection()
 {
+    projected_crs.clear();
+    projected_vertical_datum.clear();
+
     std::array<double, 2> WGS84Reference{ 0, 0 };
 
     if (gnss_poses.size() > 0)
@@ -302,6 +285,9 @@ double get_ellipsoid_height(const GNSS::GlobalPose& pose)
 
 bool GNSS::project_using_proj()
 {
+    projected_crs.clear();
+    projected_vertical_datum.clear();
+
     if (gnss_poses.empty())
         return false;
 
@@ -453,7 +439,7 @@ bool GNSS::load_raw_data_from_nmea(const std::vector<std::string>& input_file_na
     std::optional<hd_mapping::nmea::GNRMCData> lastRMCData;
     for (const auto& fn : input_file_names)
     {
-        std::ifstream infile(fn);
+        std::ifstream infile(sessionPathFromText(fn));
         if (!infile.good())
         {
             std::cout << "problem with file: '" << fn << "'" << std::endl;
@@ -484,7 +470,7 @@ bool GNSS::load_raw_data_from_nmea(const std::vector<std::string>& input_file_na
             }
             if (gga.has_value())
             {
-                GlobalPose gp;
+                GlobalPose gp{};
                 gp.timestamp = timestampLidar;
                 gp.lat = gga->latitude;
                 gp.lon = gga->longitude;
@@ -496,10 +482,9 @@ bool GNSS::load_raw_data_from_nmea(const std::vector<std::string>& input_file_na
                 gp.fix_quality = gga->fix_quality;
                 gp.undulation = gga->undulation;
 
-                // register if there  is not nans
-                if (gp.lat == gp.lat && gp.lon == gp.lon && gp.alt == gp.alt && gp.undulation == gp.undulation)
+                gp.h_wgs84 = gp.alt + gp.undulation;
+                if (std::isfinite(gp.timestamp) && std::isfinite(gp.h_wgs84) && std::abs(gp.lat) <= 90.0 && std::abs(gp.lon) <= 180.0)
                 {
-                    gp.h_wgs84 = gp.alt + gp.undulation;
                     gnss_poses.push_back(gp);
                 }
             }
@@ -526,7 +511,13 @@ std::vector<Eigen::Vector3d> GNSS::CRTConvert(
     std::vector<Eigen::Vector3d> result;
     result.reserve(llaPointcloud.size());
 
-    if (llaPointcloud.empty())
+    if (llaPointcloud.empty() ||
+        !std::ranges::all_of(
+            llaPointcloud,
+            [](const auto& p)
+            {
+                return p.allFinite() && std::abs(p.x()) <= 90 && std::abs(p.y()) <= 180;
+            }))
         return result;
     if (!CRTs::SupportedCRTs.contains(targetCRT))
     {
@@ -549,7 +540,7 @@ std::vector<Eigen::Vector3d> GNSS::CRTConvert(
         double lat = llaPointcloud[0].x();
         double lon = llaPointcloud[0].y();
 
-        int zone = int(std::floor((lon + 180.0) / 6.0)) + 1;
+        const int zone = std::min(60, static_cast<int>(std::floor((lon + 180.0) / 6.0)) + 1);
         bool north = (lat >= 0.0);
 
         target = "+proj=utm +zone=" + std::to_string(zone) + (north ? " +north " : " +south ") + "+datum=WGS84 +units=m +no_defs";
@@ -558,15 +549,29 @@ std::vector<Eigen::Vector3d> GNSS::CRTConvert(
     std::cout << "target CRT " << target << std::endl;
 
     PJ_CONTEXT* ctx = proj_context_create();
+#ifdef _WIN32
+    // deploy_mandeye uses a flat directory. The worker's current directory
+    // is its private job directory, so use the database next to the binary.
+    if (const auto directory = executableDirectory(); !directory.empty() && !std::getenv("PROJ_DATA") && !std::getenv("PROJ_LIB"))
+    {
+        const auto database = directory / "proj.db";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(database, ec))
+        {
+            const auto location = sessionPathText(database);
+            proj_context_set_database_path(ctx, location.c_str(), nullptr, nullptr);
+        }
+    }
+#endif
     PJ* P_geoid = nullptr;
 
     if (!(geoid.empty() || geoid == Elipsooid))
     {
         std::string pipeline = "+proj=pipeline "
                                "+step +proj=unitconvert +xy_in=deg +xy_out=rad "
-                               "+step +proj=vgridshift +grids=" +
+                               "+step +proj=vgridshift +grids=\"" +
             geoid +
-            " "
+            "\" "
             "+step +proj=unitconvert +xy_in=rad +xy_out=deg";
 
         P_geoid = proj_create(ctx, pipeline.c_str());
@@ -597,11 +602,15 @@ std::vector<Eigen::Vector3d> GNSS::CRTConvert(
         return result;
     }
 
-    P_crs = proj_normalize_for_visualization(ctx, P_crs);
+    PJ* visible_crs = proj_normalize_for_visualization(ctx, P_crs);
+    proj_destroy(P_crs);
+    P_crs = visible_crs;
     if (!P_crs)
     {
         std::cerr << "Failed to normalize CRS transformation for visualization\n";
-        proj_destroy(P_crs);
+        if (P_geoid)
+            proj_destroy(P_geoid);
+        proj_context_destroy(ctx);
         return {};
     }
 

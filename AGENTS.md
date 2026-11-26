@@ -142,8 +142,13 @@ download them outside the source tree.
 
 ## Docs and comments
 
-- No design docs or agent notes in the source tree. Lasting guidance for agents belongs in this file, trimmed by a
-  human.
+- Fork-owner exception: `plans/mcp/` is versioned on MCP development branches of `dlubom/HDMapping`, at the owner's
+  explicit request. It holds the agreed plan, task status, evidence summaries and handoff prompts. For MCP work,
+  read `plans/mcp/README.md` and execute only the card named in the current user prompt, one card per chat.
+  For MCP qualification, implementation and review, also read `plans/mcp/quality.md` and apply its stage-specific gates.
+  This exception does not change the rules for other agent notes or authorize an upstream delivery.
+- Apart from the fork-only MCP exception above, no design docs or agent notes go in the source tree. Lasting guidance
+  for agents belongs in this file, trimmed by a human.
 - Per-user agent notes (plans, analyses, implementation notes for your own PR or commit) go in `agents/`. Git ignores
   everything there except its `.gitignore`. Code, commit messages, PR descriptions and tracked docs must not refer to
   files in `agents/`; they exist only on one machine.

@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <pch/pch.h>
+#include <stop_token>
 #include <vector>
 
 #include <ankerl/unordered_dense.h>
@@ -50,6 +51,19 @@ inline std::string get_software_version()
 struct RawCloudLoader; // raw_cloud_loader.h: raw point clouds loaded per file during step 1
 class RunReport;
 class PointsGlobalSpill; // points_global_spill.h: step 2's map buffer kept in a file
+
+//! Optional cancellation and progress for a managed Step 1 operation.
+struct OdometryControl
+{
+    std::stop_token stop;
+    std::function<void(const char*, size_t, size_t)> progress;
+
+    void report(const char* stage, size_t current, size_t total) const
+    {
+        if (progress)
+            progress(stage, current, total);
+    }
+};
 
 struct LidarOdometryParams
 {
@@ -345,7 +359,8 @@ void update_rgd_spherical_coordinates(
 //! @param imu_file - path to file with IMU data
 //! @param imuToUse - id number of IMU to use, the same index as in pointcloud return by @ref load_point_cloud
 //! @return vector of tuples (std::pair<timestamp, timestampUnix>, angular_velocity, linear_acceleration)
-std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector3f>> load_imu(const std::string& imu_file, int imuToUse);
+std::vector<std::tuple<std::pair<double, double>, Eigen::Vector3f, Eigen::Vector3f>> load_imu(
+    const std::string& imu_file, int imuToUse, bool validate = false, std::stop_token stop = {});
 
 //! This function load point cloud from LAS/LAZ file.
 //! Optionally it can apply extrinsic calibration to each point.
@@ -364,7 +379,9 @@ std::vector<Point3Di> load_point_cloud(
     double filter_threshold_xy_inner,
     double filter_threshold_xy_outer,
     const std::unordered_map<int, Eigen::Affine3d>& calibrations,
-    std::vector<uint16_t>* rings = nullptr);
+    std::vector<uint16_t>* rings = nullptr,
+    bool validate = false,
+    std::stop_token stop = {});
 
 //! A stretch of time without LiDAR points, in seconds.
 struct LidarGap
@@ -381,7 +398,7 @@ std::vector<LidarGap> find_lidar_gaps(const std::vector<Point3Di>& points, doubl
 
 bool save_poses(const std::string& file_name, const std::vector<Eigen::Affine3d>& m_poses, const std::vector<std::string>& filenames);
 
-fs::path get_next_result_path(const std::string& working_directory);
+fs::path get_next_result_path(const fs::path& working_directory);
 
 // this function performs main LiDAR odometry calculations
 void optimize_lidar_odometry(
@@ -499,7 +516,8 @@ bool process_worker_step_lidar_odometry_core(
     std::vector<Point3Di>& intermediate_points,
     int& iter_end,
     double& delta,
-    double& lm_factor);
+    double& lm_factor,
+    std::stop_token stop = {});
 
 bool process_worker_step_update_rgd_after(
     double& acc_distance,
@@ -517,7 +535,8 @@ bool compute_step_2(
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
     bool debugMsg,
-    std::atomic<bool>& parked);
+    std::atomic<bool>& parked,
+    const OdometryControl& control = {});
 
 // for reconstructing worker data from step 1 output
 bool loadLaz(
@@ -592,7 +611,7 @@ namespace MLvxCalib
     //! Parse the calibration file and return a map from serial number to calibration.
     //! @param filename calibration file
     //! @return map of extrinsic calibration, where key is serial number of the lidar.
-    std::unordered_map<std::string, Eigen::Affine3d> GetCalibrationFromFile(const std::string& filename);
+    std::unordered_map<std::string, Eigen::Affine3d> GetCalibrationFromFile(const std::string& filename, bool validate = false);
 
     //! Parse the calibration file and return a serial number of the Livox to use for IMU.
     //! @param filename calibration file
@@ -613,5 +632,5 @@ namespace MLvxCalib
     int GetImuIdToUse(const std::unordered_map<int, std::string>& idToSn, const std::string& snToUse);
 } // namespace MLvxCalib
 
-void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params);
-void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params);
+void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params, std::stop_token stop = {});
+void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params, std::stop_token stop = {});

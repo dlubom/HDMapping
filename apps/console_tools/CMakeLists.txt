@@ -216,9 +216,8 @@ add_executable(
   ${REPOSITORY_DIRECTORY}/apps/multi_view_tls_registration/bow_loop_closure_detector.cpp
 )
 
-target_compile_definitions(bow_loop_closure_detect PRIVATE
-    WITH_GUI=0
-    -DFBOW_VOCABULARY_PATH="${THIRDPARTY_DIRECTORY}/fbow/vocabularies/orb_mur.fbow")
+target_compile_definitions(bow_loop_closure_detect PRIVATE WITH_GUI=0)
+add_dependencies(bow_loop_closure_detect hdmapping_bow_vocabulary)
 
 target_include_directories(
   bow_loop_closure_detect PRIVATE

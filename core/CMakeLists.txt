@@ -11,6 +11,7 @@ set(CORE_BASE_SOURCES
     src/nmea.cpp
     src/point_cloud.cpp
     src/point_clouds.cpp
+    src/reference_tracks.cpp
     src/session.cpp
     src/tum.cpp
    # # src/utils.cpp # TODO(mwlasiuk) : broken AF ...
@@ -30,11 +31,27 @@ set(CORE_MATH_SOURCES
     src/pair_wise_iterative_closest_point.cpp
     src/pose_graph_loop_closure.cpp
     src/pose_graph_slam.cpp
+    src/reference_alignment.cpp
+
     src/registration_plane_feature.cpp
     src/point_cloud_evaluation.cpp
 )
 
 add_library(core_math STATIC ${CORE_MATH_SOURCES})
+if(BUILD_WITH_MCP AND NOT HDMAPPING_PROCESSING_SANITIZER STREQUAL "none")
+    # Exercise the Step 3 numerical kernels, including their worker threads.
+    # processing executables already link the matching sanitizer runtime.
+    if(HDMAPPING_PROCESSING_SANITIZER STREQUAL "thread")
+        set(_step3_math_sanitizer thread)
+    elseif(HDMAPPING_PROCESSING_SANITIZER STREQUAL "address-undefined")
+        set(_step3_math_sanitizer address,undefined)
+    endif()
+    if(_step3_math_sanitizer)
+        set_source_files_properties(src/ndt.cpp src/pair_wise_iterative_closest_point.cpp PROPERTIES
+            COMPILE_OPTIONS "-fsanitize=${_step3_math_sanitizer};-fno-sanitize-recover=all;-fno-omit-frame-pointer")
+        target_link_options(core_math INTERFACE "-fsanitize=${_step3_math_sanitizer}")
+    endif()
+endif()
 target_compile_definitions(core_math PRIVATE WITH_GUI=0)
 target_link_libraries(core_math PRIVATE PROJ::proj spdlog::spdlog vqf Fusion wgs84_do_puwg92 plycpp WGS84toCartesian ${PLATFORM_MISCELLANEOUS_LIBS})
 target_include_directories(core_math PRIVATE
@@ -117,8 +134,8 @@ function(add_core_target target_name with_gui)
     endif()
 endfunction()
 
-# core_no_gui is used by python bindings, lidar odometry test subprojects and session_to_mcap (console tools) only - if they are not build just do not waste time building core_no_gui
-if(BUILD_TESTING OR BUILD_WITH_PYBIND OR BUILD_WITH_CLI_TOOLS)
+# Headless core is shared by the worker, bindings, tests and console tools.
+if(BUILD_TESTING OR BUILD_WITH_PYBIND OR BUILD_WITH_CLI_TOOLS OR BUILD_WITH_MCP)
     add_core_target(core_no_gui FALSE)
 
     target_precompile_headers(core_no_gui

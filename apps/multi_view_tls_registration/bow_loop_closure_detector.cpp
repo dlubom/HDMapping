@@ -1,10 +1,16 @@
 #include "bow_loop_closure_detector.h"
 
+#include <HDMapping/ExecutablePath.h>
+#include <HDMapping/SessionPaths.h>
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -31,7 +37,7 @@ namespace bow_loop_closure
         {
             if (path.extension() != ".jpg")
                 return false;
-            std::string stem = path.stem().string();
+            std::string stem = sessionPathText(path.stem());
             if (const auto us = stem.rfind('_'); us != std::string::npos)
                 stem = stem.substr(us + 1);
             if (stem.empty() || stem.find_first_not_of("0123456789") != std::string::npos)
@@ -95,7 +101,13 @@ namespace bow_loop_closure
         // params.max_image_size_px; empty if it can't be read.
         cv::Mat readImage(const std::string& image_path, int flags, const DetectorParams& params)
         {
+#ifdef _WIN32
+            std::ifstream input(sessionPathFromText(image_path), std::ios::binary);
+            const std::vector<unsigned char> bytes(std::istreambuf_iterator<char>(input), {});
+            cv::Mat image = bytes.empty() ? cv::Mat{} : cv::imdecode(bytes, flags);
+#else
             cv::Mat image = cv::imread(image_path, flags);
+#endif
             const int longer_side = std::max(image.cols, image.rows);
             if (!image.empty() && params.max_image_size_px > 0 && longer_side > params.max_image_size_px)
             {
@@ -193,19 +205,19 @@ namespace bow_loop_closure
         for (size_t camera = 0; camera < camera_dirs.size(); camera++)
         {
             const std::string& dir = camera_dirs[camera];
-            if (dir.empty() || !fs::is_directory(dir))
+            if (dir.empty() || !fs::is_directory(sessionPathFromText(dir)))
             {
                 spdlog::warn("bow_loop_closure: camera directory not found: '{}'", dir);
                 continue;
             }
 
             size_t loaded = 0;
-            for (const auto& entry : fs::directory_iterator(dir))
+            for (const auto& entry : fs::directory_iterator(sessionPathFromText(dir)))
             {
                 int64_t ts_ns = 0;
                 if (!entry.is_regular_file() || !parseFrameTimestamp(entry.path(), ts_ns))
                     continue;
-                frames.push_back(CameraFrame{ ts_ns, entry.path().string(), static_cast<int>(camera) });
+                frames.push_back(CameraFrame{ ts_ns, sessionPathText(entry.path()), static_cast<int>(camera) });
                 loaded++;
             }
             spdlog::info("bow_loop_closure: loaded {} camera frames from '{}'", loaded, dir);
@@ -216,7 +228,7 @@ namespace bow_loop_closure
             frames.end(),
             [](const CameraFrame& a, const CameraFrame& b)
             {
-                return a.camera != b.camera ? a.camera < b.camera : a.timestamp_ns < b.timestamp_ns;
+                return std::tie(a.camera, a.timestamp_ns, a.file_path) < std::tie(b.camera, b.timestamp_ns, b.file_path);
             });
         return frames;
     }
@@ -239,7 +251,8 @@ namespace bow_loop_closure
         int matched = 0;
         for (size_t i = 0; i < chunks.size(); i++)
         {
-            if (chunks[i].timestamps.empty())
+            if (chunks[i].timestamps.empty() || !std::isfinite(chunks[i].timestamps[0]) || chunks[i].timestamps[0] < 0 ||
+                chunks[i].timestamps[0] >= 0x1p63)
                 continue;
             int64_t chunk_ts_ns = static_cast<int64_t>(chunks[i].timestamps[0]);
             for (const auto& [begin, end] : camera_ranges)
@@ -257,23 +270,19 @@ namespace bow_loop_closure
         return chunk_frames;
     }
 
-    std::string defaultVocabularyPath()
+    fs::path defaultVocabularyPath()
     {
-#ifdef FBOW_VOCABULARY_PATH
-        return FBOW_VOCABULARY_PATH;
-#else
-        return "";
-#endif
+        return HDMapping::executablePath().parent_path() / "hdmapping-orb-mur.fbow";
     }
 
-    fbow::Vocabulary loadVocabulary(const std::string& vocabulary_path)
+    fbow::Vocabulary loadVocabulary(const fs::path& vocabulary_path)
     {
         fbow::Vocabulary vocabulary;
-        if (vocabulary_path.empty() || !fs::exists(vocabulary_path))
-            throw std::runtime_error("bow_loop_closure: vocabulary file not found: '" + vocabulary_path + "'");
-        vocabulary.readFromFile(vocabulary_path);
-        if (!vocabulary.isValid())
-            throw std::runtime_error("bow_loop_closure: failed to load vocabulary from '" + vocabulary_path + "'");
+        std::ifstream input(vocabulary_path, std::ios::binary);
+        if (!input)
+            throw std::runtime_error("bow_loop_closure: vocabulary file not found: '" + sessionPathText(vocabulary_path) + "'");
+        input.exceptions(std::ios::badbit | std::ios::failbit);
+        vocabulary.fromStream(input);
         return vocabulary;
     }
 
@@ -282,7 +291,8 @@ namespace bow_loop_closure
         const std::vector<CameraFrame>& frames,
         const std::vector<std::vector<int>>& chunk_frames,
         const DetectorParams& params,
-        fbow::Vocabulary& vocabulary)
+        fbow::Vocabulary& vocabulary,
+        std::stop_token stop)
     {
         std::vector<Candidate> candidates;
         const auto& chunks = point_clouds_container.point_clouds;
@@ -310,6 +320,8 @@ namespace bow_loop_closure
         cv::Ptr<cv::ORB> orb = cv::ORB::create(params.orb_features);
         for (const auto& frame_list : chunk_frames)
         {
+            if (stop.stop_requested())
+                return {};
             for (const int f : frame_list)
             {
                 if (f < 0 || f >= static_cast<int>(m) || has_bow[f])
@@ -335,6 +347,8 @@ namespace bow_loop_closure
                 continue;
             for (size_t j = i + 1; j < n; j++)
             {
+                if (stop.stop_requested())
+                    return {};
                 if (!has_any_bow(j))
                     continue;
 

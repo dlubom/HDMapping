@@ -8,6 +8,8 @@
 #include <array>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +21,8 @@ namespace fs = std::filesystem;
 class LazWriter
 {
 public:
+    static constexpr double coordinate_scale = 0.0001;
+
     LazWriter() = default;
     ~LazWriter()
     {
@@ -30,10 +34,14 @@ public:
     LazWriter& operator=(const LazWriter&) = delete;
 
     //! with_rgb writes LAS point format 3 (format 1 + rgb) instead of format 1.
-    bool open(const std::string& filename, double offset_x, double offset_y, double offset_z, bool with_rgb = false)
+    bool open(
+        const std::string& filename,
+        double offset_x,
+        double offset_y,
+        double offset_z,
+        bool with_rgb = false,
+        std::optional<bool> compressed = std::nullopt)
     {
-        constexpr double scale = 0.0001;
-
         if (laszip_create(&writer_))
         {
             fprintf(stderr, "DLL ERROR: creating laszip writer\n");
@@ -56,14 +64,15 @@ public:
         header->number_of_point_records = 0;
         header->number_of_points_by_return[0] = 0;
         header->number_of_points_by_return[1] = 0;
-        header->x_scale_factor = scale;
-        header->y_scale_factor = scale;
-        header->z_scale_factor = scale;
+        header->x_scale_factor = coordinate_scale;
+        header->y_scale_factor = coordinate_scale;
+        header->z_scale_factor = coordinate_scale;
+        header_offset_ = { offset_x, offset_y, offset_z };
         header->x_offset = offset_x;
         header->y_offset = offset_y;
         header->z_offset = offset_z;
 
-        laszip_BOOL compress = (strstr(filename.c_str(), ".laz") != 0);
+        laszip_BOOL compress = compressed.value_or(strstr(filename.c_str(), ".laz") != nullptr);
         if (laszip_open_writer(writer_, filename.c_str(), compress))
         {
             fprintf(stderr, "DLL ERROR: opening laszip writer for '%s'\n", filename.c_str());
@@ -91,23 +100,55 @@ public:
         unsigned short point_source_id = 0,
         const uint8_t* rgb = nullptr)
     {
+        std::array<std::uint16_t, 3> rgb16{};
+        if (rgb)
+        {
+            // 8-bit -> 16-bit LAS convention (value * 256), matching the readers' value / 256.
+            for (std::size_t channel = 0; channel < rgb16.size(); ++channel)
+                rgb16[channel] = static_cast<std::uint16_t>(static_cast<unsigned>(rgb[channel]) * 256);
+        }
+        return writePointWithGpsTime(
+            position, intensity, timestamp * 1e9, offset_x, offset_y, offset_z, point_source_id, rgb ? rgb16.data() : nullptr);
+    }
+
+    //! Write GPS time and RGB channels as represented in an existing LAS record.
+    bool writePointWithGpsTime(
+        const Eigen::Vector3d& position,
+        unsigned short intensity,
+        double gps_time,
+        double offset_x,
+        double offset_y,
+        double offset_z,
+        unsigned short point_source_id = 0,
+        const std::uint16_t* rgb = nullptr)
+    {
         point_->intensity = intensity;
         if (rgb)
         {
-            // 8-bit -> 16-bit LAS convention (value * 256), matching the readers' value / 256
-            point_->rgb[0] = static_cast<laszip_U16>(rgb[0]) << 8;
-            point_->rgb[1] = static_cast<laszip_U16>(rgb[1]) << 8;
-            point_->rgb[2] = static_cast<laszip_U16>(rgb[2]) << 8;
+            std::copy_n(rgb, 3, point_->rgb);
         }
         point_->return_number = 1;
         point_->number_of_returns = 1;
-        point_->gps_time = timestamp * 1e9;
+        point_->gps_time = gps_time;
         point_->point_source_ID = point_source_id;
 
         laszip_F64 coordinates[3];
         coordinates[0] = position.x() + offset_x;
         coordinates[1] = position.y() + offset_y;
         coordinates[2] = position.z() + offset_z;
+
+        // LASzip quantizes to a signed 32-bit integer without its own range check.
+        constexpr auto min_quantized = static_cast<double>(std::numeric_limits<std::int32_t>::min());
+        constexpr auto max_quantized = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+        for (std::size_t i = 0; i < header_offset_.size(); ++i)
+        {
+            const auto sample = std::round((coordinates[i] - header_offset_[i]) / coordinate_scale);
+            if (!std::isfinite(sample) || sample < min_quantized || sample > max_quantized)
+            {
+                std::cerr << "Point exceeds the LAS coordinate range for the selected offset and scale\n";
+                return false;
+            }
+        }
 
         if (laszip_set_coordinates(writer_, coordinates))
         {
@@ -142,7 +183,7 @@ public:
             return false;
         }
 
-        fprintf(stderr, "successfully written %lld points\n", p_count);
+        fprintf(stderr, "successfully written %lld points\n", static_cast<long long>(p_count));
 
         if (laszip_close_writer(writer_))
         {
@@ -164,6 +205,7 @@ public:
 private:
     laszip_POINTER writer_ = nullptr;
     laszip_point* point_ = nullptr;
+    std::array<double, 3> header_offset_{};
 };
 
 inline bool exportLaz(
@@ -355,7 +397,7 @@ inline void save_processed_pc(
         return;
     }
 
-    fprintf(stderr, "successfully written %lld points\n", p_count);
+    fprintf(stderr, "successfully written %lld points\n", static_cast<long long>(p_count));
 
     // close the writer
 
@@ -425,20 +467,24 @@ inline void points_to_vector(
 //! `intersection_width` of the respective plane) to one laz file. Shared by step 2 (one session,
 //! picked via a file dialog) and step 3 (one call per session, auto-named -- see
 //! export_intersection_all_sessions() in multi_session_registration.cpp).
-inline void save_intersection(
+inline bool save_intersection(
     const Session& session,
     const std::string& output_las_name,
     bool xz_intersection,
     bool yz_intersection,
     bool xy_intersection,
-    double intersection_width)
+    double intersection_width,
+    bool include_scan_ids = false)
 {
     std::vector<Eigen::Vector3d> pointcloud;
     std::vector<unsigned short> intensity;
     std::vector<double> timestamps;
 
-    for (auto& p : session.point_clouds_container.point_clouds)
+    std::vector<unsigned short> point_source_ids;
+    const auto& scans = session.point_clouds_container.point_clouds;
+    for (std::size_t index = 0; index < scans.size(); ++index)
     {
+        const auto& p = scans[index];
         if (!p.visible)
             continue;
 
@@ -457,23 +503,26 @@ inline void save_intersection(
             if (is_inside)
             {
                 pointcloud.push_back(vp);
+                if (include_scan_ids)
+                    point_source_ids.push_back(static_cast<unsigned short>(std::min<std::size_t>(index, 65535)));
                 intensity.push_back(i < p.intensities.size() ? p.intensities[i] : 0);
                 timestamps.push_back(i < p.timestamps.size() ? p.timestamps[i] : 0.0);
             }
         }
     }
 
-    if (!exportLaz(
-            output_las_name,
-            pointcloud,
-            intensity,
-            timestamps,
-            session.point_clouds_container.offset.x(),
-            session.point_clouds_container.offset.y(),
-            session.point_clouds_container.offset.z()))
-    {
+    const bool written = exportLaz(
+        output_las_name,
+        pointcloud,
+        intensity,
+        timestamps,
+        session.point_clouds_container.offset.x(),
+        session.point_clouds_container.offset.y(),
+        session.point_clouds_container.offset.z(),
+        include_scan_ids ? &point_source_ids : nullptr);
+    if (!written)
         std::cerr << "problem with saving file: " << output_las_name << std::endl;
-    }
+    return written;
 }
 
 inline bool save_all_to_las(const Session& session, std::string output_las_name, bool as_local, bool skip_ts_0)

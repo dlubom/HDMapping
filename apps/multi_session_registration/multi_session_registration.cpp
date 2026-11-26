@@ -1,3 +1,4 @@
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -19,7 +20,6 @@
 #include <Core/icp.h>
 #include <Core/ndt.h>
 #include <Core/observation_picking.h>
-#include <Core/pair_wise_iterative_closest_point.h>
 #include <Core/pfd_wrapper.hpp>
 #include <Core/registration_plane_feature.h>
 #include <Core/session.h>
@@ -43,8 +43,19 @@
 
 #endif
 
-#include "multi_session_factor_graph.h"
+#ifdef HDMAPPING_GUI_BRIDGE
+#include "project_capture.h"
+#include "project_operations.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#endif
 #include "raylib_utils.h"
+#include "step3_export_formats.h"
+#include "step3_operations.h"
+#ifdef HDMAPPING_GUI_BRIDGE
+#include "step3_io_operations.h"
+#endif
+#include <HDMapping/SessionPaths.h>
 
 std::string winTitle = std::string("Step 3 (Multi session registration) ") + HDMAPPING_CONFIGURE_PROJECT_VERSION;
 
@@ -151,8 +162,8 @@ int index_loop_closure_target = -1;
 int first_session_index = -1;
 int second_session_index = -1;
 double search_radius = 0.3;
+int nr_iter = 100;
 bool loaded_sessions = false;
-bool optimized = false;
 bool gizmo_all_sessions = false;
 //!< Stashed Gizmo update when ImGuizmo::IsUsing(). index is sessionId
 std::map<size_t, std::vector<Eigen::Affine3d>> session_drag_preview_poses;
@@ -175,22 +186,18 @@ int old_index_gizmo = -1;
 
 double time_stamp_offset = 0.0;
 
-struct ProjectSettings
-{
-    std::vector<std::string> session_file_names;
-};
+ProjectSettings project_settings;
 
 // Project file opened or last saved; empty until then (Save project falls back to Save project as).
 std::string project_file_name;
 
-std::vector<Edge> edges;
+auto& edges = project_settings.edges;
 int index_active_edge = -1;
 //!< Last index_active_edge the edge list was scrolled to (loop_closure_gui()).
 int edge_list_scrolled_to = -1;
 bool manipulate_active_edge = false;
 bool edge_gizmo = false;
 
-ProjectSettings project_settings;
 std::vector<Session> sessions;
 
 int viewer_reduce_rendered_trajectory = 1;
@@ -219,9 +226,88 @@ bool gui_xy_grid_01x01 = false;
 TaitBryanPose motion_model_weights = { 0.01, 0.01, 0.01, 0.1, 0.1, 0.1 };
 ///////////////////////////////////////////////////////////////////////////////////
 
+namespace proc = HDMapping::Processing;
+using nlohmann::json;
+
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace
+{
+    bool projectJobActive();
+    void submitProjectJob(const proc::OperationRequest& request, bool mutate);
+    std::unique_ptr<proc::GuiStateBridge> guiState;
+    std::unique_ptr<proc::GuiStateConnection> guiConnection;
+    proc::ProjectSessionSources projectSources;
+} // namespace
+#endif
+
+static void markProjectChanged()
+{
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (guiState)
+        guiState->Changed();
+#endif
+}
+
+static void showProjectError(const std::exception& error);
+
+static bool editProjectFromGui(std::string operation, json scope, json parameters)
+{
+    try
+    {
+        proc::EditStep3({ std::move(operation), {}, std::move(scope), std::move(parameters) }, project_settings, sessions);
+        markProjectChanged();
+        return true;
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+        return false;
+    }
+}
+
+static bool projectWorkAvailable()
+{
+#ifdef HDMAPPING_GUI_BRIDGE
+    if (projectJobActive())
+        return false;
+#endif
+    return loaded_sessions && !sessions.empty() && session_drag_preview_poses.empty();
+}
+
+static void runProjectFromGui(std::string operation, json scope, json parameters)
+{
+    const proc::OperationRequest request{ std::move(operation), {}, std::move(scope), std::move(parameters) };
+#ifdef HDMAPPING_GUI_BRIDGE
+    submitProjectJob(request, true);
+#else
+    try
+    {
+        proc::RunStep3(request, project_settings, sessions, {});
+        markProjectChanged();
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+    }
+#endif
+}
+
+static std::array<double, 6> poseComponents(const TaitBryanPose& pose)
+{
+    return { pose.px, pose.py, pose.pz, pose.om, pose.fi, pose.ka };
+}
+
+static void optimizeProjectFromGui()
+{
+    auto indices = json::array();
+    for (std::size_t i = 0; i < edges.size(); ++i)
+        indices.push_back(i);
+    runProjectFromGui(
+        "optimize_project",
+        { { "edge_indices", std::move(indices) } },
+        { { "motion_model_sigmas", poseComponents(motion_model_weights) }, { "iterations", nr_iter } });
+}
+
 void ndt_gui()
 {
-    static bool compute_mean_and_cov_for_bucket = false;
     if (ImGui::Begin("Normal Distributions Transform", &is_ndt_gui, ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::InputFloat3("Bucket size [m] (x, y,z)", ndt.bucket_size);
@@ -242,23 +328,32 @@ void ndt_gui()
             ndt.number_of_iterations = 1;
         ImGui::PopItemWidth();
 
+        ImGui::BeginDisabled(!projectWorkAvailable());
         if (ImGui::Button("NDT optimization"))
         {
-            for (auto& s : sessions)
-            {
-                s.is_gizmo = false;
-            }
+            for (auto& session : sessions)
+                session.is_gizmo = false;
+            index_gizmo = old_index_gizmo = -1;
 
-            double rms_initial = 0.0;
-            double rms_final = 0.0;
-            double mui = 0.0;
-
-            ndt.optimize(sessions, false, compute_mean_and_cov_for_bucket);
+            auto pairs = json::array();
+            for (std::size_t from = 0; from < sessions.size(); ++from)
+                for (std::size_t to = from + 1; to < sessions.size(); ++to)
+                    pairs.push_back({ { "from", from }, { "to", to } });
+            auto scope = sessions.size() == 1 ? json{ { "session_indices", { 0 } } } : json{ { "session_pairs", std::move(pairs) } };
+            runProjectFromGui(
+                "project.register_sessions",
+                std::move(scope),
+                { { "method", "ndt" },
+                  { "bucket_size_m", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+                  { "threads", ndt.number_of_threads },
+                  { "iterations", ndt.number_of_iterations } });
         }
+        ImGui::EndDisabled();
         ImGui::End();
     }
 
 #if 0
+    static bool compute_mean_and_cov_for_bucket = false;
     ImGui::Checkbox("ndt fix_first_node (add I to first pose in Hessian)", &ndt.is_fix_first_node);
 
     ImGui::Checkbox("ndt Gauss-Newton", &ndt.is_gauss_newton);
@@ -457,119 +552,12 @@ void setActiveEdge(const int i)
         setGizmoFromActiveEdge();
 }
 
-// Shared by icp_active_edge() and loop_closure_gui()'s plain "ICP" button: when either
-// endpoint session of the active edge is ground truth, fills source_out/target_out with the
-// other scan's points and the ground-truth scan's points trimmed to that scan's bounding box
-// (so a large ground-truth cloud doesn't drag in unrelated overlapping geometry), and returns
-// true. Returns false if neither/both sessions are ground truth -- caller handles that case.
-bool ground_truth_icp_source_target(std::vector<Eigen::Vector3d>& source_out, std::vector<Eigen::Vector3d>& target_out)
+static void refineProjectEdge(double radius, int iterations, int scans_before = 0, int scans_after = 0)
 {
-    bool is_with_ground_truth = sessions[edges[index_active_edge].index_session_from].is_ground_truth ||
-        sessions[edges[index_active_edge].index_session_to].is_ground_truth;
-
-    if (!is_with_ground_truth)
-        return false;
-
-    int index_session_from = -1;
-    int index_session_to = -1;
-    int index_from = -1;
-    int index_to = -1;
-
-    if (sessions[edges[index_active_edge].index_session_from].is_ground_truth)
-    {
-        index_session_from = edges[index_active_edge].index_session_from;
-        index_session_to = edges[index_active_edge].index_session_to;
-        index_from = edges[index_active_edge].index_from;
-        index_to = edges[index_active_edge].index_to;
-    }
-    else
-    {
-        index_session_from = edges[index_active_edge].index_session_to;
-        index_session_to = edges[index_active_edge].index_session_from;
-        index_from = edges[index_active_edge].index_to;
-        index_to = edges[index_active_edge].index_from;
-    }
-
-    double x_min = 1000000000000.0;
-    double y_min = 1000000000000.0;
-    double z_min = 1000000000000.0;
-    double x_max = -1000000000000.0;
-    double y_max = -1000000000000.0;
-    double z_max = -1000000000000.0;
-
-    auto& points_to = sessions[index_session_to].point_clouds_container.point_clouds[index_to];
-
-    for (const auto& p : points_to.points_local)
-    {
-        auto pg = points_to.m_pose * p;
-        if (pg.x() < x_min)
-            x_min = pg.x();
-        if (pg.y() < y_min)
-            y_min = pg.y();
-        if (pg.z() < z_min)
-            z_min = pg.z();
-
-        if (pg.x() > x_max)
-            x_max = pg.x();
-        if (pg.y() > y_max)
-            y_max = pg.y();
-        if (pg.z() > z_max)
-            z_max = pg.z();
-    }
-    auto& points_from = sessions[index_session_from].point_clouds_container.point_clouds[index_from];
-    std::vector<Eigen::Vector3d> ground_truth;
-    for (const auto& p : points_from.points_local)
-    {
-        auto pg = points_from.m_pose * p;
-        if (pg.x() > x_min && pg.x() < x_max)
-        {
-            if (pg.y() > y_min && pg.y() < y_max)
-            {
-                if (pg.z() > z_min && pg.z() < z_max)
-                    ground_truth.push_back(p);
-            }
-        }
-    }
-
-    // index_session_to/index_to here (not edges[index_active_edge]'s raw fields): those
-    // get swapped above when the *target* (not source) side of the edge is the ground
-    // truth session, and source must track that swap too, or it silently ends up
-    // aligning the ground-truth scan against a filtered copy of itself.
-    source_out = sessions[index_session_to].point_clouds_container.point_clouds[index_to].points_local;
-    target_out = std::move(ground_truth);
-    return true;
-}
-
-// Shared body of the fixed-search-radius ICP buttons in loop_closure_gui(): registers the
-// active edge's two scans, via ground_truth_icp_source_target() when applicable.
-void icp_active_edge(float search_radius, int number_of_iterations = 30)
-{
-    std::cout << "Iterative Closest Point" << std::endl;
-    if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
-        sessions[edges[index_active_edge].index_session_to].is_ground_truth)
-    {
-        std::cout << "Two sessions are ground truth!!! ICP is disabled" << std::endl;
-        return;
-    }
-
-    PairWiseICP icp;
-    auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-    std::vector<Eigen::Vector3d> source;
-    std::vector<Eigen::Vector3d> target;
-
-    if (!ground_truth_icp_source_target(source, target))
-    {
-        source = sessions[edges[index_active_edge].index_session_to]
-                     .point_clouds_container.point_clouds[edges[index_active_edge].index_to]
-                     .points_local;
-        target = sessions[edges[index_active_edge].index_session_from]
-                     .point_clouds_container.point_clouds[edges[index_active_edge].index_from]
-                     .points_local;
-    }
-
-    if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-        edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
+    runProjectFromGui(
+        "project.constraints.run_icp",
+        { { "edge_indices", { index_active_edge } } },
+        { { "search_radius_m", radius }, { "iterations", iterations }, { "scans_before", scans_before }, { "scans_after", scans_after } });
 }
 
 void on_loop_closure_gui_open()
@@ -603,15 +591,10 @@ void loop_closure_gui()
         }
         ImGui::Text("Visible sessions %s", ss.str().c_str());
 
+        ImGui::BeginDisabled(!projectWorkAvailable());
         if (ImGui::Button("Optimize GRAPH"))
-        {
-            for (int i = 0; i < 100; i++)
-            {
-                std::cout << "Iteration [" << i + 1 << "] of: " << 100 << std::endl;
-                optimize(sessions, edges, motion_model_weights);
-            }
-            optimized = true;
-        }
+            optimizeProjectFromGui();
+        ImGui::EndDisabled();
 
         ImGui::Checkbox("update_rotation_center", &update_rotation_center);
 
@@ -717,9 +700,11 @@ void loop_closure_gui()
             edge.relative_pose_tb_weights.fi = 1000000.0;
             edge.relative_pose_tb_weights.ka = 1000000.0;
 
-            edges.push_back(edge);
-
-            index_active_edge = edges.size() - 1;
+            if (editProjectFromGui(
+                    "project.constraints.add",
+                    json::object(),
+                    { { "edge", proc::ProjectEdgesJson(std::span<const Edge>(&edge, 1)).at(0) } }))
+                setActiveEdge(static_cast<int>(edges.size()) - 1);
         }
 
         std::string number_active_edges = "number_edges: " + std::to_string(edges.size());
@@ -780,10 +765,9 @@ void loop_closure_gui()
 
         // Deleted after the loop so the list is not modified while it is drawn. The active edge keeps pointing at
         // the same edge; deleting the active edge itself leaves manipulate mode, as "remove active edge" does.
-        if (delete_edge_index != -1)
+        if (delete_edge_index != -1 &&
+            editProjectFromGui("project.constraints.remove", { { "edge_index", delete_edge_index } }, json::object()))
         {
-            edges.erase(edges.begin() + delete_edge_index);
-
             if (delete_edge_index == index_active_edge)
             {
                 edge_gizmo = false;
@@ -846,110 +830,9 @@ void loop_closure_gui()
                     setGizmoFromActiveEdge();
                 if (!edge_gizmo)
                 {
+                    ImGui::BeginDisabled(!projectWorkAvailable());
                     if (ImGui::Button("ICP"))
-                    {
-                        std::cout << "Iterative Closest Point" << std::endl;
-                        if (sessions[edges[index_active_edge].index_session_from].is_ground_truth &&
-                            sessions[edges[index_active_edge].index_session_to].is_ground_truth)
-                        {
-                            std::cout << "Two sessions are ground truth!!! ICP is disabled" << std::endl;
-                        }
-                        else
-                        {
-                            std::vector<Eigen::Vector3d> source;
-                            std::vector<Eigen::Vector3d> target;
-
-                            if (ground_truth_icp_source_target(source, target))
-                            {
-                                int number_of_iterations = 10;
-                                PairWiseICP icp;
-                                auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-                                if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-                                    edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
-                            }
-                            else
-                            {
-                                int number_of_iterations = 10;
-                                PairWiseICP icp;
-                                auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-                                std::vector<Eigen::Vector3d> source;
-                                auto& e = edges[index_active_edge];
-                                for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-                                {
-                                    int index_src = e.index_to + i;
-                                    if (index_src >= 0 &&
-                                        index_src <
-                                            sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.size())
-                                    {
-                                        Eigen::Affine3d m_src = sessions[edges[index_active_edge].index_session_to]
-                                                                    .point_clouds_container.point_clouds.at(index_src)
-                                                                    .m_pose;
-                                        for (int k = 0; k < sessions[edges[index_active_edge].index_session_to]
-                                                                .point_clouds_container.point_clouds[index_src]
-                                                                .points_local.size();
-                                             k++)
-                                        {
-                                            Eigen::Vector3d p_g = m_src *
-                                                sessions[edges[index_active_edge].index_session_to]
-                                                    .point_clouds_container.point_clouds[index_src]
-                                                    .points_local[k];
-                                            source.push_back(p_g);
-                                        }
-                                        // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-                                    }
-                                }
-                                std::vector<Eigen::Vector3d> target;
-
-                                for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-                                {
-                                    int index_trg = e.index_from + i;
-                                    if (index_trg >= 0 &&
-                                        index_trg < sessions[edges[index_active_edge].index_session_from]
-                                                        .point_clouds_container.point_clouds.size())
-                                    {
-                                        Eigen::Affine3d m_trg = sessions[edges[index_active_edge].index_session_from]
-                                                                    .point_clouds_container.point_clouds.at(index_trg)
-                                                                    .m_pose;
-                                        for (int k = 0; k < sessions[edges[index_active_edge].index_session_from]
-                                                                .point_clouds_container.point_clouds[index_trg]
-                                                                .points_local.size();
-                                             k++)
-                                        {
-                                            Eigen::Vector3d p_g = m_trg *
-                                                sessions[edges[index_active_edge].index_session_from]
-                                                    .point_clouds_container.point_clouds[index_trg]
-                                                    .points_local[k];
-                                            target.push_back(p_g);
-                                        }
-                                        // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-                                    }
-                                }
-
-                                Eigen::Affine3d m_src_inv = sessions[edges[index_active_edge].index_session_to]
-                                                                .point_clouds_container.point_clouds[e.index_to]
-                                                                .m_pose.inverse();
-
-                                for (auto& p : source)
-                                {
-                                    p = m_src_inv * p;
-                                }
-
-                                Eigen::Affine3d m_trg_inv = sessions[edges[index_active_edge].index_session_from]
-                                                                .point_clouds_container.point_clouds[e.index_from]
-                                                                .m_pose.inverse();
-
-                                for (auto& p : target)
-                                {
-                                    p = m_trg_inv * p;
-                                }
-
-                                if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
-                                    edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
-                            }
-                        }
-                    }
+                        refineProjectEdge(search_radius, 10, num_edge_extended_before, num_edge_extended_after);
                     ImGui::SameLine();
                     ImGui::InputDouble("search_radius", &search_radius);
                     if (search_radius < 0.01)
@@ -957,20 +840,21 @@ void loop_closure_gui()
 
                     /////////////////////////////////
                     if (ImGui::Button("ICP [search radius 2m]"))
-                        icp_active_edge(2.0f);
+                        refineProjectEdge(2.0, 30);
 
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 1m]"))
-                        icp_active_edge(1.0f);
+                        refineProjectEdge(1.0, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.5m]"))
-                        icp_active_edge(0.5f);
+                        refineProjectEdge(0.5, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.25m]"))
-                        icp_active_edge(0.25f);
+                        refineProjectEdge(0.25, 30);
                     ImGui::SameLine();
                     if (ImGui::Button("ICP [search radius 0.1m]"))
-                        icp_active_edge(0.1f);
+                        refineProjectEdge(0.1, 30);
+                    ImGui::EndDisabled();
 #if 0
                     if (ImGui::Button("Save src"))
                     {
@@ -1026,120 +910,73 @@ void loop_closure_gui()
     }
 }
 
-void save_trajectories_to_laz(
-    const Session& session,
-    const std::string& output_file_name,
-    float curve_consecutive_distance_meters,
-    float not_curve_consecutive_distance_meters,
-    bool is_trajectory_export_downsampling)
+#ifdef HDMAPPING_GUI_BRIDGE
+static void publish_project_files(const json& parameters)
 {
-    std::vector<Eigen::Vector3d> pointcloud;
-    std::vector<unsigned short> intensity;
-    std::vector<double> timestamps;
-
-    float consecutive_distance = 0;
-    for (auto& p : session.point_clouds_container.point_clouds)
+    auto selected = json::array();
+    const bool poses = parameters.at("format") == "poses";
+    for (std::size_t i = 0; i < sessions.size(); ++i)
     {
-        if (p.visible)
-        {
-            for (size_t i = 0; i < p.local_trajectory.size(); i++)
-            {
-                const auto& pp = p.local_trajectory[i].m_pose.translation();
-                Eigen::Vector3d vp;
-                vp = p.m_pose * pp; // + session.point_clouds_container.offset;
-
-                if (i > 0)
-                {
-                    double dist = (p.local_trajectory[i].m_pose.translation() - p.local_trajectory[i - 1].m_pose.translation()).norm();
-                    consecutive_distance += dist;
-                }
-
-                bool is_curve = false;
-
-                if (i > 100 && i < p.local_trajectory.size() - 100)
-                {
-                    Eigen::Vector3d position_prev = p.local_trajectory[i - 100].m_pose.translation();
-                    Eigen::Vector3d position_curr = p.local_trajectory[i].m_pose.translation();
-                    Eigen::Vector3d position_next = p.local_trajectory[i + 100].m_pose.translation();
-
-                    Eigen::Vector3d v1 = position_curr - position_prev;
-                    Eigen::Vector3d v2 = position_next - position_curr;
-
-                    if (v1.norm() > 0 && v2.norm() > 0)
-                    {
-                        double angle_deg = fabs(acos(v1.dot(v2) / (v1.norm() * v2.norm())) * RAD_TO_DEG);
-
-                        if (angle_deg > 10.0)
-                        {
-                            is_curve = true;
-                        }
-                    }
-                }
-                double tol = not_curve_consecutive_distance_meters;
-
-                if (is_curve)
-                {
-                    tol = curve_consecutive_distance_meters;
-                }
-
-                if (!is_trajectory_export_downsampling)
-                {
-                    pointcloud.push_back(vp);
-                    intensity.push_back(0);
-                    timestamps.push_back(p.local_trajectory[i].timestamps.first);
-                }
-                else
-                {
-                    if (consecutive_distance >= tol)
-                    {
-                        consecutive_distance = 0;
-                        pointcloud.push_back(vp);
-                        intensity.push_back(0);
-                        timestamps.push_back(p.local_trajectory[i].timestamps.first);
-                    }
-                }
-            }
-        }
-    }
-    // if (!exportLaz(output_file_name, pointcloud, intensity, gnss.offset_x, gnss.offset_y, gnss.offset_alt))
-    if (!exportLaz(
-            output_file_name,
-            pointcloud,
-            intensity,
-            timestamps,
-            session.point_clouds_container.offset.x(),
-            session.point_clouds_container.offset.y(),
-            session.point_clouds_container.offset.z()))
-    {
-        std::cout << "problem with saving file: " << output_file_name << std::endl;
-    }
-}
-
-// Step 3 has no single active session (unlike step 2's "Export xz/yz/xy intersection", which
-// picks one output file for the one session via a save dialog), so this calls the shared
-// save_intersection() (Core/export_laz.h) once per session, auto-named -- same pattern as
-// "Save all marked trajectories" above.
-void export_intersection_all_sessions(bool xz_intersection, bool yz_intersection, bool xy_intersection, const std::string& suffix)
-{
-    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-    {
-        const auto& session_path = project_settings.session_file_names[i];
-
-        if (i >= sessions.size())
-        {
-            std::cerr << "No loaded session for: " << session_path << std::endl;
+        const auto& session = sessions.at(i);
+        if (poses && (session.is_ground_truth || Session::is_point_cloud_file(session.session_file_name)))
             continue;
-        }
-
-        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-        std::string folder_name = dir.filename().string();
-        std::string laz_path = (dir / (folder_name + suffix)).string();
-
-        std::cout << "Saving intersection to LAZ: " << laz_path << std::endl;
-        save_intersection(sessions[i], laz_path, xz_intersection, yz_intersection, xy_intersection, gui_intersection_width);
+        auto scans = json::array();
+        const auto& clouds = session.point_clouds_container.point_clouds;
+        for (std::size_t scan = 0; scan < clouds.size(); ++scan)
+            if (poses || clouds[scan].visible)
+                scans.push_back(scan);
+        if (!scans.empty())
+            selected.push_back({ { "session_index", i }, { "scan_indices", std::move(scans) } });
     }
+    if (selected.empty())
+    {
+        pfd::message("Export failed", "No scans in the selected sessions", pfd::choice::ok, pfd::icon::error);
+        return;
+    }
+    submitProjectJob({ std::string(proc::project_export_operation), {}, { { "sessions", std::move(selected) } }, parameters }, false);
+}
+#endif
 
-    std::cout << "Finished saving all intersections to .laz files." << std::endl;
+static void export_project_files(const json& parameters, const std::string& suffix, bool common_folder = false)
+{
+    const auto format = parameters.at("format").get<std::string>();
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+    {
+        const auto& session = sessions[i];
+        const auto dir = sessionPathFromText(project_settings.session_file_names.at(i)).parent_path();
+        auto output = dir;
+        try
+        {
+            if (common_folder)
+            {
+                output = dir.parent_path() / "all_tum_files";
+                fs::create_directories(output);
+            }
+            auto file = dir.filename();
+            file += suffix;
+            const auto path = output / file;
+            bool written = false;
+            if (format == "section_laz")
+            {
+                const auto plane = parameters.at("plane").get<std::string>();
+                written = save_intersection(
+                    session, sessionPathText(path), plane == "xz", plane == "yz", plane == "xy", parameters.at("width_m").get<double>());
+            }
+            else
+                written = proc::WriteProjectTrajectory(
+                    session,
+                    path,
+                    format,
+                    parameters.value("timestamps", std::string("lidar")),
+                    parameters.value("pose", std::string("matrix")),
+                    parameters.value("sort_tum", true));
+            if (!written)
+                spdlog::error("Could not write '{}'", sessionPathText(path));
+        } catch (const std::exception& error)
+        {
+            spdlog::error("Project export failed: {}", error.what());
+        }
+    }
 }
 
 void createDXFPolyline(const std::string& filename, const std::vector<Eigen::Vector3d>& points)
@@ -1284,96 +1121,16 @@ void save_trajectories(
     }
 }
 
-bool save_project_settings(const std::string& file_name, const ProjectSettings& _project_settings)
+static bool isManagedProjectFile(const fs::path& file)
 {
-    std::cout << "saving file: '" << file_name << "'" << std::endl;
-
-    nlohmann::json jj;
-
-    nlohmann::json jsession_file_names;
-    for (const auto& pc : _project_settings.session_file_names)
-    {
-        nlohmann::json jfn{ { "session_file_name", pc } };
-        jsession_file_names.push_back(jfn);
-    }
-    jj["session_file_names"] = jsession_file_names;
-
-    nlohmann::json jloop_closure_edges;
-    for (const auto& edge : edges)
-    {
-        nlohmann::json jloop_closure_edge{
-            { "px", edge.relative_pose_tb.px },
-            { "py", edge.relative_pose_tb.py },
-            { "pz", edge.relative_pose_tb.pz },
-            { "om", edge.relative_pose_tb.om },
-            { "fi", edge.relative_pose_tb.fi },
-            { "ka", edge.relative_pose_tb.ka },
-            { "w_px", edge.relative_pose_tb_weights.px },
-            { "w_py", edge.relative_pose_tb_weights.py },
-            { "w_pz", edge.relative_pose_tb_weights.pz },
-            { "w_om", edge.relative_pose_tb_weights.om },
-            { "w_fi", edge.relative_pose_tb_weights.fi },
-            { "w_ka", edge.relative_pose_tb_weights.ka },
-            { "index_from", edge.index_from },
-            { "index_to", edge.index_to },
-            { "is_fixed_px", edge.is_fixed_px },
-            { "is_fixed_py", edge.is_fixed_py },
-            { "is_fixed_pz", edge.is_fixed_pz },
-            { "is_fixed_om", edge.is_fixed_om },
-            { "is_fixed_fi", edge.is_fixed_fi },
-            { "is_fixed_ka", edge.is_fixed_ka },
-            { "index_session_from", edge.index_session_from },
-            { "index_session_to", edge.index_session_to },
-        };
-        jloop_closure_edges.push_back(jloop_closure_edge);
-    }
-    jj["loop_closure_edges"] = jloop_closure_edges;
-
-    std::ofstream fs(file_name);
-    if (!fs.good())
+    std::error_code ec;
+    auto path = fs::weakly_canonical(file, ec);
+    if (ec)
         return false;
-    fs << jj.dump(2);
-    fs.close();
-
-    return true;
-}
-
-void update_timestamp_offset()
-{
-    std::cout << "update_timestamp" << std::endl;
-    time_stamp_offset = std::numeric_limits<double>::max();
-
-    for (const auto& s : sessions)
-    {
-        if (!s.point_clouds_container.point_clouds.empty() && !s.point_clouds_container.point_clouds[0].local_trajectory.empty())
-        {
-            double ts = s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first;
-            if (ts < time_stamp_offset)
-                time_stamp_offset = ts;
-        }
-    }
-
-    std::cout << "new time_stamp_offset = " << time_stamp_offset << std::endl;
-}
-
-bool revert(std::vector<Session>& sessions)
-{
-    for (auto& session : sessions)
-    {
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.m_pose = pc.m_pose_temp;
-    }
-    return true;
-}
-
-bool revert_to_initial(std::vector<Session>& sessions)
-{
-    for (auto& session : sessions)
-    {
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.m_pose = pc.m_initial_pose;
-    }
-    return true;
+    for (auto parent = path.parent_path(); parent != parent.root_path(); parent = parent.parent_path())
+        if (fs::is_regular_file(parent / "snapshot.json", ec) && fs::is_regular_file(parent.parent_path() / "result.json", ec))
+            return true;
+    return false;
 }
 
 bool save_results(std::vector<Session>& sessions)
@@ -1389,6 +1146,11 @@ bool save_results(std::vector<Session>& sessions)
                 std::cout << "not saving poses of point cloud session: " << session.session_file_name << std::endl;
                 continue;
             }
+            if (isManagedProjectFile(sessionPathFromText(session.point_clouds_container.poses_file_name)))
+            {
+                failed += "'" + session.point_clouds_container.poses_file_name + "' (published result)\n";
+                continue;
+            }
             std::cout << "saving result to: " << session.point_clouds_container.poses_file_name << std::endl;
             if (!session.point_clouds_container.save_poses(fs::path(session.point_clouds_container.poses_file_name).string(), false))
                 failed += "'" + session.point_clouds_container.poses_file_name + "'\n";
@@ -1401,48 +1163,6 @@ bool save_results(std::vector<Session>& sessions)
         return false;
     }
     return true;
-}
-
-// Writes the world poses of all visible scans (scan pose * local trajectory node) as TUM
-// ("t[s] x y z qx qy qz qw"), sorted by time, with repeated timestamps dropped.
-bool save_session_trajectory_as_tum(const Session& session, const std::string& file_name)
-{
-    std::vector<std::pair<double, Eigen::Affine3d>> poses;
-    for (const auto& pc : session.point_clouds_container.point_clouds)
-    {
-        if (!pc.visible)
-            continue;
-        for (const auto& node : pc.local_trajectory)
-            poses.emplace_back(node.timestamps.first, pc.m_pose * node.m_pose);
-    }
-    std::stable_sort(
-        poses.begin(),
-        poses.end(),
-        [](const auto& a, const auto& b)
-        {
-            return a.first < b.first;
-        });
-
-    std::ofstream outfile(file_name);
-    if (!outfile.is_open())
-    {
-        std::cerr << "Failed to create file: " << file_name << std::endl;
-        return false;
-    }
-
-    size_t written = 0;
-    for (size_t i = 0; i < poses.size(); i++)
-    {
-        if (i > 0 && poses[i].first == poses[i - 1].first)
-            continue;
-        const Eigen::Vector3d pos = poses[i].second.translation();
-        const Eigen::Quaterniond q(poses[i].second.rotation());
-        outfile << std::fixed << std::setprecision(9) << poses[i].first / 1e9 << " " << std::setprecision(10) << pos.x() << " " << pos.y()
-                << " " << pos.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
-        written++;
-    }
-    std::cout << "Saved " << written << " poses to TUM: " << file_name << std::endl;
-    return outfile.good();
 }
 
 Eigen::Vector3d GLWidgetGetOGLPos(int x, int y, const ObservationPicking& observation_picking)
@@ -1463,76 +1183,76 @@ Eigen::Vector3d GLWidgetGetOGLPos(int x, int y, const ObservationPicking& observ
     return pos;
 }
 
-bool loadProject(const std::string& file_name, ProjectSettings& _project_settings)
+static void updateProjectTitle(const std::string& file_name)
 {
-    std::cout << "Opening project file: '" << file_name << "'\n";
+    project_file_name = file_name;
+    const auto title = winTitle + " - " + truncPath(file_name);
+    SetWindowTitle(title.c_str());
+}
 
+static void refreshVisibleSessions()
+{
+    visible_sessions.clear();
+    for (std::size_t index = 0; index < sessions.size(); ++index)
+        if (sessions[index].visible)
+            visible_sessions.insert(static_cast<int>(index));
+    number_visible_sessions = static_cast<int>(visible_sessions.size());
+    first_session_index = visible_sessions.empty() ? -1 : *visible_sessions.begin();
+    second_session_index = visible_sessions.empty() ? -1 : *visible_sessions.rbegin();
+}
+
+static void resetProjectEdgeSelection()
+{
+    index_active_edge = edge_list_scrolled_to = -1;
+    manipulate_active_edge = edge_gizmo = false;
+    refreshVisibleSessions();
+    index_loop_closure_source = index_loop_closure_target = 0;
+}
+
+static void resetProjectSelection()
+{
+    session_drag_preview_poses.clear();
+    resetProjectEdgeSelection();
+    is_loop_closure_gui = false;
+    index_gizmo = old_index_gizmo = -1;
+    index_gt = -1;
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+    {
+        sessions[i].is_gizmo = false;
+        if (sessions[i].is_ground_truth)
+            index_gt = static_cast<int>(i);
+    }
+    old_index_gt = index_gt;
+}
+
+static void showProjectError(const std::exception& error)
+{
+    pfd::message("Project I/O", error.what(), pfd::choice::ok, pfd::icon::error);
+}
+
+bool loadProject(const std::string& file_name)
+{
     try
     {
-        std::ifstream fs(file_name);
-        if (!fs.good())
-            return false;
-        nlohmann::json data = nlohmann::json::parse(fs);
-        fs.close();
-
-        _project_settings.session_file_names.clear();
-
-        std::cout << "Contained sessions:\n";
-
-        for (const auto& fn_json : data["session_file_names"])
-        {
-            const std::string fn = fn_json["session_file_name"];
-            _project_settings.session_file_names.push_back(fn);
-            std::cout << "'" << fn << "'";
-            if (!fs::exists(fn))
-                std::cout << "  (WARNING: session file does not exist! Please manually adapt path)";
-            std::cout << "\n";
-        }
-
-        edges.clear();
-        for (const auto& edge_json : data["loop_closure_edges"])
-        {
-            Edge edge;
-            edge.index_from = edge_json["index_from"];
-            edge.index_to = edge_json["index_to"];
-            edge.is_fixed_fi = edge_json["is_fixed_fi"];
-            edge.is_fixed_ka = edge_json["is_fixed_ka"];
-            edge.is_fixed_om = edge_json["is_fixed_om"];
-            edge.is_fixed_px = edge_json["is_fixed_px"];
-            edge.is_fixed_py = edge_json["is_fixed_py"];
-            edge.is_fixed_pz = edge_json["is_fixed_pz"];
-            edge.relative_pose_tb.fi = edge_json["fi"];
-            edge.relative_pose_tb.ka = edge_json["ka"];
-            edge.relative_pose_tb.om = edge_json["om"];
-            edge.relative_pose_tb.px = edge_json["px"];
-            edge.relative_pose_tb.py = edge_json["py"];
-            edge.relative_pose_tb.pz = edge_json["pz"];
-            edge.relative_pose_tb_weights.fi = edge_json["w_fi"];
-            edge.relative_pose_tb_weights.ka = edge_json["w_ka"];
-            edge.relative_pose_tb_weights.om = edge_json["w_om"];
-            edge.relative_pose_tb_weights.px = edge_json["w_px"];
-            edge.relative_pose_tb_weights.py = edge_json["w_py"];
-            edge.relative_pose_tb_weights.pz = edge_json["w_pz"];
-            edge.index_session_from = edge_json["index_session_from"];
-            edge.index_session_to = edge_json["index_session_to"];
-            edges.push_back(edge);
-        }
-
-        std::cout << "Found " << edges.size() << "edges\nOpening done\n";
-    } catch (std::exception& e)
+        auto loaded = ReadProjectSettings(sessionPathFromText(file_name));
+#ifdef HDMAPPING_GUI_BRIDGE
+        if (guiState)
+            guiState->Open();
+        projectSources.clear();
+#endif
+        project_settings = std::move(loaded);
+        sessions.clear();
+        resetProjectSelection();
+        invalidateSessionRenderers();
+        loaded_sessions = false;
+        time_stamp_offset = 0.0;
+        updateProjectTitle(file_name);
+        return true;
+    } catch (const std::exception& error)
     {
-        std::cout << "can't load project settings: " << e.what() << std::endl;
+        showProjectError(error);
         return false;
     }
-
-    project_file_name = file_name;
-    std::string newTitle = winTitle + " - " + truncPath(file_name);
-    SetWindowTitle(newTitle.c_str());
-
-    loaded_sessions = false;
-    time_stamp_offset = 0.0;
-
-    return true;
 }
 
 void openProject()
@@ -1542,17 +1262,22 @@ void openProject()
 
     if (input_file_name.size() > 0)
     {
-        loadProject(fs::path(input_file_name).string(), project_settings);
+        loadProject(input_file_name);
     }
 }
 
 void saveProjectTo(const std::string& output_file_name)
 {
-    if (save_project_settings(fs::path(output_file_name).string(), project_settings))
+    try
     {
-        project_file_name = output_file_name;
-        std::string newTitle = winTitle + " - " + truncPath(output_file_name);
-        SetWindowTitle(newTitle.c_str());
+        const auto path = sessionPathFromText(output_file_name);
+        if (isManagedProjectFile(path))
+            throw std::invalid_argument("Choose a project file outside the published result.");
+        WriteProjectSettings(path, project_settings);
+        updateProjectTitle(output_file_name);
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
     }
 }
 
@@ -1567,49 +1292,70 @@ void saveProjectAs()
 
 void saveProject()
 {
-    if (project_file_name.empty())
+    if (project_file_name.empty() || isManagedProjectFile(sessionPathFromText(project_file_name)))
         saveProjectAs();
     else
         saveProjectTo(project_file_name);
 }
 
-void addSession()
+void loadSessions();
+void finishLoadingSessions();
+
+static Session readSessionForGui(const std::string& path)
 {
-    // A single point cloud (*.laz, *.las) is loaded as an in-memory session, see Session::load_from_point_cloud
-    static const std::vector<std::string> session_or_point_cloud_filter = {
-        "Session or point cloud (*.mjs, *.json, *.laz, *.las)", "*.mjs *.json *.laz *.las", "All files", "*"
-    };
-    auto input_file_names = mandeye::fd::OpenFileDialog("Add session(s)", session_or_point_cloud_filter, true);
+    return ReadProjectSession(
+        sessionPathText(fs::absolute(sessionPathFromText(path))),
+        { is_decimate, { bucket_x, bucket_y, bucket_z }, calculate_offset, false });
+}
 
-    if (input_file_names.size() > 0)
+bool addSessionFile(const std::string& path)
+{
+    try
     {
-        for (const auto& input_file_name : input_file_names)
+#ifdef HDMAPPING_GUI_BRIDGE
+        const auto absolute = sessionPathText(fs::absolute(sessionPathFromText(path)).lexically_normal());
+        if (std::ranges::any_of(
+                sessions,
+                [&absolute](const Session& session)
+                {
+                    const auto source = projectSources.find(session.session_file_name);
+                    return source != projectSources.end() && source->second == absolute;
+                }))
+            return false;
+#endif
+        if (!loaded_sessions)
         {
-            std::cout << "Adding session file: '" << input_file_name << "'" << std::endl;
-            project_settings.session_file_names.push_back(input_file_name);
+            if (!AddProjectSessionPath(project_settings, path))
+                return false;
+            markProjectChanged();
+            return true;
         }
-
-        loaded_sessions = false;
-        time_stamp_offset = 0.0;
+        // Preserve the current sessions and any unsaved poses.
+        auto session = readSessionForGui(path);
+        sessions.reserve(sessions.size() + 1);
+        if (!AddProjectSessionPath(project_settings, path))
+            return false;
+        if (session.is_ground_truth)
+            SetProjectGroundTruth(sessions, -1);
+        sessions.push_back(std::move(session));
+        return true;
+    } catch (const std::exception& error)
+    {
+        showProjectError(error);
+        return false;
     }
 }
 
-void appendSession(const std::string& ps);
-void finishLoadingSessions();
-void loadSessions();
-
-// Adds a session file to the project unless it is already there; returns whether it was added.
-bool addSessionFile(const std::string& path)
+void addSession()
 {
-    const auto& names = project_settings.session_file_names;
-    if (std::find(names.begin(), names.end(), path) != names.end())
-    {
-        std::cout << "Session file already in project: '" << path << "'" << std::endl;
-        return false;
-    }
-    std::cout << "Adding session file: '" << path << "'" << std::endl;
-    project_settings.session_file_names.push_back(path);
-    return true;
+    static const std::vector<std::string> filter = {
+        "Session or point cloud (*.mjs, *.json, *.laz, *.las)", "*.mjs *.json *.laz *.las", "All files", "*"
+    };
+    bool added = false;
+    for (const auto& file : mandeye::fd::OpenFileDialog("Add session(s)", filter, true))
+        added |= addSessionFile(file);
+    if (added && loaded_sessions)
+        finishLoadingSessions();
 }
 
 // Next file dialog opens in the folder of a file loaded without one (drag & drop, command line).
@@ -1640,7 +1386,7 @@ void loadDroppedFiles()
         if (ext_of(path) == ".mjp")
         {
             setLocationHintFromFile(path);
-            loadProject(path.string(), project_settings);
+            loadProject(sessionPathText(path));
             return;
         }
     }
@@ -1670,261 +1416,67 @@ void loadDroppedFiles()
     setLocationHintFromFile(added.back());
 
     if (loaded_sessions)
-    {
-        for (const auto& ps : added)
-            appendSession(ps);
         finishLoadingSessions();
-    }
     else
-    {
-        time_stamp_offset = 0.0;
         loadSessions();
-    }
 }
 
-void appendSession(const std::string& ps)
+// Refresh the window after committing a complete revision of the project.
+static void refreshProjectSessions()
 {
+    resetProjectSelection();
+    for (auto& session : sessions)
     {
-        Session session;
-        session.load(fs::path(ps).string(), is_decimate, bucket_x, bucket_y, bucket_z, calculate_offset);
-
-        // making sure irelevant session specific settings that could affect rendering are off
-        session.point_clouds_container.xz_intersection = false;
-        session.point_clouds_container.yz_intersection = false;
-        session.point_clouds_container.xy_intersection = false;
-        session.point_clouds_container.xz_grid_10x10 = false;
-        session.point_clouds_container.xz_grid_1x1 = false;
-        session.point_clouds_container.xz_grid_01x01 = false;
-        session.point_clouds_container.yz_grid_10x10 = false;
-        session.point_clouds_container.yz_grid_1x1 = false;
-        session.point_clouds_container.yz_grid_01x01 = false;
-        session.point_clouds_container.xy_grid_10x10 = false;
-        session.point_clouds_container.xy_grid_1x1 = false;
-        session.point_clouds_container.xy_grid_01x01 = false;
-
-        for (auto& pc : session.point_clouds_container.point_clouds)
-            pc.point_size = point_size;
-
-        sessions.push_back(session);
-        if (session.is_ground_truth)
-            index_gt = sessions.size() - 1;
+        auto& clouds = session.point_clouds_container;
+        clouds.xz_intersection = gui_xz_intersection;
+        clouds.yz_intersection = gui_yz_intersection;
+        clouds.xy_intersection = gui_xy_intersection;
+        clouds.intersection_width = gui_intersection_width;
+        clouds.xz_grid_10x10 = gui_xz_grid_10x10;
+        clouds.xz_grid_1x1 = gui_xz_grid_1x1;
+        clouds.xz_grid_01x01 = gui_xz_grid_01x01;
+        clouds.yz_grid_10x10 = gui_yz_grid_10x10;
+        clouds.yz_grid_1x1 = gui_yz_grid_1x1;
+        clouds.yz_grid_01x01 = gui_yz_grid_01x01;
+        clouds.xy_grid_10x10 = gui_xy_grid_10x10;
+        clouds.xy_grid_1x1 = gui_xy_grid_1x1;
+        clouds.xy_grid_01x01 = gui_xy_grid_01x01;
+        for (auto& scan : clouds.point_clouds)
+            scan.point_size = point_size;
     }
-}
-
-// Reorders (ground truth first), recolors and re-uploads the loaded sessions.
-void finishLoadingSessions()
-{
-    // reorder
-    std::vector<Session> sessions_reorder;
-    std::vector<std::string> session_file_names_reordered;
-
-    std::map<int, int> map_reorder;
-    // project_settings.session_file_names.
-    int new_index = 0;
-    for (size_t i = 0; i < sessions.size(); i++)
-    {
-        if (sessions[i].is_ground_truth)
-        {
-            sessions_reorder.push_back(sessions[i]);
-            session_file_names_reordered.push_back(project_settings.session_file_names[i]);
-            map_reorder[i] = new_index++;
-        }
-    }
-    for (size_t i = 0; i < sessions.size(); i++)
-    {
-        if (!sessions[i].is_ground_truth)
-        {
-            sessions_reorder.push_back(sessions[i]);
-            session_file_names_reordered.push_back(project_settings.session_file_names[i]);
-            map_reorder[i] = new_index++;
-        }
-    }
-    sessions = sessions_reorder;
-    project_settings.session_file_names = session_file_names_reordered;
-
-    for (auto& e : edges)
-    {
-        e.index_session_from = map_reorder[e.index_session_from];
-        e.index_session_to = map_reorder[e.index_session_to];
-    }
-
-    std::cout << "sessions reordered, ground truth should be in front" << std::endl;
-    for (const auto& s : sessions)
-    {
-        std::cout << "session: '" << s.session_file_name << "' ground truth [" << int(s.is_ground_truth) << "]" << std::endl;
-    }
-
     assignDistinctSessionColors(sessions);
     invalidateSessionRenderers();
-
-    // update time_stamp_offset
-    std::cout << "update time_stamp_offset" << std::endl;
-    for (const auto& s : sessions)
+    time_stamp_offset = 0.0;
+    // Preserve Step 3's existing latest starting timestamp on load.
+    for (const auto& session : sessions)
     {
-        if (s.point_clouds_container.point_clouds.size() > 0)
-        {
-            if (s.point_clouds_container.point_clouds[0].local_trajectory.size() > 0)
-            {
-                if (s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first > time_stamp_offset)
-                {
-                    time_stamp_offset = s.point_clouds_container.point_clouds[0].local_trajectory[0].timestamps.first;
-                }
-            }
-        }
+        const auto& scans = session.point_clouds_container.point_clouds;
+        if (!scans.empty() && !scans.front().local_trajectory.empty())
+            time_stamp_offset = std::max(time_stamp_offset, scans.front().local_trajectory.front().timestamps.first);
     }
+}
+
+void finishLoadingSessions()
+{
+    OrderProjectGroundTruthFirst(project_settings, sessions);
+    refreshProjectSessions();
+    markProjectChanged();
 }
 
 void loadSessions()
 {
-    sessions.clear();
-    session_drag_preview_poses.clear();
-    for (const auto& ps : project_settings.session_file_names)
-        appendSession(ps);
-    loaded_sessions = true;
-
-    finishLoadingSessions();
-}
-
-void generate_loop_closures(const std::vector<Session>& sessions, std::vector<Edge>& edges)
-{
-    edges.clear();
-    // Implementation for generating loop closures
-
-    // bool found_edge = false;
-
-    for (int i1 = 0; i1 < sessions.size(); i1++)
+    try
     {
-        for (int j1 = 0; j1 < sessions[i1].point_clouds_container.point_clouds.size(); j1++)
-        {
-            Eigen::Affine3d pose_i = sessions[i1].point_clouds_container.point_clouds[j1].m_pose;
-
-            for (int i2 = i1 + 1; i2 < sessions.size(); i2++)
-            {
-                for (int j2 = 0; j2 < sessions[i2].point_clouds_container.point_clouds.size(); j2++)
-                {
-                    Eigen::Affine3d pose_j = sessions[i2].point_clouds_container.point_clouds[j2].m_pose;
-
-                    if ((pose_i.translation() - pose_j.translation()).norm() < 10.0) // Example threshold for proximity
-                    {
-                        // found_edge = true;
-                        //  Create a loop closure edge between pose_i and pose_j
-                        /*Edge edge;
-                        edge.index_session_from = i1;
-                        edge.index_from = j1;
-                        edge.index_session_to = i2;
-                        edge.index_to = j2;
-
-                            // Initialize other edge parameters as needed
-                            edges.push_back(edge);*/
-
-                        Edge edge;
-
-                        edge.index_session_from = i1;
-                        edge.index_session_to = i2;
-
-                        edge.index_from = j1;
-                        edge.index_to = j2;
-
-                        std::cout << "Found loop closure edge between session " << i1 << " (pose " << j1 << ") and session " << i2
-                                  << " (pose " << j2 << ")" << std::endl;
-
-                        edge.relative_pose_tb = pose_tait_bryan_from_affine_matrix(
-                            sessions[edge.index_session_from].point_clouds_container.point_clouds[edge.index_from].m_pose.inverse() *
-                            sessions[edge.index_session_to].point_clouds_container.point_clouds[edge.index_to].m_pose);
-
-                        edge.relative_pose_tb_weights.px = 1.0;
-                        edge.relative_pose_tb_weights.py = 1.0;
-                        edge.relative_pose_tb_weights.pz = 1.0;
-                        edge.relative_pose_tb_weights.om = 1.0;
-                        edge.relative_pose_tb_weights.fi = 1.0;
-                        edge.relative_pose_tb_weights.ka = 1.0;
-
-                        edges.push_back(edge);
-
-                        // j1 += 20;
-                        // j2 += 20;
-                    }
-                }
-            } // for(int i2 = i1 + 1; i2 < sessions.size(); i2++)
-        } // for(int j1 = 0; j1 < sessions[i1].point_clouds_container.point_clouds.size(); j1++)
-    } // for(int i1 = 0; i1 < sessions.size(); i1++)
-}
-
-void icp_all_edges(std::vector<Session>& sessions, std::vector<Edge>& edges, float sr)
-{
-    std::cout << "icp_all_edges" << std::endl;
-
-    int number_of_iterations = 10;
-
-    for (size_t index_active_edge = 0; index_active_edge < edges.size(); index_active_edge++)
+        std::vector<Session> loaded;
+        for (const auto& path : project_settings.session_file_names)
+            loaded.push_back(readSessionForGui(path));
+        ValidateProjectScans(project_settings, loaded);
+        sessions = std::move(loaded);
+        loaded_sessions = true;
+        finishLoadingSessions();
+    } catch (const std::exception& error)
     {
-        PairWiseICP icp;
-        auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-
-        std::vector<Eigen::Vector3d> source;
-        auto& e = edges[index_active_edge];
-        for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-        {
-            int index_src = e.index_to + i;
-            if (index_src >= 0 &&
-                index_src < sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.size())
-            {
-                Eigen::Affine3d m_src =
-                    sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds.at(index_src).m_pose;
-                for (int k = 0; k <
-                     sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[index_src].points_local.size();
-                     k++)
-                {
-                    Eigen::Vector3d p_g = m_src *
-                        sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[index_src].points_local[k];
-                    source.push_back(p_g);
-                }
-                // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-            }
-        }
-        std::vector<Eigen::Vector3d> target;
-
-        for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-        {
-            int index_trg = e.index_from + i;
-            if (index_trg >= 0 &&
-                index_trg < sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.size())
-            {
-                Eigen::Affine3d m_trg =
-                    sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.at(index_trg).m_pose;
-                for (int k = 0; k < sessions[edges[index_active_edge].index_session_from]
-                                        .point_clouds_container.point_clouds[index_trg]
-                                        .points_local.size();
-                     k++)
-                {
-                    Eigen::Vector3d p_g = m_trg *
-                        sessions[edges[index_active_edge].index_session_from]
-                            .point_clouds_container.point_clouds[index_trg]
-                            .points_local[k];
-                    target.push_back(p_g);
-                }
-                // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-            }
-        }
-
-        Eigen::Affine3d m_src_inv =
-            sessions[edges[index_active_edge].index_session_to].point_clouds_container.point_clouds[e.index_to].m_pose.inverse();
-
-        for (auto& p : source)
-        {
-            p = m_src_inv * p;
-        }
-
-        Eigen::Affine3d m_trg_inv =
-            sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds[e.index_from].m_pose.inverse();
-
-        for (auto& p : target)
-        {
-            p = m_trg_inv * p;
-        }
-
-        if (icp.compute(source, target, sr, number_of_iterations, m_pose))
-            edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
+        showProjectError(error);
     }
 }
 
@@ -1967,6 +1519,7 @@ void settings_gui()
         ImGui::SameLine();
         if (ImGui::Button("Set to origin"))
         {
+            markProjectChanged();
             bool is_first_gt = false;
 
             if (sessions.size() > 0)
@@ -2256,11 +1809,13 @@ void settings_gui()
             {
                 if ((old_index_gt != index_gt) || (old_index_gizmo != index_gizmo))
                 {
-                    for (size_t i = 0; i < sessions.size(); i++)
+                    if (old_index_gt != index_gt)
                     {
-                        sessions[i].is_ground_truth = (i == index_gt);
-                        sessions[i].is_gizmo = (i == index_gizmo);
+                        SetProjectGroundTruth(sessions, index_gt);
+                        markProjectChanged();
                     }
+                    for (size_t i = 0; i < sessions.size(); i++)
+                        sessions[i].is_gizmo = (i == index_gizmo);
 
                     // set rotation center to gizmo
                     if (index_gizmo >= 0 && index_gizmo < sessions.size() &&
@@ -2301,97 +1856,333 @@ void settings_gui()
 
             ImGui::NewLine();
 
-            if (project_settings.session_file_names.size() == sessions.size())
-            {
-                number_visible_sessions = 0;
-
-                bool first_session_index_found = false;
-                visible_sessions = {};
-                for (size_t index = 0; index < sessions.size(); index++)
-                {
-                    if (sessions[index].visible)
-                    {
-                        visible_sessions.emplace(static_cast<int>(index));
-                        number_visible_sessions++;
-                        if (!first_session_index_found)
-                        {
-                            first_session_index = index;
-                            second_session_index = index;
-                            first_session_index_found = true;
-                        }
-                        else
-                        {
-                            second_session_index = index;
-                        }
-                    }
-                }
-
-                if (!is_loop_closure_gui)
-                {
-                    static int nr_iter = 100;
-                    ImGui::SetNextItemWidth(ImGuiNumberWidth);
-                    ImGui::InputInt("Number of iterations", &nr_iter);
-                    if (nr_iter < 1)
-                        nr_iter = 1;
-
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position x [px]", &motion_model_weights.px, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position y [py]", &motion_model_weights.py, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble("Motion Model Weight (1 sigma m): position z [pz]", &motion_model_weights.pz, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation om [om]", &motion_model_weights.om, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation fi [fi]", &motion_model_weights.fi, 0.0, 0.0, "%.3f");
-                    ImGui::InputDouble(
-                        "Motion Model Weight (1 sigma degree): orientation ka [ka]", &motion_model_weights.ka, 0.0, 0.0, "%.3f");
-
-                    std::string bn = "Optimize (number of iterations: " + std::to_string(nr_iter) + ")";
-
-                    if (ImGui::Button(bn.c_str()))
-                    {
-                        for (int i = 0; i < nr_iter; i++)
-                        {
-                            std::cout << "Iteration [" << i + 1 << "] of: " << nr_iter << std::endl;
-                            optimize(sessions, edges, motion_model_weights);
-                        }
-                        optimized = true;
-                    }
-
-                    // if (optimized)
-                    //{
-                    ImGui::SameLine();
-                    if (ImGui::Button("Revert"))
-                        revert(sessions);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Save results"))
-                        save_results(sessions);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Revert to initial"))
-                        revert_to_initial(sessions);
-                    //}
-
-                    if (ImGui::Button("Generate loop closures"))
-                    {
-                        generate_loop_closures(sessions, edges);
-                    }
-
-                    if (ImGui::Button("ICP all edges"))
-                    {
-                        icp_all_edges(sessions, edges, search_radius);
-                    }
-                    ImGui::SameLine();
-                    ImGui::InputDouble("search_radius", &search_radius);
-                    if (search_radius < 0.01)
-                        search_radius = 0.01;
-                }
-            }
+            refreshVisibleSessions();
         }
     }
 
     ImGui::End();
 }
 
+#ifdef HDMAPPING_GUI_BRIDGE
+namespace
+{
+    json projectParameters()
+    {
+        auto selection = json::array();
+        for (size_t i = 0; i < sessions.size(); ++i)
+            if (sessions[i].visible)
+                selection.push_back(i);
+        return { { "visible_sessions", std::move(selection) },
+                 { "sections",
+                   { { "xz", gui_xz_intersection },
+                     { "yz", gui_yz_intersection },
+                     { "xy", gui_xy_intersection },
+                     { "width", gui_intersection_width } } },
+                 { "graph_iterations", nr_iter },
+                 { "ndt_threads", ndt.number_of_threads },
+                 { "ndt_iterations", ndt.number_of_iterations },
+                 { "ndt_bucket_size", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+                 { "icp_search_radius", search_radius },
+                 { "decimate", is_decimate },
+                 { "load_buckets", { bucket_x, bucket_y, bucket_z } },
+                 { "time_offset", time_stamp_offset },
+                 { "motion_weights",
+                   { motion_model_weights.px,
+                     motion_model_weights.py,
+                     motion_model_weights.pz,
+                     motion_model_weights.om,
+                     motion_model_weights.fi,
+                     motion_model_weights.ka } },
+                 { "edge_range",
+                   { index_loop_closure_source, index_loop_closure_target, num_edge_extended_before, num_edge_extended_after } },
+                 { "active_edge", index_active_edge },
+                 { "ground_truth", index_gt } };
+    }
+
+    proc::StateSummary describeProject()
+    {
+        auto children = json::array();
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+            children.push_back(
+                { { "index", i },
+                  { "ground_truth", sessions[i].is_ground_truth },
+                  { "visible", sessions[i].visible },
+                  { "scans", sessions[i].point_clouds_container.point_clouds.size() } });
+        return { {},
+                 projectParameters(),
+                 { { "step", 3 },
+                   { "path", project_file_name },
+                   { "sessions", std::move(children) },
+                   { "edges", edges.size() },
+                   { "active_edges", proc::ProjectEdgesJson(edges) } } };
+    }
+
+    proc::MutationResult mutateProject(const proc::OperationRequest& request)
+    {
+        if (request.operation == "project.remove_session" || request.operation == "project.set_ground_truth")
+        {
+            if (!session_drag_preview_poses.empty())
+                return proc::OperationError{ "state_busy", "Finish the active pose edit before editing the project", json::object() };
+            try
+            {
+                proc::EditProject(request, project_settings, sessions);
+                if (request.operation == "project.remove_session")
+                    refreshProjectSessions();
+                else
+                    index_gt = old_index_gt = request.scope.at("session_index").get<int>();
+                return describeProject();
+            } catch (const std::exception& error)
+            {
+                return proc::OperationError{ "invalid_parameters", error.what(), json::object() };
+            }
+        }
+        if (proc::IsStep3Edit(request.operation))
+        {
+            if (!session_drag_preview_poses.empty() || (edge_gizmo && ImGuizmo::IsUsing()))
+                return proc::OperationError{ "state_busy", "Finish the active pose edit before editing the project", json::object() };
+            try
+            {
+                proc::EditStep3(request, project_settings, sessions);
+                if (request.operation == "project.constraints.remove" || request.operation == "project.constraints.replace" ||
+                    (index_active_edge >= 0 && !canEdgeBeActivated(index_active_edge)))
+                    resetProjectEdgeSelection();
+                else if (index_active_edge >= 0 && manipulate_active_edge)
+                    setActiveEdge(index_active_edge);
+                return describeProject();
+            } catch (const std::exception& error)
+            {
+                return proc::OperationError{ "invalid_parameters", error.what(), json::object() };
+            }
+        }
+        if (request.operation != "step3.set_parameters" || !request.scope.empty() || request.parameters.empty())
+            return proc::OperationError{ "invalid_request", "Expected project parameters and an empty scope", json::object() };
+        auto iterations = ndt.number_of_iterations;
+        auto threads = ndt.number_of_threads;
+        auto radius = search_radius;
+        std::array<float, 3> buckets{ ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] };
+        for (const auto& [key, value] : request.parameters.items())
+        {
+            if ((key == "ndt_threads" || key == "ndt_iterations") && value.is_number_integer() && value >= 1 &&
+                value <= std::numeric_limits<int>::max())
+                (key == "ndt_threads" ? threads : iterations) = value.get<int>();
+            else if (key == "icp_search_radius" && value.is_number() && value >= 0.01 && std::isfinite(value.get<double>()))
+                radius = value.get<double>();
+            else if (key == "ndt_bucket_size" && value.is_array() && value.size() == 3)
+            {
+                for (size_t i = 0; i < 3; ++i)
+                {
+                    if (!value[i].is_number() || value[i] < 0.01 || value[i] > std::numeric_limits<float>::max())
+                        return proc::OperationError{ "invalid_parameters", "Invalid NDT bucket size", json::object() };
+                    buckets[i] = value[i].get<float>();
+                }
+            }
+            else
+                return proc::OperationError{ "invalid_parameters", "Invalid project parameter: " + key, json::object() };
+        }
+        ndt.number_of_iterations = iterations;
+        ndt.number_of_threads = threads;
+        search_radius = radius;
+        std::copy(buckets.begin(), buckets.end(), ndt.bucket_size);
+        return describeProject();
+    }
+
+    json projectJob = json::object();
+    bool projectJobPending = false;
+    std::string projectJobError;
+
+    bool projectJobActive()
+    {
+        const auto status = projectJob.value("status", std::string{});
+        return projectJobPending || status == "preparing" || status == "queued" || status == "running" || status == "cancelling" ||
+            projectJob.value("gui_apply_status", std::string{}) == "pending";
+    }
+
+    void submitProjectJob(const proc::OperationRequest& request, bool mutate)
+    {
+        if (projectJobActive())
+            return;
+        static std::uint64_t sequence = 0;
+        const auto target = guiState->Target();
+        projectJob = json::object();
+        projectJobError.clear();
+        projectJobPending = guiConnection->RequestJob(
+            "jobs.submit",
+            { { "request_key", target.state_id + "-step3-" + std::to_string(++sequence) },
+              { "operation",
+                { { "operation", request.operation },
+                  { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                  { "scope", request.scope },
+                  { "parameters", request.parameters } } },
+              { "capture_source", target.state_id },
+              { "source", "gui" },
+              { "access", mutate ? "mutate" : "read" } });
+        if (!projectJobPending)
+            projectJobError = "Could not submit project job";
+    }
+
+    void pollProjectJob()
+    {
+        if (auto reply = guiConnection->TakeJobReply())
+        {
+            projectJobPending = false;
+            if (const auto* error = std::get_if<proc::OperationError>(&*reply))
+                projectJobError = error->message;
+            else
+            {
+                projectJobError.clear();
+                projectJob = std::get<json>(std::move(*reply));
+            }
+        }
+        if (!projectJobPending && projectJobActive())
+        {
+            static auto next_poll = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() >= next_poll)
+            {
+                projectJobPending = guiConnection->RequestJob("jobs.get", projectJob.at("job_id"));
+                next_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+            }
+        }
+    }
+
+    void drawProjectJob()
+    {
+        if (projectJob.empty() && !projectJobPending && projectJobError.empty())
+            return;
+        ImGui::Begin("Step 3 processing", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        const auto status = projectJob.value("status", std::string{});
+        const auto id = projectJob.value("job_id", std::string{});
+        ImGui::TextUnformatted(status.empty() ? (projectJobPending ? "Submitting" : "Failed") : status.c_str());
+        if (!id.empty())
+            ImGui::Text("Job %s", id.c_str());
+        if (projectJob.contains("progress") && projectJob.at("progress").is_object())
+        {
+            const auto& progress = projectJob.at("progress");
+            const auto stage = progress.value("stage", std::string{});
+            if (!stage.empty())
+                ImGui::TextUnformatted(stage.c_str());
+        }
+        const auto apply = projectJob.value("gui_apply_status", std::string{});
+        if (!apply.empty() && apply != "not_requested")
+            ImGui::Text("Workspace update: %s", apply.c_str());
+        if (projectJob.contains("error"))
+            ImGui::TextWrapped("%s", projectJob.at("error").value("message", "").c_str());
+        if (!projectJobError.empty())
+            ImGui::TextWrapped("%s", projectJobError.c_str());
+        if (status == "completed" && projectJob.contains("result"))
+        {
+            const auto& snapshot = projectJob.at("result").at("snapshot");
+            const auto manifest = sessionPathFromText(snapshot.at("manifest_path").get<std::string>());
+            const std::string_view operation = projectJob.at("request").at("operation").at("operation").get_ref<const std::string&>();
+            const auto path = operation == proc::project_export_operation ? manifest.parent_path() : manifest.parent_path() / "project.mjp";
+            ImGui::TextWrapped("%s", sessionPathText(path).c_str());
+        }
+        if (!projectJobPending && (status == "preparing" || status == "queued" || status == "running") && ImGui::Button("Cancel job"))
+            projectJobPending = guiConnection->RequestJob("jobs.cancel", id);
+        if (!projectJobActive() && ImGui::Button("Dismiss"))
+        {
+            projectJob = json::object();
+            projectJobError.clear();
+        }
+        ImGui::End();
+    }
+
+    bool sameProjectSessions(const proc::ProjectState& project)
+    {
+        if (sessions.size() != project.sessions.size())
+            return false;
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+        {
+            const auto& name = sessions[i].session_file_name;
+            const auto source = projectSources.find(name);
+            const auto new_source = project.sources.find(project.sessions[i].session_file_name);
+            if (new_source == project.sources.end() || new_source->second != (source == projectSources.end() ? name : source->second))
+                return false;
+        }
+        return true;
+    }
+
+    std::array<int, 4> projectEdgeEndpoints(const Edge& edge)
+    {
+        return { edge.index_session_from, edge.index_from, edge.index_session_to, edge.index_to };
+    }
+
+    void connectProject()
+    {
+        guiState = std::make_unique<proc::GuiStateBridge>(proc::GuiStateCallbacks{
+            describeProject,
+            mutateProject,
+            {},
+            [](const proc::ArtifactManifest& artifact) -> std::optional<proc::OperationError>
+            {
+                auto restored = proc::LoadProjectSnapshot(artifact.snapshot);
+                if (const auto* error = std::get_if<proc::OperationError>(&restored))
+                    return *error;
+                auto& project = std::get<proc::ProjectState>(restored);
+                const bool keep_loop_editor = is_loop_closure_gui && sameProjectSessions(project);
+                const int previous_edge = index_active_edge;
+                std::optional<std::array<int, 4>> previous_endpoints;
+                if (keep_loop_editor && canEdgeBeActivated(previous_edge))
+                    previous_endpoints = projectEdgeEndpoints(edges[previous_edge]);
+                const bool previous_manipulation = manipulate_active_edge;
+                const bool previous_gizmo = edge_gizmo;
+                project_settings = std::move(project.settings);
+                sessions = std::move(project.sessions);
+                projectSources = std::move(project.sources);
+                loaded_sessions = true;
+                refreshProjectSessions();
+                if (keep_loop_editor && (number_visible_sessions == 1 || number_visible_sessions == 2))
+                {
+                    is_loop_closure_gui = true;
+                    if (previous_endpoints && canEdgeBeActivated(previous_edge) &&
+                        *previous_endpoints == projectEdgeEndpoints(edges[previous_edge]))
+                    {
+                        manipulate_active_edge = previous_manipulation;
+                        edge_gizmo = previous_gizmo;
+                        setActiveEdge(previous_edge);
+                    }
+                }
+                updateProjectTitle(sessionPathText(artifact.snapshot.manifest_path.parent_path() / "project.mjp"));
+                return std::nullopt;
+            },
+            [](const proc::OperationRequest& request) -> std::unique_ptr<proc::CaptureSource>
+            {
+                if (request.operation == "project.open")
+                {
+                    static const std::vector<Session> empty;
+                    return std::make_unique<ProjectCapture>(request.target, empty, json::object(), json::object());
+                }
+                if (!proc::IsProjectOperation(request.operation) || sessions.size() != project_settings.session_file_names.size() ||
+                    !session_drag_preview_poses.empty() || (edge_gizmo && ImGuizmo::IsUsing()))
+                    return {};
+                return std::make_unique<ProjectCapture>(
+                    request.target, sessions, ProjectSettingsJson(project_settings), projectParameters(), false, projectSources);
+            },
+            {},
+            [](const json& scope)
+            {
+                return proc::ProjectItemsPage(sessions, edges, scope);
+            } });
+        guiConnection = std::make_unique<proc::GuiStateConnection>(*guiState, "multi_session_registration_step_3");
+    }
+} // namespace
+#endif
+
 void display()
 {
+#ifdef HDMAPPING_GUI_BRIDGE
+    static std::optional<json> previous;
+    const auto observed = []
+    {
+        return json::array({ projectParameters(), project_settings.session_file_names, edges.size(), loaded_sessions });
+    };
+    const auto current = observed();
+    if (previous && *previous != current)
+        guiState->Changed();
+    const auto before = guiState->Target();
+    guiConnection->Poll();
+    pollProjectJob();
+    previous = before == guiState->Target() ? current : observed();
+#endif
     syncSessionRenderers(sessions);
 
     ImGuiIO& io = ImGui::GetIO();
@@ -2856,6 +2647,24 @@ void display()
     rlImGuiBegin();
 
     ShowMainDockSpace();
+#ifdef HDMAPPING_GUI_BRIDGE
+    drawProjectJob();
+    if (guiState->Reserved())
+    {
+        if (IsFileDropped())
+        {
+            auto dropped = LoadDroppedFiles();
+            UnloadDroppedFiles(dropped);
+        }
+        view_kbd_shortcuts();
+        ImGui::TextUnformatted("Processing data reserved");
+        end3DAndDrawLabels();
+        if (compass_ruler)
+            drawMiniCompassWithRuler();
+        rlImGuiEnd();
+        return;
+    }
+#endif
 
     if (!is_loop_closure_gui)
     {
@@ -2869,6 +2678,7 @@ void display()
         // sees a pose change and rebuilds that session's GPU buffers.
         auto commit_session_poses = [](size_t i, const std::vector<Eigen::Affine3d>& candidate_poses)
         {
+            markProjectChanged();
             for (size_t j = 0; j < candidate_poses.size(); j++)
             {
                 auto& pc = sessions[i].point_clouds_container.point_clouds[j];
@@ -3046,7 +2856,14 @@ void display()
 
             const Eigen::Affine3d& m_src =
                 sessions[edges[index_active_edge].index_session_from].point_clouds_container.point_clouds.at(index_src).m_pose;
-            edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_src.inverse() * m_g);
+            const auto updated = pose_tait_bryan_from_affine_matrix(m_src.inverse() * m_g);
+#ifdef HDMAPPING_GUI_BRIDGE
+            const auto& previous = edges[index_active_edge].relative_pose_tb;
+            if (previous.px != updated.px || previous.py != updated.py || previous.pz != updated.pz || previous.om != updated.om ||
+                previous.fi != updated.fi || previous.ka != updated.ka)
+                guiState->Changed();
+#endif
+            edges[index_active_edge].relative_pose_tb = updated;
         }
     }
 
@@ -3134,6 +2951,10 @@ void display()
             if (ImGui::IsItemHovered() && !project_file_name.empty())
                 ImGui::SetTooltip("Current project: %s", project_file_name.c_str());
 
+#ifdef HDMAPPING_GUI_BRIDGE
+            if (ImGui::MenuItem("Save complete project", nullptr, nullptr, loaded_sessions && !sessions.empty() && !projectJobActive()))
+                submitProjectJob({ std::string(proc::project_export_operation), {}, json::object(), { { "format", "project" } } }, false);
+#endif
             ImGui::Separator();
 
             if (ImGui::MenuItem("Add session(s)", "Ctrl+A"))
@@ -3150,533 +2971,97 @@ void display()
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Overwrite the poses file of every session except ground truth");
 
-            if (ImGui::BeginMenu("Export trajectory as TUM", loaded_sessions && !sessions.empty()))
+            if (ImGui::BeginMenu("Export trajectory as TUM", loaded_sessions && !sessions.empty() && projectWorkAvailable()))
             {
-                for (size_t i = 0; i < sessions.size(); i++)
+                for (std::size_t i = 0; i < sessions.size(); ++i)
                 {
-                    const Session& session = sessions[i];
-                    // A point cloud session has no trajectory, only its scan pose
+                    const auto& session = sessions[i];
                     if (Session::is_point_cloud_file(session.session_file_name))
                         continue;
-
-                    const fs::path session_path(session.session_file_name);
-                    const std::string folder_name = session_path.parent_path().filename().string();
-                    const std::string label = folder_name + "/" + session_path.filename().string() + "##tum" + std::to_string(i);
+                    const auto session_path = sessionPathFromText(session.session_file_name);
+                    const auto folder_name = sessionPathText(session_path.parent_path().filename());
+                    const std::string label = folder_name + "/" + sessionPathText(session_path.filename()) + "##tum" + std::to_string(i);
                     if (ImGui::MenuItem(label.c_str()))
                     {
-                        const std::string output_file_name = mandeye::fd::SaveFileDialog(
+                        const auto output = mandeye::fd::SaveFileDialog(
                             "Export trajectory as TUM", mandeye::fd::Tum_filter, ".txt", folder_name + "_trajectory_tum.txt");
-                        if (!output_file_name.empty() && !save_session_trajectory_as_tum(session, output_file_name))
-                            pfd::message("Export failed", "Could not write '" + output_file_name + "'", pfd::choice::ok, pfd::icon::error);
+                        if (!output.empty() &&
+                            !proc::WriteProjectTrajectory(
+                                session, sessionPathFromText(output), "trajectory_tum", "lidar", "quaternion", true))
+                            pfd::message("Export failed", "Could not write '" + output + "'", pfd::choice::ok, pfd::icon::error);
                     }
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Save the current poses of one session as a TUM trajectory (t[s] x y z qx qy qz qw)");
 
-            ImGui::Separator();
-            if (ImGui::BeginMenu("Save all marked trajectories", sessions.size() > 0))
+            const auto trajectory_formats = [](bool publish)
             {
+                const auto export_files = [publish](json parameters, const std::string& suffix)
+                {
+#ifdef HDMAPPING_GUI_BRIDGE
+                    if (publish)
+                        return publish_project_files(parameters);
+#else
+                    static_cast<void>(publish);
+#endif
+                    export_project_files(parameters, suffix);
+                };
                 if (ImGui::MenuItem("Save all as las/laz files"))
+                    export_files({ { "format", "trajectory_laz" } }, "_trajectory_laz.laz");
+                for (const bool quaternion : { false, true })
                 {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string laz_path = (dir / (folder_name + "_trajectory_laz.laz")).string();
-
-                        std::cout << "Saving trajectory to LAZ: " << laz_path << std::endl;
-
-                        save_trajectories_to_laz(session, laz_path, 0.0f, 0.0f, false);
-                    }
-
-                    std::cout << "Finished saving all trajectories to .laz files." << std::endl;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("As one global scan");
-
-                ImGui::Separator();
-
-                ImGui::Text("(x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22)");
-                if (ImGui::MenuItem("Save all as csv (timestamp Lidar)##1"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampLidar_r.csv")).string();
-
-                        std::cout << "Saving trajectory to CSV: " << csv_path << std::endl;
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampLidar,x,y,z," << "r00,r01,r02," << "r10,r11,r12," << "r20,r21,r22\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Matrix3d rot = pose.rotation();
-
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.first << "," << std::setprecision(10)
-                                            << pos.x() << "," << pos.y() << "," << pos.z() << "," << rot(0, 0) << "," << rot(0, 1) << ","
-                                            << rot(0, 2) << "," << rot(1, 0) << "," << rot(1, 1) << "," << rot(1, 2) << "," << rot(2, 0)
-                                            << "," << rot(2, 1) << "," << rot(2, 2) << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-
-                    std::cout << "Finished saving all trajectories to CSV files." << std::endl;
-                }
-                if (ImGui::MenuItem("Save all as csv (timestamp Unix)##1"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampUnix_r.csv")).string();
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampUnix,x,y,z," << "r00,r01,r02,r10,r11,r12,r20,r21,r22\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Matrix3d rot = pose.rotation();
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.second << "," // Unix timestamp
-                                            << std::setprecision(10) << pos.x() << "," << pos.y() << "," << pos.z() << "," << rot(0, 0)
-                                            << "," << rot(0, 1) << "," << rot(0, 2) << "," << rot(1, 0) << "," << rot(1, 1) << ","
-                                            << rot(1, 2) << "," << rot(2, 0) << "," << rot(2, 1) << "," << rot(2, 2) << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-                }
-                if (ImGui::MenuItem("Save all as csv (timestamp Lidar, Unix)##1"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampLidarUnix_r.csv")).string();
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampLidar,timestampUnix,x,y,z," << "r00,r01,r02,r10,r11,r12,r20,r21,r22\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Matrix3d rot = pose.rotation();
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.first << "," // Lidar timestamp
-                                            << traj.timestamps.second << "," // Unix timestamp
-                                            << std::setprecision(10) << pos.x() << "," << pos.y() << "," << pos.z() << "," << rot(0, 0)
-                                            << "," << rot(0, 1) << "," << rot(0, 2) << "," << rot(1, 0) << "," << rot(1, 1) << ","
-                                            << rot(1, 2) << "," << rot(2, 0) << "," << rot(2, 1) << "," << rot(2, 2) << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-                }
-
-                ImGui::Separator();
-                ImGui::Text("(x,y,z,qx,qy,qz,qw)");
-
-                if (ImGui::MenuItem("Save all as csv (timestamp Lidar)##2"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampLidar_q.csv")).string();
-
-                        std::cout << "Saving trajectory to CSV: " << csv_path << std::endl;
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampLidar,x,y,z,qx,qy,qz,qw\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Quaterniond q(pose.rotation());
-
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.first << "," // Lidar timestamp
-                                            << std::setprecision(10) << pos.x() << "," << pos.y() << "," << pos.z() << "," << q.x() << ","
-                                            << q.y() << "," << q.z() << "," << q.w() << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-
-                    std::cout << "Finished saving all trajectories to CSV files." << std::endl;
-                }
-                if (ImGui::MenuItem("Save all as csv (timestamp Unix)##2"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampUnix_q.csv")).string();
-
-                        std::cout << "Saving trajectory to CSV: " << csv_path << std::endl;
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampUnix,x,y,z,qx,qy,qz,qw\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Quaterniond q(pose.rotation());
-
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.second << "," // Unix timestamp
-                                            << std::setprecision(10) << pos.x() << "," << pos.y() << "," << pos.z() << "," << q.x() << ","
-                                            << q.y() << "," << q.z() << "," << q.w() << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-
-                    std::cout << "Finished saving all trajectories to CSV files." << std::endl;
-                }
-                if (ImGui::MenuItem("Save all as csv (timestamp Lidar, Unix)##2"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string csv_path = (dir / (folder_name + "_trajectory_timestampLidarUnix_q.csv")).string();
-
-                        std::cout << "Saving trajectory to CSV: " << csv_path << std::endl;
-
-                        try
-                        {
-                            std::ofstream outfile(csv_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << csv_path << std::endl;
-                                continue;
-                            }
-
-                            outfile << "timestampLidar,timestampUnix,x,y,z,qx,qy,qz,qw\n";
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Quaterniond q(pose.rotation());
-
-                                    outfile << std::fixed << std::setprecision(0) << traj.timestamps.first << "," // Lidar timestamp
-                                            << traj.timestamps.second << "," // Unix timestamp
-                                            << std::setprecision(10) << pos.x() << "," << pos.y() << "," << pos.z() << "," << q.x() << ","
-                                            << q.y() << "," << q.z() << "," << q.w() << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << csv_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << csv_path << ": " << e.what() << std::endl;
-                        }
-                    }
-
-                    std::cout << "Finished saving all trajectories to CSV files." << std::endl;
+                    ImGui::Separator();
+                    ImGui::PushID(quaternion ? "quaternion" : "matrix");
+                    ImGui::TextUnformatted(quaternion ? "(x,y,z,qx,qy,qz,qw)" : "(x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22)");
+                    for (const auto& [label, timestamps, suffix] :
+                         { std::array{ "Save all as csv (timestamp Lidar)", "lidar", "Lidar" },
+                           std::array{ "Save all as csv (timestamp Unix)", "unix", "Unix" },
+                           std::array{ "Save all as csv (timestamp Lidar, Unix)", "both", "LidarUnix" } })
+                        if (ImGui::MenuItem(label))
+                            export_files(
+                                { { "format", "trajectory_csv" },
+                                  { "timestamps", timestamps },
+                                  { "pose", quaternion ? "quaternion" : "matrix" } },
+                                std::string("_trajectory_timestamp") + suffix + (quaternion ? "_q.csv" : "_r.csv"));
+                    ImGui::PopID();
                 }
                 if (ImGui::MenuItem("Save all as TUM TXT"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-                        Session& session = sessions[i];
-                        std::filesystem::path dir = std::filesystem::path(session_path).parent_path();
-                        std::string folder_name = dir.filename().string();
-                        std::string txt_path = (dir / (folder_name + "_trajectory_tum.txt")).string();
-
-                        std::cout << "Saving trajectory to TUM TXT: " << txt_path << std::endl;
-                        try
-                        {
-                            std::ofstream outfile(txt_path);
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << txt_path << std::endl;
-                                continue;
-                            }
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-                                    Eigen::Vector3d pos = pose.translation();
-                                    Eigen::Quaterniond q(pose.rotation());
-
-                                    double t_s = static_cast<double>(traj.timestamps.first) / 1e9;
-
-                                    outfile << std::fixed << std::setprecision(9) << t_s << " " << std::setprecision(10) << pos.x() << " "
-                                            << pos.y() << " " << pos.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
-                                            << "\n";
-                                }
-                            }
-
-                            outfile.close();
-                            std::cout << "Saved: " << txt_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << txt_path << ": " << e.what() << std::endl;
-                        }
-                    }
-                    std::cout << "Finished saving all trajectories to TUM TXT files." << std::endl;
-                }
+                    export_files({ { "format", "trajectory_tum" }, { "sort_tum", false } }, "_trajectory_tum.txt");
+            };
+            if (ImGui::BeginMenu("Save all marked trajectories", projectWorkAvailable()))
+            {
+                trajectory_formats(false);
                 if (ImGui::MenuItem("Save all as TUM TXT (single folder)"))
-                {
-                    for (size_t i = 0; i < project_settings.session_file_names.size(); ++i)
-                    {
-                        const auto& session_path = project_settings.session_file_names[i];
-
-                        if (i >= sessions.size())
-                        {
-                            std::cerr << "No loaded session for: " << session_path << std::endl;
-                            continue;
-                        }
-
-                        Session& session = sessions[i];
-
-                        std::filesystem::path session_dir = std::filesystem::path(session_path).parent_path();
-
-                        std::filesystem::path base_dir = session_dir.parent_path();
-
-                        std::filesystem::path output_dir = base_dir / "all_tum_files";
-
-                        try
-                        {
-                            std::filesystem::create_directories(output_dir);
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Failed to create export directory: " << e.what() << std::endl;
-                            continue;
-                        }
-
-                        std::string folder_name = session_dir.filename().string();
-
-                        std::filesystem::path txt_path = output_dir / (folder_name + "_trajectory_tum.txt");
-
-                        std::cout << "Saving trajectory to TUM TXT: " << txt_path << std::endl;
-
-                        try
-                        {
-                            std::ofstream outfile(txt_path);
-
-                            if (!outfile.is_open())
-                            {
-                                std::cerr << "Failed to create file: " << txt_path << std::endl;
-                                continue;
-                            }
-
-                            for (const auto& pc : session.point_clouds_container.point_clouds)
-                            {
-                                if (!pc.visible)
-                                    continue;
-
-                                for (const auto& traj : pc.local_trajectory)
-                                {
-                                    Eigen::Affine3d pose = pc.m_pose * traj.m_pose;
-
-                                    Eigen::Vector3d pos = pose.translation();
-
-                                    Eigen::Quaterniond q(pose.rotation());
-
-                                    double t_s = static_cast<double>(traj.timestamps.first) / 1e9;
-
-                                    outfile << std::fixed << std::setprecision(9) << t_s << " " << std::setprecision(10) << pos.x() << " "
-                                            << pos.y() << " " << pos.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
-                                            << "\n";
-                                }
-                            }
-
-                            outfile.close();
-
-                            std::cout << "Saved: " << txt_path << std::endl;
-                        } catch (const std::exception& e)
-                        {
-                            std::cerr << "Error creating " << txt_path << ": " << e.what() << std::endl;
-                        }
-                    }
-                    std::cout << "Finished saving all trajectories to single folder." << std::endl;
-                }
-
+                    export_project_files({ { "format", "trajectory_tum" }, { "sort_tum", false } }, "_trajectory_tum.txt", true);
                 ImGui::EndMenu();
             }
+#ifdef HDMAPPING_GUI_BRIDGE
+            if (ImGui::BeginMenu("Publish project exports", projectWorkAvailable()))
+            {
+                if (ImGui::MenuItem("Session poses"))
+                    publish_project_files({ { "format", "poses" } });
+                if (ImGui::MenuItem("Marked point clouds as LAS"))
+                    publish_project_files({ { "format", "las" } });
+                if (ImGui::MenuItem("Marked point clouds as LAZ"))
+                    publish_project_files({ { "format", "laz" } });
+                if (ImGui::MenuItem("Marked trajectories as LAS"))
+                    publish_project_files({ { "format", "trajectory_las" } });
+                if (ImGui::BeginMenu("Trajectories"))
+                {
+                    trajectory_formats(true);
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("Sections"))
+                {
+                    for (const auto* plane : { "xy", "xz", "yz" })
+                        if (ImGui::MenuItem(plane))
+                            publish_project_files(
+                                { { "format", "section_laz" }, { "plane", plane }, { "width_m", gui_intersection_width } });
+                    ImGui::EndMenu();
+                }
+                ImGui::EndMenu();
+            }
+#endif
 
             ImGui::EndMenu();
         }
@@ -3699,7 +3084,8 @@ void display()
                 ImGui::EndTooltip();
             }
 
-            // bool prev_is_loop_closure_gui
+            if (ImGui::MenuItem("Optimize GRAPH", nullptr, false, projectWorkAvailable()))
+                optimizeProjectFromGui();
             ImGui::MenuItem(
                 "Manual Loop Closure", "Ctrl+M", &is_loop_closure_gui, (number_visible_sessions == 1 || number_visible_sessions == 2));
             if (ImGui::IsItemHovered())
@@ -3722,24 +3108,27 @@ void display()
             changed |= ImGui::MenuItem("10m grid##xz", nullptr, &gui_xz_grid_10x10);
             changed |= ImGui::MenuItem("1m grid##xz", nullptr, &gui_xz_grid_1x1);
             changed |= ImGui::MenuItem("0.1m grid##xz", nullptr, &gui_xz_grid_01x01);
-            if (ImGui::MenuItem("Export xz intersection", nullptr, false, gui_xz_intersection))
-                export_intersection_all_sessions(true, false, false, "_xz_intersection.laz");
+            if (ImGui::MenuItem("Export xz intersection", nullptr, false, gui_xz_intersection && projectWorkAvailable()))
+                export_project_files(
+                    { { "format", "section_laz" }, { "plane", "xz" }, { "width_m", gui_intersection_width } }, "_xz_intersection.laz");
 
             ImGui::Separator();
             changed |= ImGui::MenuItem("yz_intersection", nullptr, &gui_yz_intersection);
             changed |= ImGui::MenuItem("10m grid##yz", nullptr, &gui_yz_grid_10x10);
             changed |= ImGui::MenuItem("1m grid##yz", nullptr, &gui_yz_grid_1x1);
             changed |= ImGui::MenuItem("0.1m grid##yz", nullptr, &gui_yz_grid_01x01);
-            if (ImGui::MenuItem("Export yz intersection", nullptr, false, gui_yz_intersection))
-                export_intersection_all_sessions(false, true, false, "_yz_intersection.laz");
+            if (ImGui::MenuItem("Export yz intersection", nullptr, false, gui_yz_intersection && projectWorkAvailable()))
+                export_project_files(
+                    { { "format", "section_laz" }, { "plane", "yz" }, { "width_m", gui_intersection_width } }, "_yz_intersection.laz");
 
             ImGui::Separator();
             changed |= ImGui::MenuItem("xy_intersection", nullptr, &gui_xy_intersection);
             changed |= ImGui::MenuItem("10m grid##xy", nullptr, &gui_xy_grid_10x10);
             changed |= ImGui::MenuItem("1m grid##xy", nullptr, &gui_xy_grid_1x1);
             changed |= ImGui::MenuItem("0.1m grid##xy", nullptr, &gui_xy_grid_01x01);
-            if (ImGui::MenuItem("Export xy intersection", nullptr, false, gui_xy_intersection))
-                export_intersection_all_sessions(false, false, true, "_xy_intersection.laz");
+            if (ImGui::MenuItem("Export xy intersection", nullptr, false, gui_xy_intersection && projectWorkAvailable()))
+                export_project_files(
+                    { { "format", "section_laz" }, { "plane", "xy" }, { "width_m", gui_intersection_width } }, "_xy_intersection.laz");
 
             if (changed)
             {
@@ -3918,26 +3307,12 @@ void display()
 
                 if (session_marked_for_removal[idx])
                 {
-                    std::cout << "Removing session: " << project_settings.session_file_names[idx] << std::endl;
-
-                    project_settings.session_file_names.erase(project_settings.session_file_names.begin() + idx);
-
-                    if (idx < sessions.size())
-                    {
-                        sessions.erase(sessions.begin() + idx);
-                        session_drag_preview_poses.clear();
-                    }
+                    RemoveProjectSession(project_settings, sessions, idx);
                 }
             }
             session_marked_for_removal.clear();
-
-            if (!sessions.empty())
-                update_timestamp_offset();
-            else
-            {
-                loaded_sessions = false;
-                time_stamp_offset = 0.0;
-            }
+            refreshProjectSessions();
+            markProjectChanged();
 
             ImGui::CloseCurrentPopup();
         }
@@ -4013,7 +3388,11 @@ void mouse(int glut_button, int state, int x, int y)
             !manipulate_active_edge)
         {
             // if (s_loop_closure_gui)
-            if ((sessions.size() > 0) && (number_visible_sessions > 0) && update_rotation_center)
+            if ((sessions.size() > 0) && (number_visible_sessions > 0) && update_rotation_center
+#ifdef HDMAPPING_GUI_BRIDGE
+                && !guiState->Reserved()
+#endif
+            )
             {
                 getClosestTrajectoriesPoint(
                     sessions,
@@ -4125,7 +3504,7 @@ int main(int argc, char* argv[])
         if (!project_file.empty())
         {
             setLocationHintFromFile(project_file);
-            loadProject(project_file, project_settings);
+            loadProject(project_file);
         }
         if (!session_files.empty())
             setLocationHintFromFile(session_files.back());
@@ -4136,7 +3515,14 @@ int main(int argc, char* argv[])
         if (added)
             loadSessions();
 
+#ifdef HDMAPPING_GUI_BRIDGE
+        connectProject();
+#endif
         mainLoop();
+#ifdef HDMAPPING_GUI_BRIDGE
+        SetWindowState(FLAG_WINDOW_HIDDEN);
+        guiConnection->Close();
+#endif
 
         releaseSessionRenderers();
         shutdownGL();

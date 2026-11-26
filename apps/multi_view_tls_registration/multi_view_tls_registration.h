@@ -1,6 +1,8 @@
 
 #pragma once
 
+#include "step2_session_exports.h"
+
 #include <filesystem>
 #include <regex>
 
@@ -129,7 +131,7 @@ struct TLSRegistration
     bool save_trajectories_laz = false; // Save laz with all trajectories
     bool save_gnss_laz = false; // Save laz with GNSS data
     bool save_scale_board_laz = false; // Save laz with scale board
-    float scale_board_dec = 0.1; // Decimation for scale board laz export
+    float scale_board_dec = 0.1f; // Decimation for scale board laz export
     float scale_board_side_len = -1.0; // Range covered in x and y dimensions
     bool save_initial_poses = false; // Path where initial poses are saved
     bool save_poses = false; // Path where poses are saved
@@ -149,29 +151,5 @@ bool has_extension(const std::string file_path, const std::string extension);
 void initial_pose_to_identity(Session& session);
 
 void save_separately_to_las(const Session& session, fs::path outwd, std::string extension = ".las");
-
-void save_trajectories_to_laz(
-    const Session& session,
-    std::string output_file_name,
-    float curve_consecutive_distance_meters,
-    float not_curve_consecutive_distance_meters,
-    bool is_trajectory_export_downsampling);
-
-void save_scale_board_to_laz(const Session& session, std::string output_file_name, float dec, float side_len = -1.0);
-
-bool createDXFPolyline(const std::string& filename, const std::vector<Eigen::Vector3d>& points);
-
-// void load_available_geo_points(Session& session, std::string input_file_name);
-
-bool save_trajectories(
-    Session& session,
-    std::string output_file_name,
-    float curve_consecutive_distance_meters,
-    float not_curve_consecutive_distance_meters,
-    bool is_trajectory_export_downsampling,
-    bool write_lidar_timestamp = true,
-    bool write_unix_timestamp = false,
-    bool use_quaternions = true,
-    bool save_to_dxf = false);
 
 void run_multi_view_tls_registration(std::string input_file_name, TLSRegistration& tls_registration, std::string output_dir = "");

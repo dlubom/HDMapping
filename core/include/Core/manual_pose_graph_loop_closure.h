@@ -45,9 +45,23 @@ public:
     ManualPoseGraphLoopClosure() = default;
     ~ManualPoseGraphLoopClosure() = default;
 
+    //! Set the motion model and optimize over the edges, GNSS, GCPs and CPs.
+    bool compute_pose_graph_slam(
+        PointClouds& point_clouds_container,
+        GNSS& gnss,
+        GroundControlPoints& gcps,
+        ControlPoints& cps,
+        const std::function<bool(int, int)>& continue_iteration = {});
+
 #if WITH_GUI == 1
-    //! "Compute Pose Graph SLAM": sets the motion model, then graph_slam() over the edges, GNSS, GCPs and CPs.
-    void compute_pose_graph_slam(PointClouds& point_clouds_container, GNSS& gnss, GroundControlPoints& gcps, ControlPoints& cps);
+    struct Actions
+    {
+        std::function<bool(int, int)> add;
+        std::function<bool(int)> remove;
+        std::function<void()> optimize;
+        std::function<void(double, int, bool)> icp;
+        std::function<void(const char*)> align_reference;
+    };
     void Gui(
         PointClouds& point_clouds_container,
         int& index_loop_closure_source,
@@ -58,7 +72,9 @@ public:
         GroundControlPoints& gcps,
         ControlPoints& cps,
         int num_edge_extended_before,
-        int num_edge_extended_after);
+        int num_edge_extended_after,
+        void (*cache_edited)() = nullptr,
+        const Actions* actions = nullptr);
     void Render(
         PointClouds& point_clouds_container,
         int index_loop_closure_source,
@@ -70,6 +86,6 @@ private:
     //! Runs the next "ICP all edges" step; finishes the run after the last one.
     void icp_all_edges_step(PointClouds& point_clouds_container, int num_edge_extended_before, int num_edge_extended_after);
     //! The "ICP all edges" button, start radius and progress.
-    void icp_all_edges_gui();
+    void icp_all_edges_gui(const Actions* actions);
 #endif
 };

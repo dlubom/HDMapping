@@ -19,6 +19,9 @@ set(HD_CPU_OPTIMIZATION "AUTO" CACHE STRING "CPU optimization target (AUTO, INTE
 set_property(CACHE HD_CPU_OPTIMIZATION PROPERTY STRINGS AUTO INTEL AMD ARM GENERIC)
 
 # Options to enable / disable specific components
+option(BUILD_WITH_MCP "Build the local MCP runtime" ON)
+# Packaging scripts consume a normalized boolean, including -DBUILD_WITH_MCP=1/YES.
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/hdmapping-mcp-enabled.txt" CONTENT "$<BOOL:${BUILD_WITH_MCP}>\n")
 option(BUILD_WITH_CLI_TOOLS "Build with command line tools" OFF)
 option(BUILD_WITH_HD_MAPPER_APPLICATION "Build with hd_mapper tool" OFF)
 option(BUILD_WITH_UTILITY_APPLICATION "Enable build of utility applications" OFF)
@@ -101,6 +104,21 @@ include(cmake/implot.cmake)
 # ============================================================================
 include(cmake/dependencies.cmake)
 
+# The GUI and worker resolve this asset beside their executable.
+get_property(_bow_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+set(_bow_bin "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+if(_bow_multi_config)
+    string(APPEND _bow_bin "/$<CONFIG>")
+endif()
+set(_bow_source "${THIRDPARTY_DIRECTORY}/fbow/vocabularies/orb_mur.fbow")
+set(_bow_file "${_bow_bin}/hdmapping-orb-mur.fbow")
+add_custom_command(OUTPUT "${_bow_file}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bow_bin}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${_bow_source}" "${_bow_file}"
+    DEPENDS "${_bow_source}" VERBATIM)
+add_custom_target(hdmapping_bow_vocabulary DEPENDS "${_bow_file}")
+install(FILES "${_bow_source}" DESTINATION bin RENAME hdmapping-orb-mur.fbow COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+
 # raylib/imgui_raylib/rlimgui/imguizmo_raylib targets, needed before
 # add_subdirectory(core) below since core's own CMakeLists.txt defines a
 # core_raylib target (holding shared raylib rendering/camera/picking code,
@@ -127,6 +145,18 @@ if(BUILD_TESTING)
     add_subdirectory(calib_core/tests)
     add_subdirectory(apps/lidar_odometry_step_1/tests)
     add_subdirectory(rosbags/tests)
+endif()
+
+if(BUILD_WITH_MCP)
+    include(cmake/processing_quality.cmake)
+    if(HDMAPPING_PROCESSING_SANITIZER STREQUAL "thread")
+        # The native reader instantiates oneTBB's task completion atomics in core_no_gui.
+        target_compile_options(core_no_gui PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(core_no_gui INTERFACE -fsanitize=thread)
+    endif()
+    add_subdirectory(processing)
+    add_subdirectory(apps/hdmapping_worker)
+    add_subdirectory(apps/hdmapping_mcp)
 endif()
 
 set(CORE_LIBRARIES core)

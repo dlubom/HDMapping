@@ -55,9 +55,17 @@ public:
         double bucket_y,
         double bucket_z,
         bool load_cache_mode);
-    bool update_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name);
+    bool update_poses_from_RESSO(
+        const std::string& folder_with_point_clouds,
+        const std::filesystem::path& poses_file_name,
+        bool strict = false,
+        bool utf8_paths = false);
     bool update_poses_from_RESSO_inverse(const std::string& folder_with_point_clouds, const std::string& poses_file_name);
-    bool update_initial_poses_from_RESSO(const std::string& folder_with_point_clouds, const std::string& poses_file_name);
+    bool update_initial_poses_from_RESSO(
+        const std::string& folder_with_point_clouds,
+        const std::filesystem::path& poses_file_name,
+        bool strict = false,
+        bool utf8_paths = false);
     bool load_eth(
         const std::string& folder_with_point_clouds,
         const std::string& poses_file_name,
@@ -84,8 +92,8 @@ public:
         int viewer_reduce_rendered_trajectory,
         PointClouds::PointCloudDimensions dims = {});
 #endif
-    // bool save_poses();
-    bool save_poses(const std::string file_name, bool is_subsession);
+    //! Write native RESSO poses. Private snapshots can preserve full precision and initial poses.
+    bool save_poses(const std::filesystem::path& file_name, bool is_subsession, bool initial = false, bool full_precision = false);
     bool save_scans();
     void show_all();
     void show_all_from_range(int index_begin, int index_end);
@@ -102,7 +110,9 @@ public:
         double bucket_y,
         double bucket_z,
         bool calculate_offset,
-        bool load_cache_mode);
+        bool load_cache_mode,
+        bool utf8_paths = false,
+        bool strict_trajectory = false);
     PointCloudDimensions compute_point_cloud_dimension() const;
     void print_point_cloud_dimension();
     bool load_3DTK_tls(std::vector<std::string> input_file_names, bool is_decimate, double bucket_x, double bucket_y, double bucket_z);

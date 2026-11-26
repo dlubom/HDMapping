@@ -2,6 +2,8 @@
 
 #include <Eigen/Eigen>
 
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -62,9 +64,21 @@ public:
     struct LocalTrajectoryNode
     {
         std::pair<double, double> timestamps; // <lidar_timestamp, unix_timestamp>
-        Eigen::Affine3d m_pose;
-        Eigen::Vector3d imu_om_fi_ka;
-        Eigen::Vector3d imu_diff_angle_om_fi_ka_deg;
+        Eigen::Affine3d m_pose = Eigen::Affine3d::Identity();
+        Eigen::Vector3d imu_om_fi_ka = Eigen::Vector3d::Zero();
+        Eigen::Vector3d imu_diff_angle_om_fi_ka_deg = Eigen::Vector3d::Zero();
+    };
+
+    struct DeferredPoints
+    {
+        enum class Format
+        {
+            Ply,
+            Las
+        };
+
+        Format format;
+        std::filesystem::path source;
     };
 
     PointCloud()
@@ -82,12 +96,14 @@ public:
         gizmo = false;
     }
 
-    ~PointCloud() = default;
-
     GridParameters rgd_params;
     std::vector<PointBucketIndexPair> index_pairs;
     std::vector<Bucket> buckets;
     std::string file_name;
+    //! Original name used by Step 2 exchange formats after switching to a published cache path.
+    std::string source_scan_name;
+    //! Source of points skipped by the native loader, until it reads the geometry.
+    std::optional<DeferredPoints> deferred_points;
     // True when file_name does not exist on disk yet (e.g. scan imported from E57);
     // "Save session as" in step 2 exports the cloud as .laz next to the session.
     bool laz_in_memory_only = false;
@@ -102,7 +118,7 @@ public:
     std::vector<int> points_type;
     std::vector<unsigned short> intensities;
     std::vector<double> timestamps;
-    Eigen::Affine3d m_pose_temp;
+    Eigen::Affine3d m_pose_temp = Eigen::Affine3d::Identity();
     Eigen::Affine3d m_pose;
     Eigen::Affine3d m_initial_pose;
     Eigen::Matrix<double, 6, 6, Eigen::RowMajor> covariance_matrix_tait_bryan;
@@ -140,7 +156,7 @@ public:
     bool fixed_ka = false;
 
     bool load(const std::string& file_name);
-    bool load_pc(const std::string& input_file_name, bool load_cache_mode);
+    bool load_pc(const std::string& input_file_name, bool load_cache_mode, bool utf8_path = false);
     void update_from_gui();
     bool save_as_global(const std::string& file_name);
     // rgd

@@ -35,6 +35,16 @@ function(hdmapping_install_app)
             message(FATAL_ERROR "hdmapping_install_app: no such target '${target_name}'")
         endif()
 
+        get_target_property(_hdmapping_imported ${target_name} IMPORTED)
+        if(_hdmapping_imported)
+            # Go executables have no CMake-managed RPATH. PROGRAMS preserves
+            # executable permissions, the native suffix, component and DESTDIR.
+            install(PROGRAMS "$<TARGET_FILE:${target_name}>" DESTINATION bin
+                RENAME "${HDMAPPING_BINARY_PREFIX}$<TARGET_FILE_NAME:${target_name}>"
+                COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+            continue()
+        endif()
+
         install(TARGETS ${target_name} RUNTIME DESTINATION bin COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
 
         # Declared after the install(TARGETS) above and in the same directory,

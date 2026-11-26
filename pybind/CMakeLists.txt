@@ -82,6 +82,7 @@ target_sources(lidar_odometry_py
 target_sources(multi_view_tls_registration_py
     PRIVATE
         ${CMAKE_SOURCE_DIR}/apps/multi_view_tls_registration/multi_view_tls_registration.cpp
+        ${CMAKE_SOURCE_DIR}/apps/multi_view_tls_registration/step2_session_exports.cpp
 )
 
 target_sources(multi_session_registration_py

@@ -111,18 +111,48 @@ static void report_lidar_gaps(
         std::cerr << "WARNING:   ... and " << lines.size() - kMaxLines << " more\n";
 }
 
+void set_lidar_odometry_default_params(LidarOdometryParams& params)
+{
+    params.decimation = 0.01;
+    params.in_out_params_indoor.resolution_X = 0.1;
+    params.in_out_params_indoor.resolution_Y = 0.1;
+    params.in_out_params_indoor.resolution_Z = 0.1;
+
+    params.in_out_params_outdoor.resolution_X = 0.3;
+    params.in_out_params_outdoor.resolution_Y = 0.3;
+    params.in_out_params_outdoor.resolution_Z = 0.3;
+
+    params.filter_threshold_xy_inner = 0.3;
+    params.filter_threshold_xy_outer = 70.0;
+    params.threshould_output_filter = 0.3;
+
+    params.use_robust_and_accurate_lidar_odometry = false;
+    params.distance_bucket = 0.2;
+    params.polar_angle_deg = 10.0;
+    params.azimutal_angle_deg = 10.0;
+    params.robust_and_accurate_lidar_odometry_iterations = 20;
+
+    params.max_distance_lidar = 70.0;
+    params.nr_iter = 1000;
+    params.sliding_window_trajectory_length_threshold = 200;
+    params.real_time_threshold_seconds = 10;
+}
+
 bool load_data(
     std::vector<std::string>& input_file_names,
     LidarOdometryParams& params,
     std::vector<std::vector<Point3Di>>& pointsPerFile,
     Imu& imu_data,
-    bool debugMsg)
+    bool debugMsg,
+    const OdometryControl& control,
+    const fs::path& working_directory_override)
 {
     if (!params.run_report || params.run_report->live().status != "running")
         params.run_report = std::make_shared<RunReport>(
             input_file_names.empty() ? fs::path{} : fs::path(input_file_names.front()).parent_path(), params.points_global_spill_directory);
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Loading);
     HDMAP_ZONE_SCOPE("load_data");
+    const bool validate = !working_directory_override.empty();
     std::sort(input_file_names.begin(), input_file_names.end());
     std::vector<std::string> csv_files, laz_files;
     std::string sn_file;
@@ -165,6 +195,7 @@ bool load_data(
         }
     }
 
+    bool has_missing_chunk = false;
     auto get4index = [](const std::string& path) -> std::string
     {
         auto s = fs::path(path).stem().string();
@@ -188,6 +219,7 @@ bool load_data(
 
         if (!found)
         {
+            has_missing_chunk = true;
             std::cout << "\n!!! there is no CSV file for: " << laz_files[i] << " !!! \n\n";
         }
     }
@@ -209,11 +241,17 @@ bool load_data(
 
         if (!found)
         {
+            has_missing_chunk = true;
             std::cout << "\n!!! there is no LAZ file for: " << csv_files[i] << " !!! \n\n";
         }
     }
 
-    if (input_file_names.size() > 2)
+    if (validate && (has_missing_chunk || laz_files.size() != csv_files.size() || laz_files.empty()))
+        throw std::invalid_argument("Recording needs matched LiDAR and IMU file pairs");
+    if (control.stop.stop_requested())
+        return false;
+
+    if (validate || input_file_names.size() > 2)
     {
         std::string working_directory = fs::path(input_file_names.front()).parent_path().string();
 
@@ -228,7 +266,7 @@ bool load_data(
         }
 
         // --- Calibration and IMU setup
-        const auto preloadedCalibration = MLvxCalib::GetCalibrationFromFile(calibrationFile);
+        const auto preloadedCalibration = MLvxCalib::GetCalibrationFromFile(calibrationFile, validate);
         const std::string imuSnToUse = MLvxCalib::GetImuSnToUse(calibrationFile);
         const auto idToSn = MLvxCalib::GetIdToSnMapping(sn_file);
 
@@ -261,6 +299,8 @@ bool load_data(
 
             if (hasError)
             {
+                if (validate)
+                    throw std::invalid_argument("Invalid calibration or missing sensor serial number");
                 std::cerr << "Press ENTER to exit...\n";
                 std::cin.get();
                 std::exit(EXIT_FAILURE);
@@ -308,9 +348,14 @@ bool load_data(
             {
                 for (size_t i = range.begin(); i < range.end(); ++i)
                 {
-                    imuChunks[i] = load_imu(csv_files[i].c_str(), imuNumberToUse);
+                    if (control.stop.stop_requested())
+                        return;
+                    imuChunks[i] = load_imu(csv_files[i].c_str(), imuNumberToUse, validate, control.stop);
                 }
             });
+
+        if (control.stop.stop_requested())
+            return false;
 
         // Merge all chunks sequentially at the end
         for (auto& chunk : imuChunks)
@@ -339,11 +384,18 @@ bool load_data(
                 murataFiles.size(),
                 [&](size_t i)
                 {
-                    murataChunks[i] = load_imu(murataFiles[i], imuNumberToUse);
+                    if (control.stop.stop_requested())
+                        return;
+                    murataChunks[i] = load_imu(murataFiles[i], imuNumberToUse, validate, control.stop);
                 });
             for (auto& chunk : murataChunks)
                 imu_data.insert(imu_data.end(), std::make_move_iterator(chunk.begin()), std::make_move_iterator(chunk.end()));
         }
+
+        if (control.stop.stop_requested())
+            return false;
+        if (validate && imu_data.empty())
+            throw std::invalid_argument("Recording contains no usable IMU samples");
 
         // Sort once after merging
         std::sort(
@@ -374,9 +426,10 @@ bool load_data(
 
         // --- Working directories
 
-        fs::path wdp = fs::path(working_directory) / "preview";
+        const auto workspace = working_directory_override.empty() ? fs::path(working_directory) : working_directory_override;
+        fs::path wdp = workspace / "preview";
         params.working_directory_preview = wdp.string();
-        fs::path wdp_cache = fs::path(working_directory) / "cache";
+        fs::path wdp_cache = workspace / "cache";
         params.working_directory_cache = wdp_cache.string();
 
         params.raw_cloud_loader.reset();
@@ -391,9 +444,9 @@ bool load_data(
             L.file_size.assign(minSize, 0);
             L.file_time.assign(minSize, fs::file_time_type{});
             const std::vector<std::string> files = L.files;
-            L.load = [files, inner, outer, combinedCalibration](size_t i)
+            L.load = [files, inner, outer, combinedCalibration, validate, stop = control.stop](size_t i)
             {
-                auto data = load_point_cloud(files[i].c_str(), true, inner, outer, combinedCalibration);
+                auto data = load_point_cloud(files[i].c_str(), true, inner, outer, combinedCalibration, nullptr, validate, stop);
                 std::sort(
                     data.begin(),
                     data.end(),
@@ -414,6 +467,8 @@ bool load_data(
                 minSize,
                 [&](size_t i)
                 {
+                    if (control.stop.stop_requested())
+                        return;
                     std::error_code ec;
                     L.file_size[i] = fs::file_size(L.files[i], ec);
                     L.file_time[i] = fs::last_write_time(L.files[i], ec);
@@ -426,12 +481,16 @@ bool load_data(
                     }
                     gaps_in_file[i] = find_lidar_gaps(data, kLidarGapWarningS);
                 });
+            if (control.stop.stop_requested())
+                return false;
             report_lidar_gaps(L.files, gaps_in_file, L.t_first, L.t_last);
             if (params.save_calibration_validation && minSize > 0) // as the eager load: the first file, then dropped
                 write_calibration_validation(wdp, L.load(0), params);
             size_t totalPoints = 0;
             for (auto k : L.n)
                 totalPoints += k;
+            if (validate && totalPoints == 0)
+                throw std::invalid_argument("Recording contains no usable LiDAR points");
             std::cout << "TOTAL: " << totalPoints << " (lazy: ranges recorded, clouds loaded on demand)\n..loading finished.\n\n";
             return true;
         }
@@ -445,10 +504,19 @@ bool load_data(
             minSize,
             [&](size_t i)
             {
+                if (control.stop.stop_requested())
+                    return;
                 const std::string& fn = laz_files[i];
 
                 auto data = load_point_cloud(
-                    fn.c_str(), true, params.filter_threshold_xy_inner, params.filter_threshold_xy_outer, combinedCalibration);
+                    fn.c_str(),
+                    true,
+                    params.filter_threshold_xy_inner,
+                    params.filter_threshold_xy_outer,
+                    combinedCalibration,
+                    nullptr,
+                    validate,
+                    control.stop);
 
                 std::sort(
                     data.begin(),
@@ -472,6 +540,8 @@ bool load_data(
                 // Store results
                 pointsPerFile[i] = std::move(data);
             });
+        if (control.stop.stop_requested())
+            return false;
         report_lidar_gaps(laz_files, gaps_in_file, t_first, t_last);
 
         if (pointsPerFile.size() > 0)
@@ -482,6 +552,8 @@ bool load_data(
         for (const auto& pp : pointsPerFile)
             totalPoints += pp.size();
 
+        if (validate && totalPoints == 0)
+            throw std::invalid_argument("Recording contains no usable LiDAR points");
         std::cout << "TOTAL: " << totalPoints << "\n..loading finished.\n\n";
         return true;
     }
@@ -492,7 +564,7 @@ bool load_data(
     }
 }
 
-void calculate_trajectory(Trajectory& trajectory, Imu& imu_data, LidarOdometryParams& params, bool debugMsg)
+void calculate_trajectory(Trajectory& trajectory, Imu& imu_data, LidarOdometryParams& params, bool debugMsg, const OdometryControl& control)
 {
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Initialization);
     HDMAP_ZONE_SCOPE("calculate_trajectory");
@@ -534,6 +606,8 @@ void calculate_trajectory(Trajectory& trajectory, Imu& imu_data, LidarOdometryPa
 
         for (const auto& [timestamp_pair, gyr, acc] : imu_data)
         {
+            if (control.stop.stop_requested())
+                return;
             const double g = 9.80665;
             vqf_real_t gyr_vqf[3] = { static_cast<double>(gyr.x()), static_cast<double>(gyr.y()), static_cast<double>(gyr.z()) };
             vqf_real_t acc_vqf[3] = { static_cast<double>(acc.x()) * g,
@@ -618,6 +692,8 @@ void calculate_trajectory(Trajectory& trajectory, Imu& imu_data, LidarOdometryPa
 
         for (const auto& [timestamp_pair, gyr, acc] : imu_data)
         {
+            if (control.stop.stop_requested())
+                return;
             const FusionVector gyroscope = { static_cast<float>(gyr.x() * RAD_TO_DEG) - static_cast<float>(bias_gyr_x),
                                              static_cast<float>(gyr.y() * RAD_TO_DEG) - static_cast<float>(bias_gyr_y),
                                              static_cast<float>(gyr.z() * RAD_TO_DEG) - static_cast<float>(bias_gyr_z) };
@@ -664,7 +740,8 @@ bool compute_step_1(
     LidarOdometryParams& params,
     Trajectory& trajectory,
     std::vector<WorkerData>& worker_data,
-    const std::atomic<bool>& pause)
+    const std::atomic<bool>& pause,
+    const OdometryControl& control)
 {
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Cache);
     HDMAP_ZONE_SCOPE("compute_step_1");
@@ -693,7 +770,7 @@ bool compute_step_1(
     }
     for (size_t fi = 0; fi < pointsPerFile.size(); fi++)
     {
-        if (!lazy_ensure(loader, ppf, fi))
+        if (control.stop.stop_requested() || !lazy_ensure(loader, ppf, fi))
             return false;
         const auto& pp = pointsPerFile[fi];
         // number_of_points += pp.size();
@@ -741,9 +818,13 @@ bool compute_step_1(
         return false;
     }
 
-    int threshold = params.threshold_nr_poses;
-
-    const int n_iter = poses.size() / threshold;
+    const int threshold = params.threshold_nr_poses;
+    if (threshold <= 0 || poses.size() < static_cast<size_t>(threshold))
+    {
+        std::cerr << "Too few poses to prepare an odometry window" << std::endl;
+        return false;
+    }
+    const size_t n_iter = poses.size() / static_cast<size_t>(threshold);
     worker_data.clear();
     worker_data.reserve(n_iter);
 
@@ -757,6 +838,10 @@ bool compute_step_1(
 
     for (size_t i = 0; i < n_iter; i++)
     {
+        if (control.stop.stop_requested())
+            return false;
+        if (control.progress && i % 50 == 0)
+            control.report("prepare", i, n_iter);
         if (i % 50 == 0)
             std::cout << "\rrunning iterations: " << i + 1 << "/" << n_iter << std::endl << std::flush;
 
@@ -828,7 +913,7 @@ bool compute_step_1(
         }
 
         // correct points timestamps
-        if (wd.intermediate_trajectory_timestamps.size() > 2)
+        if (!points.empty() && wd.intermediate_trajectory_timestamps.size() > 2)
         {
             double ts_begin = wd.intermediate_trajectory_timestamps[0].first;
             double ts_step = (wd.intermediate_trajectory_timestamps[wd.intermediate_trajectory_timestamps.size() - 1].first -
@@ -908,7 +993,7 @@ bool compute_step_1(
         {
             if (params.run_report)
                 params.run_report->pause(true);
-            while (pause)
+            while (pause && !control.stop.stop_requested())
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             if (params.run_report)
                 params.run_report->pause(false);
@@ -918,18 +1003,27 @@ bool compute_step_1(
     std::cout << "\rrunning iterations: " << n_iter << " (done)" << std::flush;
     std::cout << std::endl;
 
+    if (worker_data.empty())
+    {
+        std::cerr << "No odometry window has enough time-aligned LiDAR points" << std::endl;
+        return false;
+    }
+    control.report("prepare", n_iter, n_iter);
     if (params.run_report)
         params.run_report->cachePrepared();
     params.m_g = worker_data[0].intermediate_trajectory[0];
     return true;
 }
 
-void run_consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params)
+void run_consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params, const OdometryControl& control)
 {
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Consistency);
     std::cout << "Point cloud consistency and trajectory smoothness START" << std::endl;
     for (int i = 0; i < params.num_constistency_iter; i++)
     {
+        if (control.stop.stop_requested())
+            return;
+        control.report("consistency", static_cast<size_t>(i), static_cast<size_t>(params.num_constistency_iter));
         std::cout << "Iteration " << i + 1 << " of " << params.num_constistency_iter << std::endl;
         for (int ii = 0; ii < worker_data.size(); ii++)
         {
@@ -937,11 +1031,11 @@ void run_consistency(std::vector<WorkerData>& worker_data, const LidarOdometryPa
         }
         if (!params.use_mutliple_gaussian)
         {
-            Consistency(worker_data, params);
+            Consistency(worker_data, params, control.stop);
         }
         else
         {
-            Consistency2(worker_data, params);
+            Consistency2(worker_data, params, control.stop);
         }
     }
     std::cout << "Point cloud consistency and trajectory smoothness FINISHED" << std::endl;
@@ -951,7 +1045,11 @@ void run_consistency(std::vector<WorkerData>& worker_data, const LidarOdometryPa
 }
 
 static bool write_result_files(
-    std::vector<WorkerData>& worker_data, LidarOdometryParams& params, const fs::path& outwd, double elapsed_time_s)
+    std::vector<WorkerData>& worker_data,
+    LidarOdometryParams& params,
+    const fs::path& outwd,
+    double elapsed_time_s,
+    const OdometryControl& control)
 {
     bool success = true;
     HDMAP_ZONE_SCOPE("save_result");
@@ -967,6 +1065,8 @@ static bool write_result_files(
     int original_points_to_save_counter = 0;
     for (int i = 0; i < worker_data.size(); i++)
     {
+        if (control.stop.stop_requested())
+            return false;
         std::vector<Point3Di> original_points; // = worker_data[i].load_points(worker_data[i].original_points_cache_file_name);
         if (!load_vector_data(worker_data[i].original_points_cache_file_name.string(), original_points))
         {
@@ -1088,6 +1188,9 @@ static bool write_result_files(
     std::vector<std::vector<int>> index_poses;
     for (int i = 0; i < worker_data_concatenated.size(); i++)
     {
+        if (control.stop.stop_requested())
+            return false;
+        control.report("save", static_cast<size_t>(i), worker_data_concatenated.size());
         std::cout << "------------------------" << std::endl;
         fs::path path(outwd);
         std::string filename = ("scan_lio_" + std::to_string(i) + ".laz");
@@ -1261,7 +1364,12 @@ static bool write_result_files(
     return success;
 }
 
-bool save_result(std::vector<WorkerData>& worker_data, LidarOdometryParams& params, fs::path outwd, double elapsed_time_s)
+bool save_result(
+    std::vector<WorkerData>& worker_data,
+    LidarOdometryParams& params,
+    fs::path outwd,
+    double elapsed_time_s,
+    const OdometryControl& control)
 {
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Export);
     if (params.run_report)
@@ -1272,7 +1380,7 @@ bool save_result(std::vector<WorkerData>& worker_data, LidarOdometryParams& para
     bool success = false;
     try
     {
-        success = write_result_files(worker_data, params, outwd, elapsed_time_s);
+        success = write_result_files(worker_data, params, outwd, elapsed_time_s, control);
     } catch (const std::exception& error)
     {
         if (params.run_report)
@@ -1289,7 +1397,7 @@ bool save_result(std::vector<WorkerData>& worker_data, LidarOdometryParams& para
     return save_processing_results_json(params, outwd, elapsed_time_s) && success;
 }
 
-void filter_reference_buckets(LidarOdometryParams& params)
+void filter_reference_buckets(LidarOdometryParams& params, std::stop_token stop)
 {
     std::scoped_lock lock(params.mutex_buckets_indoor, params.mutex_buckets_outdoor);
     ++params.buckets_indoor_revision;
@@ -1297,6 +1405,8 @@ void filter_reference_buckets(LidarOdometryParams& params)
     NDTBucketMapType reference_buckets_out;
     for (const auto& b : params.buckets_indoor)
     {
+        if (stop.stop_requested())
+            return;
         if (b.second.number_of_points > 10)
         {
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen_solver(b.second.cov, Eigen::ComputeEigenvectors);
@@ -1319,6 +1429,8 @@ void filter_reference_buckets(LidarOdometryParams& params)
     NDTBucketMapType reference_buckets_out2;
     for (const auto& b : params.buckets_indoor)
     {
+        if (stop.stop_requested())
+            return;
         if (b.second.number_of_points > 10)
         {
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen_solver(b.second.cov, Eigen::ComputeEigenvectors);
@@ -1339,21 +1451,25 @@ void filter_reference_buckets(LidarOdometryParams& params)
     params.buckets_outdoor = reference_buckets_out2;
 }
 
-void save_trajectory_to_ascii(std::vector<WorkerData>& worker_data, std::string output_file_name)
+bool save_trajectory_to_ascii(const std::vector<WorkerData>& worker_data, const fs::path& output_file_name, std::stop_token stop)
 {
     ofstream file;
     file.open(output_file_name);
     for (const auto& wd : worker_data)
     {
+        if (stop.stop_requested())
+            return false;
         for (const auto& it : wd.intermediate_trajectory)
         {
             file << it(0, 3) << " " << it(1, 3) << " " << it(2, 3) << std::endl;
         }
     }
     file.close();
+    return static_cast<bool>(file);
 }
 
-void load_reference_point_clouds(const std::vector<std::string>& input_file_names, LidarOdometryParams& params)
+bool load_reference_point_clouds(
+    const std::vector<std::string>& input_file_names, LidarOdometryParams& params, const OdometryControl& control)
 {
     std::scoped_lock lock(params.mutex_buckets_indoor, params.mutex_buckets_outdoor);
     ++params.buckets_indoor_revision;
@@ -1367,15 +1483,19 @@ void load_reference_point_clouds(const std::vector<std::string>& input_file_name
 
     for (size_t i = 0; i < input_file_names.size(); i++)
     {
+        if (control.stop.stop_requested())
+            return false;
+        control.report("reference", i, input_file_names.size());
         std::cout << "loading reference point cloud from: " << input_file_names[i] << std::endl;
-        auto pp = load_point_cloud(input_file_names[i].c_str(), false, 0, 10000, {});
+        auto pp =
+            load_point_cloud(input_file_names[i].c_str(), false, 0, 10000, {}, nullptr, static_cast<bool>(control.progress), control.stop);
         std::cout << "loaded " << pp.size() << " reference points" << std::endl;
         params.reference_points.insert(std::end(params.reference_points), std::begin(pp), std::end(pp));
     }
 
     update_rgd(params.in_out_params_indoor, params.buckets_indoor, params.reference_points);
     update_rgd(params.in_out_params_outdoor, params.buckets_outdoor, params.reference_points);
-    // params.buckets_indoor = params.reference_buckets;
+    return !params.reference_points.empty();
 }
 
 std::string save_results_automatic(

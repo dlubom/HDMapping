@@ -1,24 +1,10 @@
 #include <pch/pch.h>
 
 #include <Core/tum.h>
+#include <HDMapping/SessionPaths.h>
 
 #include <Eigen/Eigen>
 #include <spdlog/spdlog.h>
-
-namespace
-{
-    void split(const std::string& str, char delim, std::vector<std::string>& out)
-    {
-        size_t start;
-        size_t end = 0;
-
-        while ((start = str.find_first_not_of(delim, end)) != std::string::npos)
-        {
-            end = str.find(delim, start);
-            out.push_back(str.substr(start, end - start));
-        }
-    }
-} // namespace
 
 bool TUM::load_data_from_tum(const std::vector<std::string>& input_file_names, bool subtract_first_pose)
 {
@@ -32,43 +18,24 @@ bool TUM::load_data_from_tum(const std::vector<std::string>& input_file_names, b
 
     for (const auto& fn : input_file_names)
     {
-        std::ifstream infile(fn);
+        std::ifstream infile(sessionPathFromText(fn));
         if (!infile.good())
         {
             std::cout << "problem with file: '" << fn << "'" << std::endl;
             return false;
         }
-        std::string s;
-        while (!infile.eof())
+        std::string line;
+        while (std::getline(infile, line))
         {
-            getline(infile, s);
-
-            if (s.empty() || s[0] == '#')
-            {
+            TumPose pose{};
+            std::istringstream fields(line);
+            if (!(fields >> pose.timestamp >> pose.x >> pose.y >> pose.z >> pose.qx >> pose.qy >> pose.qz >> pose.qw))
                 continue;
-            }
-
-            std::vector<std::string> strs;
-            split(s, ' ', strs);
-
-            if (strs.size() >= 8)
-            {
-                TUM::TumPose tp;
-                std::istringstream(strs[0]) >> tp.timestamp;
-                std::istringstream(strs[1]) >> tp.x;
-                std::istringstream(strs[2]) >> tp.y;
-                std::istringstream(strs[3]) >> tp.z;
-                std::istringstream(strs[4]) >> tp.qx;
-                std::istringstream(strs[5]) >> tp.qy;
-                std::istringstream(strs[6]) >> tp.qz;
-                std::istringstream(strs[7]) >> tp.qw;
-
-                if (std::isfinite(tp.x) && std::isfinite(tp.y) && std::isfinite(tp.z) && std::isfinite(tp.qx) && std::isfinite(tp.qy) &&
-                    std::isfinite(tp.qz) && std::isfinite(tp.qw))
-                {
-                    tum_poses.push_back(tp);
-                }
-            }
+            const Eigen::Vector3d position(pose.x, pose.y, pose.z);
+            const Eigen::Quaterniond rotation(pose.qw, pose.qx, pose.qy, pose.qz);
+            if (std::isfinite(pose.timestamp) && position.allFinite() && rotation.coeffs().allFinite() &&
+                std::isfinite(rotation.squaredNorm()) && rotation.squaredNorm() > 0.0)
+                tum_poses.push_back(pose);
         }
         infile.close();
     }

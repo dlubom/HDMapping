@@ -3,10 +3,16 @@
 name: Build with bundled libraries on Ubuntu
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "mcp/**" ]
   pull_request:
     branches: [ "main" ]
+
+# A PR and its branch push validate the same head; keep one active run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
@@ -17,6 +23,10 @@ jobs:
     # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
     # You can convert this to a matrix build if you need cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["ON"]') }}
     runs-on: ubuntu-24.04
 
     steps:
@@ -27,6 +37,7 @@ jobs:
 
     - uses: actions/checkout@v4
       with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
         submodules: true
     
     - name: Install CMake 4.0
@@ -38,10 +49,28 @@ jobs:
     - name: Fix pkg-config visibility
       run: echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
+    - name: Install processing quality tools
+      if: matrix.mcp == 'ON'
+      run: |
+        sudo apt-get install -y --no-install-recommends clang-18 clang-tidy-18 libclang-rt-18-dev xvfb xauth libgl1-mesa-dri
+        python3 -m venv "$RUNNER_TEMP/processing-format"
+        "$RUNNER_TEMP/processing-format/bin/pip" install clang-format==21.1.8
+        echo "$RUNNER_TEMP/processing-format/bin" >> "$GITHUB_PATH"
+        clang++-18 --version
+        clang-tidy-18 --version
+
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON ${{ matrix.mcp == 'OFF' && '-DBUILD_WITH_MCP=OFF -DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }} -DHDMAPPING_MCP_RACE=${{ matrix.mcp }} -DCMAKE_EXPORT_COMPILE_COMMANDS=${{ matrix.mcp }} -DHDMAPPING_PROCESSING_TIDY=${{ matrix.mcp }}
+
+    - name: Check MCP quality
+      if: matrix.mcp == 'ON'
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target mcp-check mcp-check-controls mcp-race
+
+    - name: Analyze processing targets and verify the quality gates
+      if: matrix.mcp == 'ON'
+      run: cmake --build build --target processing-tidy processing-check-controls
 
     - name: Build
       # Build your program with the given configuration
@@ -51,5 +80,30 @@ jobs:
       working-directory: ${{github.workspace}}/build
       # Execute tests defined by the CMake configuration.
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -C ${{env.BUILD_TYPE}}
+      run: ctest -C ${{env.BUILD_TYPE}} --output-on-failure
 
+    - name: Check live GUI state RPC
+      if: matrix.mcp == 'ON'
+      run: xvfb-run -a -s '-screen 0 1920x1080x24' python3 processing/tests/gui_state_process.py build/bin
+
+    - name: Check installed product relocation
+      run: python3 scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }}
+
+    - name: Verify ASan and UBSan
+      if: matrix.mcp == 'ON'
+      run: |
+        cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+          -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=address-undefined
+        cmake --build build-asan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test processing_constraints_test processing_georeference_test processing_loop_candidates_test processing_segments_test processing_session_io_test processing_project_io_test processing_step3_test hdmapping_worker processing-check-controls --parallel 2
+        ctest --test-dir build-asan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration|constraints|georeference|loop-candidates|segments|session-io|project-io|step3|project-export)' --output-on-failure
+        printf '{"type":"describe"}\n' | build-asan/bin/hdmapping_worker
+
+    - name: Verify TSan separately
+      if: matrix.mcp == 'ON' && !cancelled()
+      run: |
+        # Follow synchronization in the native reader's oneTBB scheduler and
+        # in spdlog's lazy default logger initialization.
+        cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+          -DBUILD_WITH_MCP=ON -DBUILD_TESTING=ON -DHDMAPPING_PROCESSING_SANITIZER=thread -DTBB_SANITIZE=thread -DSPDLOG_SANITIZE_THREAD=ON
+        cmake --build build-tsan --target processing_runtime_test processing_snapshot_test processing_publication_test processing_state_test processing_step1_test processing_step2_registration_test processing_constraints_test processing_georeference_test processing_loop_candidates_test processing_segments_test processing_session_io_test processing_project_io_test processing_step3_test processing-check-controls --parallel 2
+        ctest --test-dir build-tsan -L 'processing-(runtime|snapshot|publication|state|step1|step2-registration|constraints|georeference|loop-candidates|segments|session-io|project-io|step3|project-export)' --output-on-failure

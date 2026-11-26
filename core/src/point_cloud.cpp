@@ -1,7 +1,10 @@
 #include <pch/pch.h>
 
+#include <memory>
+
 #include <Core/point_cloud.h>
 #include <Core/transformations.h>
+#include <HDMapping/SessionPaths.h>
 
 #if WITH_GUI == 1
 #include <GL/freeglut.h>
@@ -86,10 +89,11 @@ bool PointCloud::load(const std::string& file_name)
 
 #endif
     std::cout << "File: '" << file_name << "' loaded" << std::endl;
+    deferred_points.reset();
     return true;
 }
 
-bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mode)
+bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mode, bool utf8_path)
 {
     double min_ts = std::numeric_limits<double>::max();
     double max_ts = std::numeric_limits<double>::lowest();
@@ -102,12 +106,29 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         return false;
     }
 
+    bool opened = false;
+    const auto destroy_reader = [&opened](void* reader)
+    {
+        if (opened)
+        {
+            laszip_close_reader(reader);
+        }
+        laszip_destroy(reader);
+    };
+    std::ifstream input;
+    const std::unique_ptr<void, decltype(destroy_reader)> owner(laszip_reader, destroy_reader);
     laszip_BOOL is_compressed = 0;
-    if (laszip_open_reader(laszip_reader, input_file_name.c_str(), &is_compressed))
+    if (utf8_path)
+    {
+        input.open(sessionPathFromText(input_file_name), std::ios::binary);
+    }
+    if (utf8_path ? (!input || laszip_open_reader_stream(laszip_reader, input, &is_compressed) != 0)
+                  : laszip_open_reader(laszip_reader, input_file_name.c_str(), &is_compressed) != 0)
     {
         spdlog::error(":DLL ERROR: opening laszip reader for '{}'", input_file_name);
         return false;
     }
+    opened = true;
     laszip_header* header;
 
     if (laszip_get_header_pointer(laszip_reader, &header))
@@ -158,7 +179,6 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         if (laszip_read_point(laszip_reader))
         {
             spdlog::error("DLL ERROR: reading point {}", p_count);
-            laszip_close_reader(laszip_reader);
             return false;
         }
 
@@ -198,14 +218,11 @@ bool PointCloud::load_pc(const std::string& input_file_name, bool load_cache_mod
         p_count++;
     }
 
-    laszip_close_reader(laszip_reader);
-    // laszip_clean(laszip_reader);
-    // laszip_destroy(laszip_reader);
-
     // std::cout << std::setprecision(20);
     // std::cout << "min_ts " << min_ts << std::endl;
     // std::cout << "max_ts " << max_ts << std::endl;
     // std::cout << "number_of_points_with_timestamp_eq_0: " << number_of_points_with_timestamp_eq_0 << std::endl;
+    deferred_points.reset();
     return true;
 }
 
@@ -256,38 +273,20 @@ void build_rgd_init_job(int i, PointCloud::Job* job, std::vector<PointCloud::Buc
 void build_rgd_job(
     int i, PointCloud::Job* job, std::vector<PointCloud::PointBucketIndexPair>* index_pair, std::vector<PointCloud::Bucket>* buckets)
 {
-    for (uint64_t ii = job->index_begin_inclusive; ii < job->index_end_exclusive; ii++)
+    const auto& pairs = *index_pair;
+    for (uint64_t ind = job->index_begin_inclusive; ind < job->index_end_exclusive; ++ind)
     {
-        uint64_t ind = ii;
-        if (ind == 0)
+        const auto bucket_index = pairs[ind].index_of_bucket;
+        // Only the first and last points of each sorted run write its endpoints.
+        if (ind == 0 || pairs[ind - 1].index_of_bucket != bucket_index)
         {
-            uint64_t index_of_bucket = (*index_pair)[ind].index_of_bucket;
-            uint64_t index_of_bucket_1 = (*index_pair)[ind + 1].index_of_bucket;
-
-            (*buckets)[index_of_bucket].index_begin = ind;
-            if (index_of_bucket != index_of_bucket_1)
-            {
-                (*buckets)[index_of_bucket].index_end = ind + 1;
-                (*buckets)[index_of_bucket_1].index_end = ind + 1;
-            }
+            (*buckets)[bucket_index].index_begin = ind;
         }
-        else if (ind == (*buckets).size() - 1)
-        {
-            if ((*index_pair)[ind].index_of_bucket < (*buckets).size())
-            {
-                (*buckets)[(*index_pair)[ind].index_of_bucket].index_end = ind + 1;
-            }
-        }
-        else if (ind + 1 < (*index_pair).size())
-        {
-            uint64_t index_of_bucket = (*index_pair)[ind].index_of_bucket;
-            uint64_t index_of_bucket_1 = (*index_pair)[ind + 1].index_of_bucket;
 
-            if (index_of_bucket != index_of_bucket_1)
-            {
-                (*buckets)[index_of_bucket].index_end = ind + 1;
-                (*buckets)[index_of_bucket_1].index_begin = ind + 1;
-            }
+        const auto next = ind + 1;
+        if (next == pairs.size() || pairs[next].index_of_bucket != bucket_index)
+        {
+            (*buckets)[bucket_index].index_end = next;
         }
     }
 }

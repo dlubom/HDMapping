@@ -21,6 +21,13 @@ find_dylib_in_build() {
         echo "build/lib/$dylib_name"
         return
     fi
+
+    # Dependency fixups revisit bundled libraries. Avoid traversing the whole
+    # build tree (including Go caches) again for each already copied library.
+    if [ -e "build/HDMapping/lib/$dylib_name" ]; then
+        echo "build/HDMapping/lib/$dylib_name"
+        return
+    fi
     
     # Search recursively in build directory (including symlinks)
     local found=$(find build -name "$dylib_name" \( -type f -o -type l \) 2>/dev/null | head -1)
@@ -30,6 +37,33 @@ find_dylib_in_build() {
     fi
     
     echo ""
+}
+
+# Resolve a dylib's runpath before flattening the dependency tree into lib/.
+resolve_dylib_runpath() {
+    local dylib_path="$1"
+    local relative_dep="$2"
+    local loader_dir=$(dirname "$dylib_path")
+    local runpath
+    while IFS= read -r runpath; do
+        case "$runpath" in
+            @loader_path) runpath="$loader_dir" ;;
+            @loader_path/*) runpath="$loader_dir/${runpath#@loader_path/}" ;;
+            /*) ;;
+            *) continue ;;
+        esac
+        if [ -f "$runpath/$relative_dep" ]; then
+            printf '%s\n' "$runpath/$relative_dep"
+            return 0
+        fi
+    done < <(otool -l "$dylib_path" | awk '
+        $1 == "cmd" { is_rpath = ($2 == "LC_RPATH") }
+        is_rpath && $1 == "path" {
+            sub(/^[[:space:]]*path /, "")
+            sub(/ \(offset [0-9]+\)$/, "")
+            print
+        }')
+    return 1
 }
 
 # Function to copy a dylib and fix its install name
@@ -87,8 +121,18 @@ bundle_dylib() {
     echo "  ✓ Bundled: $dylib_name"
     
     # Recursively bundle dependencies of this dylib
-    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@rpath" | grep -v "@loader_path")
+    local deps=$(otool -L "$dylib_path" | grep -v ":" | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System")
+    local loader_dir=$(dirname "$dylib_path")
     for dep in $deps; do
+        # Resolve against the original dylib while its source path is known.
+        if [[ "$dep" == "@loader_path/"* ]]; then
+            dep="$loader_dir/${dep#@loader_path/}"
+        elif [[ "$dep" == "@rpath/"* ]]; then
+            local resolved
+            if resolved=$(resolve_dylib_runpath "$dylib_path" "${dep#@rpath/}"); then
+                dep="$resolved"
+            fi
+        fi
         local dep_name=$(basename "$dep")
         if [[ "$dep" == *".dylib"* ]]; then
             # Try the original path first, then search
@@ -152,8 +196,9 @@ fix_binary_dylibs() {
             if [ "$is_dylib" = false ]; then
                 # For executables, change to @executable_path/../lib
                 install_name_tool -change "$dep" "@executable_path/../lib/$dep_name" "$binary" 2>/dev/null || true
+            elif [[ "$dep" != "@loader_path/$dep_name" ]]; then
+                install_name_tool -change "$dep" "@loader_path/$dep_name" "$binary" 2>/dev/null || true
             fi
-            # For dylibs, @loader_path is already correct
         elif [[ "$dep" == "@executable_path/"* ]]; then
             # Already uses @executable_path
             dep_name=$(basename "$dep")
@@ -207,12 +252,33 @@ BINARY_COUNT=0
 for binary in "$BUILD_BIN_DIR"/*; do
     if [ -f "$binary" ] && [ -x "$binary" ]; then
         binary_name=$(basename "$binary")
+        case "$binary_name" in
+            hdmapping_mcp|hdmapping_coordinator|hdmapping_worker)
+                grep -q '^1$' build/hdmapping-mcp-enabled.txt || continue
+                ;;
+        esac
         cp "$binary" "$BUNDLE_DIR/bin/"
         chmod +x "$BUNDLE_DIR/bin/$binary_name"
         echo "  ✓ $binary_name"
         BINARY_COUNT=$((BINARY_COUNT + 1))
     fi
 done
+if grep -q '^1$' build/hdmapping-mcp-enabled.txt; then
+    for binary_name in hdmapping_mcp hdmapping_coordinator hdmapping_worker; do
+        if [ ! -x "$BUNDLE_DIR/bin/$binary_name" ]; then
+            echo "Error: MCP enabled but $binary_name was not built"
+            exit 1
+        fi
+    done
+fi
+cp "build/bin/hdmapping-orb-mur.fbow" "$BUNDLE_DIR/bin/" || exit 1
+if ! IFS= read -r PROJ_DATABASE < build/hdmapping-proj-database.txt || [ ! -f "$PROJ_DATABASE" ]; then
+    echo "Error: the PROJ database selected by CMake is missing. Configure with the complete PROJ package."
+    exit 1
+fi
+# The bundled dylib resolves its database relative to lib/.
+mkdir -p "$BUNDLE_DIR/share/proj"
+cp "$PROJ_DATABASE" "$BUNDLE_DIR/share/proj/proj.db"
 echo "  Total: $BINARY_COUNT executables copied"
 
 echo -e "${YELLOW}Step 3: Detecting and bundling dynamic libraries...${NC}"
@@ -276,9 +342,17 @@ else
     echo "  ⚠ README.txt not copied"
 fi
 
-echo -e "${YELLOW}Step 6: Code signing bundle...${NC}"
-# Ad-hoc signing for local use
-codesign --force --deep --sign - "$BUNDLE_DIR" 2>/dev/null && echo "  ✓ Bundle signed (ad-hoc)" || echo "  ⚠ Signing failed (bundle may still work)"
+echo -e "${YELLOW}Step 6: Verifying and signing bundled Mach-O files...${NC}"
+# install_name_tool can invalidate a Mach-O signature. Repair it after all fixups.
+for binary in "$BUNDLE_DIR/bin/"* "$BUNDLE_DIR/lib/"*.dylib; do
+    if [ -f "$binary" ] && [ ! -L "$binary" ] && file -b "$binary" | grep -q '^Mach-O'; then
+        if ! codesign --verify --strict "$binary" 2>/dev/null; then
+            codesign --force --sign - "$binary"
+            codesign --verify --strict "$binary"
+        fi
+    fi
+done
+echo "  ✓ Bundled Mach-O signatures verified"
 
 echo ""
 echo -e "${GREEN}=====================================${NC}"
@@ -293,6 +367,7 @@ echo "Structure:"
 echo "  $BUNDLE_DIR/"
 echo "    ├── bin/       ($BINARY_COUNT executables)"
 echo "    ├── lib/       ($DYLIB_COUNT libraries)"
+echo "    ├── share/proj/proj.db"
 echo "    └── README.txt"
 echo ""
 echo "To test the bundle:"

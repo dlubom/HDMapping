@@ -3,22 +3,33 @@
 name: Build on Windows
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "mcp/**" ]
   pull_request:
     branches: [ "main" ]
   release:
     types: [ published ]
 
+# A PR and its branch push validate the same head; keep one active run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
+  PYTHONUTF8: "1"
 
 jobs:
   build:
     # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
     # You can convert this to a matrix build if you need cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ${{ fromJSON((startsWith(github.ref, 'refs/heads/mcp/') || startsWith(github.head_ref, 'mcp/')) && '["ON","OFF"]' || '["ON"]') }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -27,6 +38,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: true
           fetch-depth: 0
 
@@ -44,26 +56,45 @@ jobs:
       - name: Configure CMake
         # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
         # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-        run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON
+        run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DBUILD_WITH_UTILITY_APPLICATION=ON -DBUILD_TESTING=ON ${{ matrix.mcp == 'OFF' && '-DBUILD_WITH_MCP=OFF -DHDMAPPING_GO_EXECUTABLE=must-not-run-go' || '' }} -DHDMAPPING_MCP_QUALITY=${{ matrix.mcp }}
+
+      - name: Check Windows MCP quality and process lifecycle
+        if: matrix.mcp == 'ON'
+        shell: pwsh
+        run: ./scripts/check_mcp_windows.ps1 -BuildDir build -Config ${{ env.BUILD_TYPE }}
 
       - name: Build
         # Build your program with the given configuration
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target package
 
       - name: Test
+        if: matrix.mcp == 'OFF'
         working-directory: ${{github.workspace}}/build
         # Execute tests defined by the CMake configuration.
         # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
         run: ctest -C ${{env.BUILD_TYPE}} --output-on-failure
 
+      - name: Check installed product relocation
+        if: matrix.mcp == 'OFF'
+        run: python scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }}
+
       - name: Deploy mandeye package
         shell: cmd
         run: deploy_mandeye.bat "${{github.workspace}}\deploy\mandeye"
 
+      - name: Check deployed product relocation
+        if: matrix.mcp == 'OFF'
+        run: python scripts/check_mcp_install.py --build-dir build --config ${{env.BUILD_TYPE}} --mcp ${{ matrix.mcp }} --package-dir deploy/mandeye --package-executable hdmapping_mcp.exe
+
+      - name: Check Windows MCP runtime and packages
+        if: matrix.mcp == 'ON'
+        shell: pwsh
+        run: ./scripts/check_mcp_windows.ps1 -BuildDir build -Config ${{ env.BUILD_TYPE }} -DeployDir deploy/mandeye
+
       - name: Upload mandeye folder as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mandeye-windows-${{env.VERSION}}
+          name: mandeye-windows-${{env.VERSION}}${{ matrix.mcp == 'ON' && '-mcp' || '' }}
           path: ${{github.workspace}}/deploy/mandeye/
 
       - name: Attach to GitHub release

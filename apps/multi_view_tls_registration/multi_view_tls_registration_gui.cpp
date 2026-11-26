@@ -1,3 +1,10 @@
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+#include <HDMapping/Processing/SessionSnapshot.h>
+
+#include <chrono>
+#include <cstdlib>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -52,6 +59,7 @@
 #include <Core/structures.h>
 #include <Core/transformations.h>
 #include <Core/tum.h>
+#include <HDMapping/SessionPaths.h>
 #include <RaylibWidgets/WindowFit.h>
 
 #ifdef _WIN32
@@ -86,6 +94,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <string_view>
 #include <tuple>
 
 #include <opencv2/imgcodecs.hpp>
@@ -98,6 +107,21 @@
 #include "../lidar_odometry_step_1/lidar_odometry_utils.h"
 #include "bow_loop_closure_detector.h"
 #include "multi_view_tls_registration.h"
+#include "step2_io_operations.h"
+#include "step2_segment_operations.h"
+#include "step2_solver_selection.h"
+#include <Core/reference_tracks.h>
+
+#ifdef HDMAPPING_GUI_STATE
+#include "step2_constraint_operations.h"
+#include "step2_georeference_operations.h"
+#include "step2_loop_candidate_operations.h"
+#include "step2_operations.h"
+#include "step2_state_parameters.h"
+#include <HDMapping/Processing/GuiStateBridge.h>
+#include <HDMapping/Processing/GuiStateConnection.h>
+#include <HDMapping/Processing/SessionSnapshot.h>
+#endif
 
 #include <HDMapping/HDMAPPING_ConfigureInfo.hpp>
 
@@ -978,15 +1002,6 @@ bool gnssWithOffset = false;
 bool tumSubtractFirstPose = false;
 
 // radio button selectors
-static int NDTnomSelection = 0;
-static int NDTpeSelection = 0;
-static int NDT3dSelection = 0;
-static int ICPnomSelection = 0;
-static int ICPpeSelection = 0;
-static int ICP3dSelection = 0;
-static int RPFnomSelection = 0;
-static int RPFpeSelection = 0;
-static int RPF3dSelection = 0;
 static int PGSnomSelection = 0;
 static int PGSpeSelection = 0;
 static int PGS3dSelection = 0;
@@ -1011,6 +1026,8 @@ bool is_lio_segments_gui = false;
 bool is_settings_gui = true;
 bool is_translate_gui = false;
 
+namespace proc = HDMapping::Processing;
+
 struct TranslateTool
 {
     enum class Step
@@ -1022,6 +1039,7 @@ struct TranslateTool
         Ready
     };
     Step step = Step::Idle;
+    proc::TargetRef target;
     Eigen::Vector3d origin = Eigen::Vector3d::Zero();
     Eigen::Vector3d x_point = Eigen::Vector3d::Zero();
     Eigen::Vector3d y_hint = Eigen::Vector3d::Zero();
@@ -1075,6 +1093,7 @@ bool fillInSession = true;
 
 TLSRegistration tls_registration;
 ObservationPicking observation_picking;
+static std::string observations_file_name;
 
 bool new_loop_closure_index = false;
 int num_edge_extended_before = 0;
@@ -1120,6 +1139,7 @@ bool manipulate_only_marked_gizmo = false;
 // in-progress poses live here and are drawn from the cached GPU buffers; they
 // are committed to m_pose once, when the drag ends.
 // gizmo_drag_preview_poses[k] is the preview pose of scan gizmo_drag_first_index + k.
+static proc::TargetRef gizmo_drag_target;
 int gizmo_drag_first_index = -1;
 std::vector<Eigen::Affine3d> gizmo_drag_preview_poses;
 
@@ -1128,8 +1148,281 @@ bool isGizmoDragging()
     return gizmo_drag_first_index >= 0;
 }
 
+#if defined(HDMAPPING_SNAPSHOT_PROBE) || defined(HDMAPPING_GUI_STATE)
+const auto session_owner = std::make_shared<Session>();
+Session& session = *session_owner;
+#else
 Session session;
+#endif
 PointClouds::PointCloudDimensions session_dims;
+#ifdef HDMAPPING_GUI_STATE
+static proc::GuiStateBridge* state_bridge = nullptr;
+static std::string state_path;
+static std::string registration_result_path;
+static std::optional<std::pair<proc::OperationRequest, bool>> registration_request;
+static std::string constraint_result_path;
+static std::string georeference_result_path;
+static nlohmann::json registration_job = nlohmann::json::object();
+static std::string registration_error;
+static bool registration_in_flight = false;
+static std::chrono::steady_clock::time_point next_registration_poll;
+
+static bool registrationActive()
+{
+    const auto status = registration_job.value("status", std::string{});
+    return registration_request || registration_in_flight || status == "preparing" || status == "queued" || status == "running" ||
+        status == "cancelling" || registration_job.value("gui_apply_status", std::string{}) == "pending";
+}
+
+static void submitStep2Job(std::string_view operation, nlohmann::json scope, nlohmann::json parameters, bool mutate)
+{
+    if (registrationActive())
+        return;
+    registration_job = nlohmann::json::object();
+    registration_error.clear();
+    registration_request.emplace(proc::OperationRequest{ std::string(operation), {}, std::move(scope), std::move(parameters) }, mutate);
+}
+
+static void submitReferenceAlignment(const char* source)
+{
+    submitStep2Job("step2.align_reference", nlohmann::json::object(), { { "source", source } }, true);
+}
+
+static void submitRegistration(std::string algorithm, bool changes_poses = true)
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
+        indices.push_back(i);
+    if (indices.size() < 2)
+    {
+        registration_error = "Registration requires at least two scans";
+        return;
+    }
+    submitStep2Job(
+        proc::register_scans_operation,
+        { { "scan_indices", std::move(indices) } },
+        { { "algorithm", std::move(algorithm) } },
+        changes_poses);
+}
+
+static nlohmann::json allActiveEdgeIndices()
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < session.pose_graph_loop_closure.edges.size(); ++i)
+        indices.push_back(i);
+    return indices;
+}
+
+static void submitGraphOptimization()
+{
+    submitStep2Job(proc::optimize_graph_operation, { { "edge_indices", allActiveEdgeIndices() } }, nlohmann::json::object(), true);
+}
+
+static void submitConstraintIcp(double radius, int iterations, bool all)
+{
+    const auto indices = all ? allActiveEdgeIndices() : nlohmann::json::array({ session.pose_graph_loop_closure.index_active_edge });
+    submitStep2Job(
+        proc::constraint_icp_operation,
+        { { "edge_indices", indices } },
+        { { "radius_m", radius },
+          { "iterations", iterations },
+          { "coarse_to_fine", all },
+          { "extend_before", num_edge_extended_before },
+          { "extend_after", num_edge_extended_after } },
+        true);
+}
+
+static bool editManualConstraint(std::string operation, nlohmann::json scope, nlohmann::json parameters)
+{
+    if (state_bridge->Reserved())
+        return false;
+    if (const auto error =
+            proc::EditStep2Constraints(session, { std::move(operation), state_bridge->Target(), std::move(scope), std::move(parameters) }))
+    {
+        registration_error = error->message;
+        return false;
+    }
+    return true;
+}
+
+static void pollRegistration(proc::GuiStateConnection& connection)
+{
+    using nlohmann::json;
+    if (auto reply = connection.TakeJobReply())
+    {
+        registration_in_flight = false;
+        if (const auto* error = std::get_if<proc::OperationError>(&*reply))
+            registration_error = error->message;
+        else
+        {
+            registration_error.clear();
+            registration_job = std::get<json>(std::move(*reply));
+        }
+    }
+    if (registration_request)
+    {
+        static std::uint64_t sequence = 0;
+        const auto& [request, mutate] = *registration_request;
+        const auto target = state_bridge->Target();
+        const json operation{ { "operation", request.operation },
+                              { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+                              { "scope", request.scope },
+                              { "parameters", request.parameters } };
+        registration_in_flight = connection.RequestJob(
+            "jobs.submit",
+            { { "request_key", target.state_id + "-step2-" + std::to_string(++sequence) },
+              { "operation", operation },
+              { "capture_source", target.state_id },
+              { "source", "gui" },
+              { "access", mutate ? "mutate" : "read" } });
+        registration_request.reset();
+    }
+    else if (!registration_in_flight && registrationActive() && std::chrono::steady_clock::now() >= next_registration_poll)
+    {
+        registration_in_flight = connection.RequestJob("jobs.get", registration_job.at("job_id"));
+        next_registration_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    }
+}
+
+static void registrationJobGui(proc::GuiStateConnection& connection)
+{
+    if (!registrationActive() && registration_job.empty() && registration_error.empty())
+        return;
+    ImGui::Begin("Step 2 processing", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    const auto status = registration_job.value("status", std::string{});
+    const auto apply = registration_job.value("gui_apply_status", std::string{});
+    const auto id = registration_job.value("job_id", std::string{});
+    ImGui::TextUnformatted(status.empty() ? (registration_error.empty() ? "Submitting" : "Failed") : status.c_str());
+    if (!id.empty())
+        ImGui::Text("Job %s", id.c_str());
+    if (registration_job.contains("progress"))
+    {
+        const auto& progress = registration_job.at("progress");
+        const auto stage = progress.value("stage", std::string{});
+        const auto message = progress.value("message", std::string{});
+        if (!stage.empty())
+            ImGui::TextUnformatted(stage.c_str());
+        if (!message.empty())
+            ImGui::TextWrapped("%s", message.c_str());
+    }
+    if (!apply.empty() && apply != "not_requested")
+        ImGui::Text("Workspace update: %s", apply.c_str());
+    if (registration_job.contains("error"))
+        ImGui::TextWrapped("%s", registration_job.at("error").value("message", std::string{}).c_str());
+    if (!registration_error.empty())
+        ImGui::TextWrapped("%s", registration_error.c_str());
+    if (!registration_in_flight && (status == "preparing" || status == "queued" || status == "running") && ImGui::Button("Cancel job"))
+        registration_in_flight = connection.RequestJob("jobs.cancel", id);
+    if (!registrationActive() && ImGui::Button("Dismiss"))
+    {
+        registration_error.clear();
+        registration_job = nlohmann::json::object();
+    }
+    ImGui::End();
+}
+
+static proc::GuiStateConnection* registration_connection = nullptr;
+
+#endif
+
+// Bulk geometry edits may replace points or trajectories while preserving all sizes and poses.
+static void markBulkEdit()
+{
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge)
+        state_bridge->Changed();
+#endif
+}
+
+static void clearTranslatePreview()
+{
+    if (translate_tool.step == TranslateTool::Step::Idle)
+        return;
+    translate_tool.step = TranslateTool::Step::Idle;
+    translate_tool.has_transform = false;
+    translate_tool.transform = Eigen::Affine3d::Identity();
+    SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+}
+
+static void openedStep2Session([[maybe_unused]] const std::string& path)
+{
+    gizmo_drag_first_index = -1;
+    gizmo_drag_preview_poses.clear();
+    clearTranslatePreview();
+#ifdef HDMAPPING_GUI_STATE
+    state_path = path;
+    registration_result_path.clear();
+    constraint_result_path.clear();
+    georeference_result_path.clear();
+    if (state_bridge)
+        state_bridge->Open();
+#endif
+}
+
+static nlohmann::json step2ScanScope(std::size_t first, std::size_t count)
+{
+    auto indices = nlohmann::json::array();
+    for (std::size_t i = 0; i < count; ++i)
+        indices.push_back(first + i);
+    return { { "scan_indices", std::move(indices) } };
+}
+
+static nlohmann::json step2MatrixParameter(const char* field, const Eigen::Affine3d& pose)
+{
+    auto matrix = nlohmann::json::array();
+    for (int row = 0; row < 4; ++row)
+        matrix.push_back({ pose(row, 0), pose(row, 1), pose(row, 2), pose(row, 3) });
+    return { { field, std::move(matrix) } };
+}
+
+static proc::TargetRef currentStep2Target()
+{
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge)
+        return state_bridge->Target();
+#endif
+    return {};
+}
+
+static bool commitStep2PoseEdit(std::string_view operation, nlohmann::json scope, nlohmann::json parameters, const proc::TargetRef& target)
+{
+    auto report_error = [](const proc::OperationError& error)
+    {
+        spdlog::warn("Step 2 pose edit: {}: {}", error.code, error.message);
+#ifdef HDMAPPING_GUI_STATE
+        registration_error = error.message;
+#endif
+    };
+#ifdef HDMAPPING_GUI_STATE
+    // Plain cloud loads can precede an open MCP state.
+    if (state_bridge && !target.state_id.empty())
+    {
+        bool committed = false;
+        state_bridge->Dispatch(
+            "states.execute",
+            { { "target", { { "state_id", target.state_id }, { "revision", target.revision } } },
+              { "operation", operation },
+              { "scope", scope },
+              { "parameters", parameters } },
+            [&](const proc::GuiResponse& response)
+            {
+                if (const auto* error = std::get_if<proc::OperationError>(&response))
+                    report_error(*error);
+                else
+                    committed = true;
+            });
+        return committed;
+    }
+#endif
+    auto result =
+        proc::EditStep2Poses(session.point_clouds_container, { std::string(operation), target, std::move(scope), std::move(parameters) });
+    if (const auto* error = std::get_if<proc::OperationError>(&result))
+    {
+        report_error(*error);
+        return false;
+    }
+    return true;
+}
 
 // Writes the in-progress drag poses into the scans and ends the drag.
 void commitGizmoDrag()
@@ -1139,26 +1432,20 @@ void commitGizmoDrag()
         return;
     }
     auto& pcs = session.point_clouds_container.point_clouds;
-    for (size_t k = 0; k < gizmo_drag_preview_poses.size(); k++)
+    if (!gizmo_drag_preview_poses.empty())
     {
-        const size_t j = static_cast<size_t>(gizmo_drag_first_index) + k;
-        if (j >= pcs.size())
+        const auto first = static_cast<std::size_t>(gizmo_drag_first_index);
+        const auto count = gizmo_drag_preview_poses.size();
+        if (commitStep2PoseEdit(
+                proc::edit_segment_operation,
+                step2ScanScope(first, count),
+                step2MatrixParameter("anchor_pose", gizmo_drag_preview_poses.front()),
+                gizmo_drag_target))
         {
-            break;
+            // syncPoses() ran before the drag commit in this frame.
+            for (std::size_t i = first; i < first + count; ++i)
+                scan_renderer.rebuild(i, pcs[i]);
         }
-        PointCloud& pc = pcs[j];
-        pc.m_pose = gizmo_drag_preview_poses[k];
-        pc.pose = pose_tait_bryan_from_affine_matrix(pc.m_pose);
-        pc.gui_translation[0] = static_cast<float>(pc.pose.px);
-        pc.gui_translation[1] = static_cast<float>(pc.pose.py);
-        pc.gui_translation[2] = static_cast<float>(pc.pose.pz);
-        pc.gui_rotation[0] = static_cast<float>(pc.pose.om * RAD_TO_DEG);
-        pc.gui_rotation[1] = static_cast<float>(pc.pose.fi * RAD_TO_DEG);
-        pc.gui_rotation[2] = static_cast<float>(pc.pose.ka * RAD_TO_DEG);
-        // Rebuild right away: this frame's syncPoses() already ran (top of
-        // display()) and the preview is off from now on, so without this the
-        // scan is drawn once more at its pre-drag pose -- a visible jump back.
-        scan_renderer.rebuild(j, pc);
     }
     gizmo_drag_first_index = -1;
     gizmo_drag_preview_poses.clear();
@@ -1166,6 +1453,8 @@ void commitGizmoDrag()
 bool session_loaded = false;
 std::vector<std::string> geoids;
 std::string selected_geoid_model;
+static double angle_diff = 5.0;
+static bool skip_ts_0 = true;
 
 // these functions performs experiment from paper
 //@article
@@ -1215,7 +1504,6 @@ void perform_experiment_on_linux(
     RegistrationPlaneFeature& registration_plane_feature,
     PoseGraphSLAM& pose_graph_slam);
 double compute_rms(bool initial, Session& session, ObservationPicking& observation_picking);
-void reset_poses(Session& session);
 void translate_gui();
 void draw_translate_preview();
 void measure_gui();
@@ -1228,6 +1516,11 @@ void draw_section_preview();
 
 void ndt_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.ndt);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::InputFloat3("Bucket size (x,y,z) [m]", tls_registration.ndt.bucket_size);
     if (tls_registration.ndt.bucket_size[0] < 0.01)
         tls_registration.ndt.bucket_size[0] = 0.01f;
@@ -1250,50 +1543,52 @@ void ndt_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &NDTnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &NDTnomSelection, 1);
-
-    tls_registration.ndt.is_gauss_newton = (NDTnomSelection == 0);
-    tls_registration.ndt.is_levenberg_marguardt = (NDTnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &NDTpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &NDTpeSelection, 1);
-
-    tls_registration.ndt.is_cw = (NDTpeSelection == 0);
-    tls_registration.ndt.is_wc = (NDTpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &NDT3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &NDT3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &NDT3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.ndt.is_tait_bryan_angles = (NDT3dSelection == 0);
-    tls_registration.ndt.is_quaternion = (NDT3dSelection == 1);
-    tls_registration.ndt.is_rodrigues = (NDT3dSelection == 2);
+    selection.write(tls_registration.ndt);
 
     if (ImGui::Button("Optimization"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt");
+#else
         double rms_initial = 0.0;
         double rms_final = 0.0;
         double mui = 0.0;
         // ndt.optimize(point_clouds_container.point_clouds, rms_initial, rms_final, mui);
         // spdlog::info("mui: " << mui << " rms_initial: " << rms_initial << " rms_final: " << rms_final << std::endl;
+        markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, false, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
 
     if (ImGui::Button("Compute mean Mahalanobis distance"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_mahalanobis", false);
+#else
         double rms_initial = 0.0;
         double rms_final = 0.0;
         double mui = 0.0;
 
+        markBulkEdit();
         tls_registration.ndt.optimize(session.point_clouds_container.point_clouds, true, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
     if (ImGui::IsItemHovered())
     {
@@ -1312,14 +1607,24 @@ void ndt_gui()
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_lie_left");
+#else
+        markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_left_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("ndt_lie_right");
+#else
+        markBulkEdit();
         tls_registration.ndt.optimize_lie_algebra_right_jacobian(
             session.point_clouds_container.point_clouds, tls_registration.compute_mean_and_cov_for_bucket);
+#endif
     }
 
     ImGui::Separator();
@@ -1373,6 +1678,11 @@ void ndt_gui()
 
 void icp_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.icp);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::PushItemWidth(ImGuiNumberWidth);
     ImGui::InputFloat("Search radius", &tls_registration.icp.search_radius, 0.01f, 0.1f);
     if (tls_registration.icp.search_radius < 0.01f)
@@ -1395,59 +1705,81 @@ void icp_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &ICPnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &ICPnomSelection, 1);
-
-    tls_registration.icp.is_gauss_newton = (ICPnomSelection == 0);
-    tls_registration.icp.is_levenberg_marguardt = (ICPnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &ICPpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &ICPpeSelection, 1);
-
-    tls_registration.icp.is_cw = (ICPpeSelection == 0);
-    tls_registration.icp.is_wc = (ICPpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &ICP3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &ICP3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &ICP3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.icp.is_tait_bryan_angles = (ICP3dSelection == 0);
-    tls_registration.icp.is_quaternion = (ICP3dSelection == 1);
-    tls_registration.icp.is_rodrigues = (ICP3dSelection == 2);
+    selection.write(tls_registration.icp);
 
     if (ImGui::Button("Optimization point to point source to target"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp");
+#else
+        markBulkEdit();
         tls_registration.icp.optimization_point_to_point_source_to_target(session.point_clouds_container);
+#endif
+    }
 
     ImGui::Separator();
 
     ImGui::Text("Optimization source to target Lie-algebra:");
     ImGui::SameLine();
     if (ImGui::Button("left Jacobian"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_lie_left");
+#else
+        markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_left_jacobian(session.point_clouds_container);
+#endif
+    }
 
     ImGui::SameLine();
     if (ImGui::Button("right Jacobian"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_lie_right");
+#else
+        markBulkEdit();
         tls_registration.icp.optimize_source_to_target_lie_algebra_right_jacobian(session.point_clouds_container);
+#endif
+    }
 
     ImGui::Separator();
 
     if (ImGui::Button("Compute RMS (optimization_point_to_point_source_to_target)"))
     {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("icp_rms", false);
+#else
         double rms = 0.0;
         tls_registration.icp.optimization_point_to_point_source_to_target_compute_rms(session.point_clouds_container, rms);
         spdlog::info("RMS (optimization_point_to_point_source_to_target): {}", rms);
+#endif
     }
 }
 
 void rpf_gui()
 {
+#ifdef HDMAPPING_GUI_STATE
+    auto selection = Step2SolverSelection::read(tls_registration.registration_plane_feature);
+#else
+    static Step2SolverSelection selection{ 0, 0, 0 };
+#endif
     ImGui::PushItemWidth(ImGuiNumberWidth);
     ImGui::InputFloat("Search radius", &tls_registration.registration_plane_feature.search_radius, 0.01, 2.0);
     if (tls_registration.registration_plane_feature.search_radius < 0.01)
@@ -1470,58 +1802,92 @@ void rpf_gui()
 
     ImGui::Text("Nonlinear optimization method:");
     ImGui::SameLine();
-    ImGui::RadioButton("Gauss-Newton", &RPFnomSelection, 0);
+    ImGui::RadioButton("Gauss-Newton", &selection.optimizer, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Levenberg-Marguardt", &RPFnomSelection, 1);
-
-    tls_registration.registration_plane_feature.is_gauss_newton = (RPFnomSelection == 0);
-    tls_registration.registration_plane_feature.is_levenberg_marguardt = (RPFnomSelection == 1);
+    ImGui::RadioButton("Levenberg-Marguardt", &selection.optimizer, 1);
 
     ImGui::Text("Poses expressed as:");
     ImGui::SameLine();
-    ImGui::RadioButton("camera<-world (cw)", &RPFpeSelection, 0);
+    ImGui::RadioButton("camera<-world (cw)", &selection.pose_convention, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("camera->world (wc)", &RPFpeSelection, 1);
-
-    tls_registration.registration_plane_feature.is_cw = (RPFpeSelection == 0);
-    tls_registration.registration_plane_feature.is_wc = (RPFpeSelection == 1);
+    ImGui::RadioButton("camera->world (wc)", &selection.pose_convention, 1);
 
     ImGui::Text("Parameterizations of 3D rotation:");
-    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &RPF3dSelection, 0);
+    ImGui::RadioButton("Tait-Bryan angles (om fi ka: RxRyRz)", &selection.rotation, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &RPF3dSelection, 1);
+    ImGui::RadioButton("Quaternion (q0 q1 q2 q3)", &selection.rotation, 1);
     ImGui::SameLine();
-    ImGui::RadioButton("Rodrigues (sx sy sz)", &RPF3dSelection, 2);
+    ImGui::RadioButton("Rodrigues (sx sy sz)", &selection.rotation, 2);
 
-    tls_registration.registration_plane_feature.is_tait_bryan_angles = (RPF3dSelection == 0);
-    tls_registration.registration_plane_feature.is_quaternion = (RPF3dSelection == 1);
-    tls_registration.registration_plane_feature.is_rodrigues = (RPF3dSelection == 2);
+    selection.write(tls_registration.registration_plane_feature);
 
     ImGui::Separator();
     ImGui::Text("Optimize point to projection onto plane source to target:");
     if (ImGui::Button("Basic Jacobian"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target(
             session.point_clouds_container);
+#endif
+    }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra left Jacobian"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection_lie_left");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_left_jacobian(
             session.point_clouds_container);
+#endif
+    }
     ImGui::SameLine();
     if (ImGui::Button("Lie-algebra right Jacobian"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_projection_lie_right");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_projection_onto_plane_source_to_target_lie_algebra_right_jacobian(
             session.point_clouds_container);
+#endif
+    }
 
     ImGui::Separator();
 
     ImGui::Text("Optimize source to target:");
     if (ImGui::Button("point to plane (using dot product)"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_point");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_point_to_plane_source_to_target(session.point_clouds_container);
+#endif
+    }
     ImGui::SameLine();
     if (ImGui::Button("distance point to plane"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_distance");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_distance_point_to_plane_source_to_target(session.point_clouds_container);
+#endif
+    }
     ImGui::SameLine();
     if (ImGui::Button("plane to plane"))
+    {
+#ifdef HDMAPPING_GUI_STATE
+        submitRegistration("plane_to_plane");
+#else
+        markBulkEdit();
         tls_registration.registration_plane_feature.optimize_plane_to_plane_source_to_target(session.point_clouds_container);
+#endif
+    }
 }
 
 void pca_gui()
@@ -1791,8 +2157,6 @@ void pose_graph_slam_gui()
 
 void observation_picking_gui()
 {
-    static std::string observations_file_name = "";
-
     ImGui::Begin("Observations", &is_manual_analisys);
     {
         ImGui::Checkbox("Observation picking mode", &observation_picking.is_observation_picking_mode);
@@ -1956,14 +2320,8 @@ void observation_picking_gui()
 }
 
 // ── Automatic image-based (fbow) loop closure detection ─────────────────────
-// Candidates are only ever surfaced for manual review here (montage preview +
-// per-row "Add edge") -- never auto-added to the pose graph -- per
-// BOW_PLACE_RECOGNITION_HANDOFF.md's documented false-positive risk on
-// repetitive scenes. Detection itself runs on a background thread (ORB
-// extraction over hundreds of frames must not block the render loop); it only
-// reads session.point_clouds_container (poses/timestamps), never mutates it,
-// mirroring TrajectoryViewer.cpp's imgViewThread pattern for its own
-// background image work.
+// The legacy path runs in-process. With MCP enabled the button submits a durable read job,
+// and the editor accepts its candidates only for the matching opening and revision.
 namespace
 {
     struct BowLoopClosureState
@@ -1973,7 +2331,15 @@ namespace
         bow_loop_closure::DetectorParams params;
 
         std::atomic<bool> detecting{ false };
+#ifdef HDMAPPING_GUI_STATE
+        bool awaiting_job = false;
+        proc::TargetRef result_target;
+        std::filesystem::path report_path;
+        std::map<std::pair<int, int>, nlohmann::json> candidate_edges;
+        bow_loop_closure::DetectorParams preview_params;
+#else
         std::thread detect_thread;
+#endif
 
         std::mutex results_mutex;
         std::vector<bow_loop_closure::Candidate> results;
@@ -1988,14 +2354,44 @@ namespace
         bool montage_tex_valid = false;
     };
     BowLoopClosureState bow_state;
+    const bow_loop_closure::DetectorParams& montageParameters();
+    void bow_loop_closure_clear_preview();
 
     void bow_loop_closure_start_detection()
     {
         if (bow_state.detecting.load())
             return;
+#ifdef HDMAPPING_GUI_STATE
+        if (registrationActive())
+            return;
+#else
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
+#endif
 
+        std::vector<std::string> camera_dirs;
+#ifndef HDMAPPING_GUI_STATE
+        std::vector<std::string> camera_names;
+#endif
+        for (const auto& dir : bow_state.camera_dirs)
+        {
+            if (dir[0] == '\0')
+                continue;
+            camera_dirs.emplace_back(dir.data());
+#ifndef HDMAPPING_GUI_STATE
+            auto path = sessionPathFromText(camera_dirs.back());
+            if (!path.has_filename())
+                path = path.parent_path(); // ".../cam_front/"
+            camera_names.push_back(sessionPathText(path.filename()));
+#endif
+        }
+        if (camera_dirs.empty())
+        {
+            bow_state.status = "Select at least one camera folder";
+            return;
+        }
+        const auto params = bow_state.params;
+        bow_loop_closure_clear_preview();
         bow_state.detecting = true;
         {
             std::lock_guard<std::mutex> lk(bow_state.results_mutex);
@@ -2003,21 +2399,33 @@ namespace
             bow_state.results.clear();
             bow_state.selected_candidate = -1;
         }
-
-        std::vector<std::string> camera_dirs;
-        std::vector<std::string> camera_names;
-        for (const auto& dir : bow_state.camera_dirs)
+#ifdef HDMAPPING_GUI_STATE
+        auto indices = nlohmann::json::array();
+        for (std::size_t i = 0; i < session.point_clouds_container.point_clouds.size(); ++i)
+            indices.push_back(i);
+        if (indices.size() < 2)
         {
-            if (dir[0] == '\0')
-                continue;
-            camera_dirs.emplace_back(dir.data());
-            std::filesystem::path path(camera_dirs.back());
-            if (!path.has_filename())
-                path = path.parent_path(); // ".../cam_front/"
-            camera_names.push_back(path.filename().string());
+            bow_state.status = "Loop detection requires at least two scans";
+            bow_state.detecting = false;
+            return;
         }
-        bow_loop_closure::DetectorParams params = bow_state.params;
-
+        for (auto& path : camera_dirs)
+            path = sessionPathText(std::filesystem::absolute(sessionPathFromText(path)));
+        bow_state.candidate_edges.clear();
+        bow_state.report_path.clear();
+        bow_state.awaiting_job = true;
+        submitStep2Job(
+            proc::detect_candidates_operation,
+            { { "scan_indices", std::move(indices) } },
+            { { "camera_dirs", camera_dirs },
+              { "min_arc_gap_m", params.min_arc_gap_m },
+              { "max_xy_dist_m", params.max_xy_dist_m },
+              { "min_bow_score", params.min_bow_score },
+              { "min_inliers", params.min_inliers },
+              { "orb_features", params.orb_features },
+              { "max_image_size_px", params.max_image_size_px } },
+            false);
+#else
         bow_state.detect_thread = std::thread(
             [camera_dirs, camera_names, params]()
             {
@@ -2052,6 +2460,7 @@ namespace
                 bow_state.status = status;
                 bow_state.detecting = false;
             });
+#endif
     }
 
     // Uploads `mat` (BGR, as cv::imread/drawMatches produce) as the montage
@@ -2077,7 +2486,7 @@ namespace
     {
         bow_state.selected_candidate = row;
         std::lock_guard<std::mutex> lk(bow_state.results_mutex);
-        cv::Mat montage = bow_loop_closure::buildCandidateMontage(results[row], bow_state.frames, bow_state.params);
+        cv::Mat montage = bow_loop_closure::buildCandidateMontage(results[row], bow_state.frames, montageParameters());
         bow_loop_closure_upload_montage(montage);
     }
 
@@ -2087,6 +2496,130 @@ namespace
         if (bow_state.montage_tex_valid)
             UnloadTexture(bow_state.montage_tex);
         bow_state.montage_tex_valid = false;
+    }
+
+#ifdef HDMAPPING_GUI_STATE
+    std::optional<proc::OperationError> presentLoopCandidates(const proc::ArtifactManifest& artifact)
+    {
+        using nlohmann::json;
+        try
+        {
+            std::vector<std::filesystem::path> files;
+            const auto result = proc::ReadSnapshot(artifact.snapshot, {}, &files);
+            if (const auto* error = std::get_if<proc::OperationError>(&result))
+                return *error;
+            const auto& contents = std::get<proc::SnapshotContents>(result);
+            if (contents.kind != proc::loop_candidates_kind || artifact.artifact_id != "loop-candidates")
+                throw std::runtime_error("Unexpected loop candidate report");
+            std::ifstream input(contents.entry);
+            const auto report = json::parse(input);
+            const auto& settings = report.at("settings");
+            bow_loop_closure::DetectorParams params;
+            params.orb_features = settings.at("orb_features").get<int>();
+            params.max_image_size_px = settings.at("max_image_size_px").get<int>();
+
+            const auto cameraCount = report.at("camera_count").get<std::size_t>();
+            std::vector<std::string> names;
+            for (std::size_t camera = 0; camera < cameraCount; ++camera)
+                names.push_back("camera " + std::to_string(camera));
+            std::vector<bow_loop_closure::CameraFrame> frames;
+            std::vector<bow_loop_closure::Candidate> candidates;
+            std::map<std::pair<int, int>, json> edges;
+            const auto frameIndex = [&](const json& frame)
+            {
+                const auto path = contents.entry.parent_path() / sessionPathFromText(frame.at("file").get<std::string>());
+                if (std::ranges::find(files, path) == files.end())
+                    throw std::runtime_error("Candidate frame is absent from the report inventory");
+                const int camera = frame.at("camera_index").get<int>();
+                if (camera < 0 || static_cast<std::size_t>(camera) >= cameraCount)
+                    throw std::runtime_error("Candidate camera index is outside the submission");
+                const int index = static_cast<int>(frames.size());
+                frames.push_back({ std::stoll(frame.at("timestamp_ns").get<std::string>()), sessionPathText(path), camera });
+                return index;
+            };
+            const auto scanCount = session.point_clouds_container.point_clouds.size();
+            for (const auto& row : report.at("candidates"))
+            {
+                const auto& edge = row.at("edge");
+                const int from = edge.at("index_from").get<int>();
+                const int to = edge.at("index_to").get<int>();
+                if (from < 0 || to <= from || static_cast<std::size_t>(to) >= scanCount)
+                    throw std::runtime_error("Candidate endpoints are outside the session");
+                candidates.push_back(
+                    { from,
+                      to,
+                      frameIndex(row.at("frame_from")),
+                      frameIndex(row.at("frame_to")),
+                      row.at("xy_dist_m").get<double>(),
+                      row.at("arc_gap_m").get<double>(),
+                      row.at("bow_score").get<double>(),
+                      row.at("inliers").get<int>() });
+                edges.emplace(std::pair{ from, to }, edge);
+            }
+            bow_loop_closure_clear_preview();
+            bow_state.camera_names = std::move(names);
+            bow_state.frames = std::move(frames);
+            bow_state.results = std::move(candidates);
+            bow_state.candidate_edges = std::move(edges);
+            bow_state.preview_params = params;
+            bow_state.result_target = artifact.target;
+            bow_state.report_path = contents.entry;
+            bow_state.status = std::to_string(bow_state.results.size()) + " candidates found";
+            return {};
+        } catch (const std::exception& error)
+        {
+            return proc::OperationError{ "invalid_result", error.what(), nlohmann::json::object() };
+        }
+    }
+
+    void finishLoopCandidateJob()
+    {
+        if (!bow_state.awaiting_job || registrationActive())
+            return;
+        bow_state.awaiting_job = false;
+        bow_state.detecting = false;
+        const auto applied = registration_job.value("gui_apply_status", std::string{});
+        if (applied == "applied")
+            return;
+        if (registration_job.value("status", std::string{}) == "completed")
+            bow_state.status = "Candidate report saved. Workspace update: " + applied;
+        else
+        {
+            bow_state.status = registration_job.value("error", nlohmann::json::object()).value("message", registration_error);
+            if (bow_state.status.empty())
+                bow_state.status = registration_job.value("status", std::string("Detection failed"));
+        }
+    }
+
+    bool currentLoopCandidates()
+    {
+        return state_bridge->Target() == bow_state.result_target && !state_bridge->Reserved();
+    }
+
+    void retainLoopCandidatesAfterEditorChange()
+    {
+        state_bridge->Changed();
+        bow_state.result_target = state_bridge->Target();
+    }
+
+    bool activateLoopCandidate(const bow_loop_closure::Candidate& candidate)
+    {
+        if (!currentLoopCandidates() ||
+            !editManualConstraint(
+                "constraints.add", nlohmann::json::object(), bow_state.candidate_edges.at({ candidate.index_i, candidate.index_j })))
+            return false;
+        retainLoopCandidatesAfterEditorChange();
+        return true;
+    }
+#endif
+
+    const bow_loop_closure::DetectorParams& montageParameters()
+    {
+#ifdef HDMAPPING_GUI_STATE
+        return bow_state.preview_params;
+#else
+        return bow_state.params;
+#endif
     }
 
     // N / P step the BoW candidates instead of the manual loop closure's active edge while a candidate is
@@ -2156,6 +2689,11 @@ void bow_loop_closure_gui()
     ImGui::PopItemWidth();
 
     bool detecting = bow_state.detecting.load();
+    bool can_activate = true;
+#ifdef HDMAPPING_GUI_STATE
+    detecting = detecting || registrationActive();
+    can_activate = currentLoopCandidates();
+#endif
     ImGui::BeginDisabled(detecting || session.point_clouds_container.point_clouds.empty());
     if (ImGui::Button("Detect candidates"))
         bow_loop_closure_start_detection();
@@ -2180,6 +2718,10 @@ void bow_loop_closure_gui()
         }
     }
     ImGui::Text("%s", status_copy.c_str());
+#ifdef HDMAPPING_GUI_STATE
+    if (!results_copy.empty() && state_bridge->Target() != bow_state.result_target)
+        ImGui::TextUnformatted("Detection belongs to an earlier session revision. Run detection again to add edges.");
+#endif
 
     ImGui::Separator();
     ImGui::Text(
@@ -2219,9 +2761,15 @@ void bow_loop_closure_gui()
             c.inliers,
             results_cameras.empty() ? "" : results_cameras[row].c_str());
         ImGui::SameLine();
+        ImGui::BeginDisabled(!can_activate);
         if (ImGui::Button("Add edge"))
         {
+#ifdef HDMAPPING_GUI_STATE
+            if (!activateLoopCandidate(c))
+                bow_state.status = "Could not activate candidate: " + registration_error;
+#else
             session.pose_graph_loop_closure.add_edge(session.point_clouds_container, c.index_i, c.index_j);
+#endif
         }
         ImGui::SameLine();
         if (ImGui::Button("Preview in 3D"))
@@ -2229,7 +2777,11 @@ void bow_loop_closure_gui()
             index_loop_closure_source = c.index_i;
             index_loop_closure_target = c.index_j;
             is_loop_closure_gui = true;
+#ifdef HDMAPPING_GUI_STATE
+            retainLoopCandidatesAfterEditorChange();
+#endif
         }
+        ImGui::EndDisabled();
 
         ImGui::PopID();
     }
@@ -2237,8 +2789,23 @@ void bow_loop_closure_gui()
 
     if (!results_copy.empty())
     {
+        ImGui::BeginDisabled(!can_activate);
         if (ImGui::Button("Add all shown"))
         {
+#ifdef HDMAPPING_GUI_STATE
+            const auto added = std::erase_if(
+                bow_state.results,
+                [](const auto& candidate)
+                {
+                    if (!activateLoopCandidate(candidate))
+                        return false;
+                    bow_state.candidate_edges.erase({ candidate.index_i, candidate.index_j });
+                    return true;
+                });
+            bow_state.status = "Added " + std::to_string(added) + " edges to the pose graph";
+            if (!bow_state.results.empty())
+                bow_state.status += ". Remaining candidates: " + registration_error;
+#else
             for (const auto& c : results_copy)
                 session.pose_graph_loop_closure.add_edge(session.point_clouds_container, c.index_i, c.index_j);
             {
@@ -2246,10 +2813,12 @@ void bow_loop_closure_gui()
                 bow_state.results.clear();
                 bow_state.status = "Added " + std::to_string(results_copy.size()) + " edges to the pose graph";
             }
+#endif
             bow_loop_closure_clear_preview();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Add every candidate as a pose graph edge and clear the list");
+        ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Save all shown as montages..."))
         {
@@ -2259,7 +2828,7 @@ void bow_loop_closure_gui()
                 std::lock_guard<std::mutex> lk(bow_state.results_mutex);
                 for (const auto& c : results_copy)
                 {
-                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, bow_state.params);
+                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, montageParameters());
                     if (!m.empty())
                     {
                         std::string fn = out_dir + "/cand_" + std::to_string(c.index_i) + "_" + std::to_string(c.index_j) + ".png";
@@ -2310,7 +2879,7 @@ void bow_loop_closure_gui()
                 if (!out_file.empty())
                 {
                     std::lock_guard<std::mutex> lk(bow_state.results_mutex);
-                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, bow_state.params);
+                    cv::Mat m = bow_loop_closure::buildCandidateMontage(c, bow_state.frames, montageParameters());
                     if (!m.empty())
                         cv::imwrite(out_file, m);
                 }
@@ -2332,7 +2901,12 @@ void bow_loop_closure_gui()
                             return c.index_i == shown.index_i && c.index_j == shown.index_j;
                         });
                     if (it != results.end())
+                    {
+#ifdef HDMAPPING_GUI_STATE
+                        bow_state.candidate_edges.erase({ it->index_i, it->index_j });
+#endif
                         next_row = static_cast<int>(results.erase(it) - results.begin());
+                    }
                     remaining = results;
                 }
                 // Show the candidate that took its place, or the new last one.
@@ -2406,6 +2980,24 @@ void loop_closure_gui()
 
         int prev_index_active_edge = session.pose_graph_loop_closure.index_active_edge;
         session.pose_graph_loop_closure.edge_hotkeys = !bow_preview_takes_edge_hotkeys();
+#ifdef HDMAPPING_GUI_STATE
+        const ManualPoseGraphLoopClosure::Actions graph_actions{
+            [](int from, int to)
+            {
+                return editManualConstraint("constraints.add", nlohmann::json::object(), { { "index_from", from }, { "index_to", to } });
+            },
+            [](int edge)
+            {
+                return editManualConstraint("constraints.remove", { { "edge_index", edge } }, nlohmann::json::object());
+            },
+            submitGraphOptimization,
+            submitConstraintIcp,
+            submitReferenceAlignment,
+        };
+        const auto* actions = &graph_actions;
+#else
+        const ManualPoseGraphLoopClosure::Actions* actions = nullptr;
+#endif
         session.pose_graph_loop_closure.Gui(
             session.point_clouds_container,
             index_loop_closure_source,
@@ -2416,7 +3008,9 @@ void loop_closure_gui()
             session.ground_control_points,
             session.control_points,
             num_edge_extended_before,
-            num_edge_extended_after);
+            num_edge_extended_after,
+            markBulkEdit,
+            actions);
 
         new_loop_closure_index = (prev_index_active_edge != session.pose_graph_loop_closure.index_active_edge);
     }
@@ -2502,7 +3096,11 @@ void lio_segments_gui()
             session.point_clouds_container.hide_all();
         ImGui::SameLine();
         if (ImGui::Button("Reset poses"))
-            reset_poses(session);
+            commitStep2PoseEdit(
+                proc::restore_poses_operation,
+                step2ScanScope(0, session.point_clouds_container.point_clouds.size()),
+                nlohmann::json::object(),
+                currentStep2Target());
 
         ImGui::Checkbox("Show with initial pose", &session.point_clouds_container.show_with_initial_pose);
         ImGui::SameLine();
@@ -2539,8 +3137,6 @@ void lio_segments_gui()
 
         ImGui::Text("Fuse IMU inclination: ");
         ImGui::SameLine();
-
-        static double angle_diff = 5.0;
 
         if (ImGui::Button("Set those that satisfy acceptable angle"))
         {
@@ -2839,27 +3435,7 @@ void lio_segments_gui()
 }
 
 // -----------------------------------------------------------------------------
-// GNSS / TUM / ENU-origin session persistence
-//
-// core's Session::save()/Session::load() (core/src/session.cpp) only knows about
-// point clouds, loop-closure edges and control points -- the GNSS track, the TUM
-// track and the ENU projection origin live in the GUI's own `tls_registration`
-// (see multi_view_tls_registration.h), so they're persisted here by re-opening
-// the *.mjs JSON that Session::save() just wrote and adding three extra
-// top-level keys:
-//
-//   "enu_origin"        - the WGS84 lat/lon (+ geoid separation) the GNSS
-//                         topocentric projection is referenced to. Previously
-//                         this was always re-derived from the first GNSS pose on
-//                         every projection/load; saving it lets a reopened
-//                         session keep the exact same origin even before GNSS
-//                         data is reloaded.
-//   "gnss_measurements" - every GNSS::GlobalPose (raw WGS84 + projected ENU).
-//   "tum_trajectory"    - every TUM::TumPose.
-//
-// All three keys are optional: an older session without them just loads with
-// empty GNSS/TUM tracks and the from-first-pose origin behaviour, as before.
-// -----------------------------------------------------------------------------
+// Persist the optional reference tracks alongside the native session metadata.
 static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss, const TUM& tum)
 {
     try
@@ -2875,50 +3451,7 @@ static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss,
             data = nlohmann::json::parse(fin);
         }
 
-        nlohmann::json jorigin;
-        jorigin["latitude"] = gnss.WGS84ReferenceLatitude;
-        jorigin["longitude"] = gnss.WGS84ReferenceLongitude;
-        jorigin["geoid_separation"] = gnss.geoidSeparation;
-        jorigin["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
-        data["enu_origin"] = jorigin;
-
-        nlohmann::json jgnss = nlohmann::json::array();
-        for (const auto& p : gnss.gnss_poses)
-        {
-            jgnss.push_back(
-                { { "timestamp", p.timestamp },
-                  { "lat", p.lat },
-                  { "lon", p.lon },
-                  { "h_wgs84", p.h_wgs84 },
-                  { "undulation", p.undulation },
-                  { "alt", p.alt },
-                  { "hdop", p.hdop },
-                  { "satelites_tracked", p.satelites_tracked },
-                  { "height", p.height },
-                  { "age", p.age },
-                  { "time", p.time },
-                  { "fix_quality", p.fix_quality },
-                  { "enu_x", p.enu_x },
-                  { "enu_y", p.enu_y },
-                  { "enu_z", p.enu_z },
-                  { "dist_xy_along", p.dist_xy_along } });
-        }
-        data["gnss_measurements"] = jgnss;
-
-        nlohmann::json jtum = nlohmann::json::array();
-        for (const auto& p : tum.tum_poses)
-        {
-            jtum.push_back(
-                { { "timestamp", p.timestamp },
-                  { "x", p.x },
-                  { "y", p.y },
-                  { "z", p.z },
-                  { "qx", p.qx },
-                  { "qy", p.qy },
-                  { "qz", p.qz },
-                  { "qw", p.qw } });
-        }
-        data["tum_trajectory"] = jtum;
+        data.update(HDMapping::EncodeReferenceTracks(gnss, tum));
 
         std::ofstream fout(path);
         if (!fout.good())
@@ -2937,76 +3470,21 @@ static void writeGnssTumToSessionFile(const std::string& path, const GNSS& gnss,
 
 static void readGnssTumFromSessionFile(const std::string& path, GNSS& gnss, TUM& tum)
 {
+    const auto show_gnss = gnss.show_correspondences;
+    const auto show_tum = tum.show_correspondences;
+    const auto point_size = tum.point_size;
+    const auto next_tum_version = tum.version + 1;
+    gnss = GNSS{};
+    tum = TUM{};
+    gnss.show_correspondences = show_gnss;
+    tum.show_correspondences = show_tum;
+    tum.point_size = point_size;
+    tum.version = next_tum_version;
     try
     {
-        std::ifstream fin(path);
-        if (!fin.good())
-            return;
-        nlohmann::json data = nlohmann::json::parse(fin);
-
-        if (data.contains("enu_origin"))
-        {
-            const auto& jorigin = data["enu_origin"];
-            gnss.WGS84ReferenceLatitude = jorigin.value("latitude", 0.0);
-            gnss.WGS84ReferenceLongitude = jorigin.value("longitude", 0.0);
-            gnss.geoidSeparation = jorigin.value("geoid_separation", 0.0);
-            // A stored origin takes precedence over re-deriving one from the
-            // first GNSS pose; honour an explicit flag if the session carries
-            // one, otherwise assume the stored origin should be used as-is.
-            gnss.setWGS84ReferenceFromFirstPose = jorigin.value("set_from_first_pose", false);
-            spdlog::info(
-                "Loaded ENU origin from session: lat={}, lon={}, geoid_separation={}",
-                gnss.WGS84ReferenceLatitude,
-                gnss.WGS84ReferenceLongitude,
-                gnss.geoidSeparation);
-        }
-
-        if (data.contains("gnss_measurements"))
-        {
-            gnss.gnss_poses.clear();
-            for (const auto& j : data["gnss_measurements"])
-            {
-                GNSS::GlobalPose p{};
-                p.timestamp = j.value("timestamp", 0.0);
-                p.lat = j.value("lat", 0.0);
-                p.lon = j.value("lon", 0.0);
-                p.h_wgs84 = j.value("h_wgs84", 0.0);
-                p.undulation = j.value("undulation", 0.0);
-                p.alt = j.value("alt", 0.0);
-                p.hdop = j.value("hdop", 0.0);
-                p.satelites_tracked = j.value("satelites_tracked", 0.0);
-                p.height = j.value("height", 0.0);
-                p.age = j.value("age", 0.0);
-                p.time = j.value("time", 0.0);
-                p.fix_quality = j.value("fix_quality", 0.0);
-                p.enu_x = j.value("enu_x", 0.0);
-                p.enu_y = j.value("enu_y", 0.0);
-                p.enu_z = j.value("enu_z", 0.0);
-                p.dist_xy_along = j.value("dist_xy_along", 0.0);
-                gnss.gnss_poses.push_back(p);
-            }
-            spdlog::info("Loaded {} GNSS measurement(s) from session '{}'", gnss.gnss_poses.size(), path);
-        }
-
-        if (data.contains("tum_trajectory"))
-        {
-            tum.tum_poses.clear();
-            for (const auto& j : data["tum_trajectory"])
-            {
-                TUM::TumPose p{};
-                p.timestamp = j.value("timestamp", 0.0);
-                p.x = j.value("x", 0.0);
-                p.y = j.value("y", 0.0);
-                p.z = j.value("z", 0.0);
-                p.qx = j.value("qx", 0.0);
-                p.qy = j.value("qy", 0.0);
-                p.qz = j.value("qz", 0.0);
-                p.qw = j.value("qw", 1.0);
-                tum.tum_poses.push_back(p);
-            }
-            tum.version++;
-            spdlog::info("Loaded {} TUM pose(s) from session '{}'", tum.tum_poses.size(), path);
-        }
+        std::ifstream fin(sessionPathFromText(path));
+        if (fin)
+            HDMapping::DecodeReferenceTracks(nlohmann::json::parse(fin), gnss, tum);
     } catch (const std::exception& e)
     {
         spdlog::error("Failed reading GNSS/TUM data from session '{}': {}", path, e.what());
@@ -3017,6 +3495,7 @@ void loadSession(const std::string& session_file_name)
 {
     spdlog::info("Session file: '{}'", session_file_name);
 
+    markBulkEdit();
     if (session.load(
             fs::path(session_file_name).string(),
             tls_registration.is_decimate,
@@ -3025,6 +3504,7 @@ void loadSession(const std::string& session_file_name)
             tls_registration.bucket_z,
             tls_registration.calculate_offset))
     {
+        openedStep2Session(session_file_name);
         session_loaded = true;
         index_begin = 0;
         index_end = session.point_clouds_container.point_clouds.size() - 1;
@@ -3140,7 +3620,11 @@ std::string saveSession(std::string output_file_name = "")
         const std::string poses_file_name = (dir / (stem + "_poses.mrp")).string();
 
         exportInMemoryPointClouds(dir, false);
-        session.save(output_file_name, poses_file_name, initial_poses_file_name, false);
+        [[maybe_unused]] bool saved = session.save(output_file_name, poses_file_name, initial_poses_file_name, false);
+#ifdef HDMAPPING_GUI_STATE
+        if (saved)
+            state_path = output_file_name;
+#endif
         writeGnssTumToSessionFile(output_file_name, tls_registration.gnss, tls_registration.tum);
         spdlog::info("Saving result to: '{}'", poses_file_name);
         session.point_clouds_container.save_poses(poses_file_name, false);
@@ -3174,6 +3658,7 @@ std::string saveSession(std::string output_file_name = "")
 // session folder) and does its own in-memory fill.
 void finalizeScanSession(const std::string& sourceDir, bool fillInSession)
 {
+    openedStep2Session(sourceDir);
     session_loaded = true;
     index_begin = 0;
     index_end = session.point_clouds_container.point_clouds.size() - 1;
@@ -3399,7 +3884,7 @@ void loadE57Files(const std::vector<std::string>& input_file_names, bool fillInS
             pc.laz_in_memory_only = true;
             // Provenance for "Update e57 poses".
             pc.e57_source_path = abs_src;
-            pc.e57_scan_index = static_cast<int>(si);
+            pc.e57_scan_index = static_cast<int>(scan.data3d_index);
             pc.points_local = std::move(scan.points);
             pc.intensities = std::move(scan.intensities);
             pc.colors = std::move(scan.colors);
@@ -3772,6 +4257,7 @@ void settings_gui()
             {
                 session.working_directory = fs::path(input_file_name).parent_path().string();
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load(
                         session.working_directory.c_str(),
                         input_file_name.c_str(),
@@ -3785,7 +4271,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(input_file_name);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::SameLine();
@@ -3810,6 +4299,7 @@ void settings_gui()
             {
                 session.working_directory = fs::path(input_file_name).parent_path().string();
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load_eth(
                         session.working_directory.c_str(),
                         input_file_name.c_str(),
@@ -3822,7 +4312,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(input_file_name);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::Text("ETH dataset: ");
@@ -3845,6 +4338,7 @@ void settings_gui()
                 for (size_t i = 0; i < input_file_names.size(); i++)
                     spdlog::info("{}", input_file_names[i]);
 
+                markBulkEdit();
                 if (!session.point_clouds_container.load_3DTK_tls(
                         input_file_names,
                         tls_registration.is_decimate,
@@ -3856,7 +4350,10 @@ void settings_gui()
                     return;
                 }
                 else
+                {
+                    openedStep2Session(session.working_directory);
                     spdlog::info("Loaded: {} point_clouds", session.point_clouds_container.point_clouds.size());
+                }
             }
         }
         ImGui::Text("3DTK dataset (18: the campus of the Jacobs University Bremen)");
@@ -5306,17 +5803,16 @@ void lioSegmentsGizmo()
 
             if (ImGuizmo::IsUsing())
             {
-                // Mid-drag: only update the preview chain (CPU-only); m_pose is
-                // left untouched so syncPoses() doesn't re-upload the moved scans.
-                // Each following scan keeps its offset to the previous one,
-                // taken from the still-unmodified m_pose values.
-                const size_t last = manipulate_only_marked_gizmo ? i + 1 : pcs.size();
-                gizmo_drag_first_index = static_cast<int>(i);
-                gizmo_drag_preview_poses.resize(last - i);
-                gizmo_drag_preview_poses[0] = Eigen::Affine3d(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
-                for (size_t j = i + 1; j < last; j++)
+                if (!isGizmoDragging())
                 {
-                    gizmo_drag_preview_poses[j - i] = gizmo_drag_preview_poses[j - i - 1] * (pcs[j - 1].m_pose.inverse() * pcs[j].m_pose);
+                    gizmo_drag_first_index = static_cast<int>(i);
+                    gizmo_drag_target = currentStep2Target();
+                }
+                if (gizmo_drag_target == currentStep2Target())
+                {
+                    const auto count = manipulate_only_marked_gizmo ? 1 : pcs.size() - i;
+                    const Eigen::Affine3d anchor(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
+                    gizmo_drag_preview_poses = proc::PreviewStep2Segment(session.point_clouds_container, i, count, anchor);
                 }
             }
             else
@@ -5327,6 +5823,47 @@ void lioSegmentsGizmo()
             }
         }
     }
+}
+
+static void importGnssReference(std::string_view format, std::string_view projection)
+{
+    const bool nmea = format == "nmea";
+    const auto paths = mandeye::fd::OpenFileDialog(
+        nmea ? "Load nmea files" : "Load gnss files", nmea ? mandeye::fd::Nmea_filter : mandeye::fd::Gnss_filter, true);
+    if (paths.empty())
+        return;
+    auto& gnss = tls_registration.gnss;
+#ifdef HDMAPPING_GUI_STATE
+    nlohmann::json parameters = { { "paths", paths }, { "format", std::string(format) }, { "projection", std::string(projection) } };
+    if (projection == "puwg92")
+        parameters["localize"] = gnssWithOffset;
+    else
+    {
+        parameters["set_from_first_pose"] = gnss.setWGS84ReferenceFromFirstPose;
+        if (!gnss.setWGS84ReferenceFromFirstPose)
+        {
+            parameters["latitude_deg"] = gnss.WGS84ReferenceLatitude;
+            parameters["longitude_deg"] = gnss.WGS84ReferenceLongitude;
+        }
+    }
+    submitStep2Job("gnss.import", nlohmann::json::object(), std::move(parameters), true);
+#else
+    if (projection == "puwg92")
+    {
+        Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+        if (gnss.load_data_from_gnss_and_convert_to_92(paths, offset, gnssWithOffset))
+            session.point_clouds_container.offset_to_apply = offset;
+        else
+            spdlog::error("Error loading GNSS files!");
+        return;
+    }
+    const bool loaded = nmea ? gnss.load_raw_data_from_nmea(paths) : gnss.load_raw_data_from_gnss(paths);
+    if (!loaded)
+        spdlog::error("Error loading {} files!", format);
+    const bool projected = projection == "mercator" ? gnss.project_to_mercator_projection() : gnss.project_using_proj();
+    if (!projected)
+        spdlog::error("Error converting WGS84 to {} projection!", projection);
+#endif
 }
 
 void display()
@@ -5435,6 +5972,28 @@ void display()
     frame_mvp_3d = MatrixMultiply(app_state.camera.frameView3D, app_state.camera.frameProj3D);
 
     showAxes();
+#ifdef HDMAPPING_GUI_STATE
+    if (state_bridge && state_bridge->Reserved())
+    {
+        // Some editor panels write back to scans even on idle frames. During a pin
+        // draw only from the scan cache, with the usual camera matrices and input.
+        scan_renderer.draw(
+            session.point_clouds_container.point_clouds,
+            static_cast<float>(app_state.point_size),
+            scanColorModeFromScheme(csPointCloud),
+            static_cast<float>(session_dims.z_min),
+            static_cast<float>(session_dims.z_max));
+        raylib_widgets::end3DMatrixStack(io.DisplaySize.x, io.DisplaySize.y);
+        rlImGuiBegin();
+        view_kbd_shortcuts();
+        ImGui::Begin("Processing");
+        ImGui::TextUnformatted("Session reserved for processing. Camera controls are available.");
+        ImGui::End();
+        registrationJobGui(*registration_connection);
+        rlImGuiEnd();
+        return;
+    }
+#endif
     drawIntersectionGrids(session.point_clouds_container, session_dims);
 
     // renderLoopClosure() hides every scan except the current source/target
@@ -5504,15 +6063,27 @@ void display()
     // draw list only actually hits the GPU once, at rlImGuiEnd() near the
     // end of this function).
     rlImGuiBegin();
+#ifdef HDMAPPING_GUI_STATE
+    registrationJobGui(*registration_connection);
+#endif
 
     ShowMainDockSpace();
 
     if (session.control_points.is_imgui)
     {
+        const Eigen::Vector3f rotation_center(
+            app_state.camera.euler.rotationCenter.x, app_state.camera.euler.rotationCenter.y, app_state.camera.euler.rotationCenter.z);
+#ifdef HDMAPPING_GUI_STATE
         session.control_points.imgui(
             session.point_clouds_container,
-            Eigen::Vector3f(
-                app_state.camera.euler.rotationCenter.x, app_state.camera.euler.rotationCenter.y, app_state.camera.euler.rotationCenter.z));
+            rotation_center,
+            []
+            {
+                submitReferenceAlignment("cp");
+            });
+#else
+        session.control_points.imgui(session.point_clouds_container, rotation_center);
+#endif
 
         // Appends to the same "Control Point" window ControlPoints::imgui() just built.
         if (session.control_points.is_imgui)
@@ -5529,7 +6100,18 @@ void display()
     }
 
     if (session.ground_control_points.is_imgui)
+    {
+#ifdef HDMAPPING_GUI_STATE
+        session.ground_control_points.imgui(
+            session.point_clouds_container,
+            []
+            {
+                submitReferenceAlignment("gcp");
+            });
+#else
         session.ground_control_points.imgui(session.point_clouds_container);
+#endif
+    }
 
     // Commits a still-running drag whose gizmo won't be processed this frame.
     commitGizmoDragIfOrphaned();
@@ -5547,7 +6129,8 @@ void display()
             // from the cached GPU buffers, so hide them from the regular draw.
             // (With "show with initial pose" the drag isn't visible anyway.)
             auto& pcs = session.point_clouds_container.point_clouds;
-            const bool drawDragPreview = isGizmoDragging() && !session.point_clouds_container.show_with_initial_pose;
+            const bool drawDragPreview =
+                isGizmoDragging() && gizmo_drag_target == currentStep2Target() && !session.point_clouds_container.show_with_initial_pose;
             std::vector<char> previewWasVisible;
             if (drawDragPreview)
             {
@@ -5968,7 +6551,6 @@ void display()
                 ImGui::Separator();
                 if (ImGui::BeginMenu("Save all marked scans"))
                 {
-                    static bool skip_ts_0 = true;
                     ImGui::Checkbox("Skip points with zero ts", &skip_ts_0);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Invalid points with zero timestamp will be skipped during export");
@@ -6241,97 +6823,25 @@ void display()
                     ImGui::MenuItem("Load with offset -> move to (0,0,0)", nullptr, &gnssWithOffset);
 
                     if (ImGui::MenuItem("Load GNSS files and convert WGS84 to PUWG92"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            Eigen::Vector3d out_offset(0.0, 0.0, 0.0);
-                            if (!tls_registration.gnss.load_data_from_gnss_and_convert_to_92(input_file_names, out_offset, gnssWithOffset))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            else
-                            {
-                                session.point_clouds_container.offset_to_apply = out_offset;
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "puwg92");
 
                     ImGui::MenuItem("Set WGS84 reference from 1st pose", nullptr, &tls_registration.gnss.setWGS84ReferenceFromFirstPose);
 
                     ImGui::Text("Load & convert WGS84 to Cartesian by Mercator projection");
 
                     if (ImGui::MenuItem("Load GNSS (deprecated)"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            if (!tls_registration.gnss.project_to_mercator_projection())
-                            {
-                                spdlog::error("Error converting WGS84 to Mercator projection!");
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "mercator");
                     if (ImGui::MenuItem("Load GNSS"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load gnss files", mandeye::fd::Gnss_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            if (!tls_registration.gnss.load_raw_data_from_gnss(input_file_names))
-                            {
-                                spdlog::error("Error loading GNSS files!");
-                            }
-                            if (!tls_registration.gnss.project_using_proj())
-                            {
-                                spdlog::error("Error converting WGS84 to PROJ projection!");
-                            }
-                        }
-                    }
+                        importGnssReference("gnss", "topocentric");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load structured GNSS dataset and decode it into coordinates, using PROJ library");
 
                     if (ImGui::MenuItem("Load NMEA (deprecated)"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load nmea files", mandeye::fd::Nmea_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
-                                spdlog::error("Error loading NMEA files!");
-                        }
-                        if (!tls_registration.gnss.project_to_mercator_projection())
-                        {
-                            spdlog::error("Error converting WGS84 to Mercator projection!");
-                        }
-                    }
+                        importGnssReference("nmea", "mercator");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load raw GNSS serial output and decode it into coordinates");
                     if (ImGui::MenuItem("Load NMEA"))
-                    {
-                        std::vector<std::string> input_file_names;
-                        input_file_names = mandeye::fd::OpenFileDialog("Load nmea files", mandeye::fd::Nmea_filter, true);
-
-                        if (input_file_names.size() > 0)
-                        {
-                            if (!tls_registration.gnss.load_raw_data_from_nmea(input_file_names))
-                                spdlog::error("Error loading NMEA files!");
-                        }
-                        if (!tls_registration.gnss.project_using_proj())
-                        {
-                            spdlog::error("Error converting WGS84 to PROJ projection!");
-                        }
-                    }
+                        importGnssReference("nmea", "topocentric");
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Load raw GNSS serial output and decode it into coordinates, using PROJ library");
 
@@ -6409,11 +6919,29 @@ void display()
                         std::string itemName = "Save metascan points in " + crtName + " (PROJ)";
                         if (ImGui::MenuItem(itemName.c_str()))
                         {
+                            if (!tls_registration.gnss.projected_crs.empty())
+                            {
+                                spdlog::error(
+                                    "Metascan projection requires a topocentric reference. Current GNSS CRS is '{}'.",
+                                    tls_registration.gnss.projected_crs);
+                                continue;
+                            }
                             const auto output_file_name = mandeye::fd::SaveFileDialog(out_fn.c_str(), mandeye::fd::LAS_LAZ_filter, ".laz");
 
                             const auto [pointcloud, intensity, timestamps] = prepareVisibleData();
                             const auto lla_points = tls_registration.gnss.unproject_using_proj(pointcloud);
                             auto crt_points = tls_registration.gnss.CRTConvert(lla_points, crtName, selected_geoid_model);
+                            if (crt_points.empty() ||
+                                !std::ranges::all_of(
+                                    crt_points,
+                                    [](const auto& p)
+                                    {
+                                        return p.allFinite();
+                                    }))
+                            {
+                                spdlog::error("Could not project scan points in '{}' with geoid '{}'", crtName, selected_geoid_model);
+                                continue;
+                            }
                             Eigen::Vector3d offset = crt_points.front();
                             for (auto& p : crt_points)
                             {
@@ -6441,6 +6969,17 @@ void display()
                             }
 
                             auto crt_points = tls_registration.gnss.CRTConvert(lla_points, crtName, selected_geoid_model);
+                            if (crt_points.empty() ||
+                                !std::ranges::all_of(
+                                    crt_points,
+                                    [](const auto& p)
+                                    {
+                                        return p.allFinite();
+                                    }))
+                            {
+                                spdlog::error("Could not project GNSS points in '{}' with geoid '{}'", crtName, selected_geoid_model);
+                                continue;
+                            }
                             Eigen::Vector3d offset = crt_points.front();
                             for (auto& p : crt_points)
                             {
@@ -6468,8 +7007,15 @@ void display()
                         std::vector<std::string> input_file_names;
                         input_file_names = mandeye::fd::OpenFileDialog("Load TUM trajectory files", mandeye::fd::Tum_filter, true);
 
-                        if (input_file_names.size() > 0)
+                        if (!input_file_names.empty())
                         {
+#ifdef HDMAPPING_GUI_STATE
+                            submitStep2Job(
+                                "tum.import",
+                                nlohmann::json::object(),
+                                { { "paths", std::move(input_file_names) }, { "subtract_first_pose", tumSubtractFirstPose } },
+                                true);
+#else
                             if (!tls_registration.tum.load_data_from_tum(input_file_names, tumSubtractFirstPose))
                             {
                                 spdlog::error("Error loading TUM trajectory files!");
@@ -6482,6 +7028,7 @@ void display()
                                     session.point_clouds_container.offset.y(),
                                     session.point_clouds_container.offset.z());
                             }
+#endif
                         }
                     }
                     if (ImGui::IsItemHovered())
@@ -6726,8 +7273,12 @@ void display()
             ImGui::BeginDisabled(loop_closure.icp_all_edges_run.running);
             if (ImGui::Button("Compute Pose Graph SLAM"))
             {
+#ifdef HDMAPPING_GUI_STATE
+                submitGraphOptimization();
+#else
                 loop_closure.compute_pose_graph_slam(
                     session.point_clouds_container, tls_registration.gnss, session.ground_control_points, session.control_points);
+#endif
             }
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -7112,12 +7663,9 @@ void display()
     {
         translate_gui();
     }
-    else if (translate_tool.step != TranslateTool::Step::Idle)
+    else
     {
-        translate_tool.step = TranslateTool::Step::Idle;
-        translate_tool.has_transform = false;
-        translate_tool.transform = Eigen::Affine3d::Identity();
-        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+        clearTranslatePreview();
     }
 
     if (is_section_gui)
@@ -7259,6 +7807,7 @@ void translate_gui()
 
     if (ImGui::Button("Start picking"))
     {
+        translate_tool.target = currentStep2Target();
         translate_tool.step = TranslateTool::Step::PickOrigin;
         translate_tool.has_transform = false;
         translate_tool.transform = Eigen::Affine3d::Identity();
@@ -7270,12 +7819,7 @@ void translate_gui()
     }
     ImGui::SameLine();
     if (ImGui::Button("Reset"))
-    {
-        translate_tool.step = TranslateTool::Step::Idle;
-        translate_tool.has_transform = false;
-        translate_tool.transform = Eigen::Affine3d::Identity();
-        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
-    }
+        clearTranslatePreview();
 
     const char* step_text = "Idle";
     switch (translate_tool.step)
@@ -7313,11 +7857,13 @@ void translate_gui()
     ImGui::Separator();
     ImGui::BeginDisabled(!translate_tool.has_transform);
     {
-        if (ImGui::Button("Translate"))
+        if (ImGui::Button("Translate") &&
+            commitStep2PoseEdit(
+                proc::transform_scope_operation,
+                step2ScanScope(0, session.point_clouds_container.point_clouds.size()),
+                step2MatrixParameter("transform", translate_tool.transform),
+                translate_tool.target))
         {
-            for (auto& pc : session.point_clouds_container.point_clouds)
-                pc.m_pose = translate_tool.transform * pc.m_pose;
-
             for (auto& cp : session.control_points.cps)
             {
                 Eigen::Vector3d g(cp.x_target_global, cp.y_target_global, cp.z_target_global);
@@ -7327,10 +7873,7 @@ void translate_gui()
                 cp.z_target_global = g.z();
             }
 
-            translate_tool.step = TranslateTool::Step::Idle;
-            translate_tool.has_transform = false;
-            translate_tool.transform = Eigen::Affine3d::Identity();
-            SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+            clearTranslatePreview();
         }
     }
     ImGui::EndDisabled();
@@ -7377,6 +7920,18 @@ void mouse(int glut_button, int state, int x, int y)
 
     if (!io.WantCaptureMouse)
     {
+#ifdef HDMAPPING_GUI_STATE
+        if (state_bridge && state_bridge->Reserved())
+        {
+            if (state == GLUT_DOWN)
+                app_state.mouse_buttons |= 1 << glut_button;
+            else if (state == GLUT_UP)
+                app_state.mouse_buttons = 0;
+            app_state.mouse_old_x = x;
+            app_state.mouse_old_y = y;
+            return;
+        }
+#endif
         if (glut_button == GLUT_LEFT_BUTTON && state == GLUT_DOWN && !io.KeyCtrl && !io.KeyShift &&
             translate_tool.step != TranslateTool::Step::Idle && translate_tool.step != TranslateTool::Step::Ready)
         {
@@ -7685,6 +8240,534 @@ int exportSessionToDirectory(const fs::path& input_file, const fs::path& output_
     return 0;
 }
 
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+// P04 developer probe on the GUI owner thread. P06 adds shared revision tracking and capture RPC.
+static void captureSessionProbe(const fs::path& destination)
+{
+    using namespace HDMapping::Processing;
+    const TargetRef target{ "step2-probe", 1 };
+    const auto& ndt = tls_registration.ndt;
+    SessionCaptureSource source(
+        session_owner,
+        [target]
+        {
+            return target;
+        },
+        { { "ndt",
+            { { "bucket_size", { ndt.bucket_size[0], ndt.bucket_size[1], ndt.bucket_size[2] } },
+              { "number_of_iterations", ndt.number_of_iterations },
+              { "number_of_threads", ndt.number_of_threads },
+              { "is_fix_first_node", ndt.is_fix_first_node },
+              { "is_generalized", ndt.is_generalized } } } });
+    RunContext context{};
+    const auto begin = std::chrono::steady_clock::now();
+    const auto snapshot = CaptureSnapshot(source, target.revision, destination, context);
+    if (const auto* failure = std::get_if<OperationError>(&snapshot))
+    {
+        spdlog::error("Snapshot capture: {}: {}", failure->code, failure->message);
+        return;
+    }
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    const auto& scans = session.point_clouds_container.point_clouds;
+    std::size_t points = 0;
+    for (const auto& scan : scans)
+    {
+        points += scan.points_local.size();
+    }
+    spdlog::info(
+        "Snapshot captured in {:.3f} s: {} scans, {} points, first pose X {:.17g}, NDT iterations {}",
+        elapsed,
+        scans.size(),
+        points,
+        scans.front().m_pose.translation().x(),
+        ndt.number_of_iterations);
+}
+#endif
+
+#ifdef HDMAPPING_GUI_STATE
+// Read editor inputs at the GUI dispatch boundary. Core panels edit poses,
+// constraints and control points directly, including from keyboard shortcuts.
+// Bulk point and trajectory arrays are tracked at their editing call sites.
+static nlohmann::json step2EditorInputs()
+{
+    using nlohmann::json;
+    const auto& clouds = session.point_clouds_container;
+    const auto& graph = session.pose_graph_loop_closure;
+    const auto& pgs = tls_registration.pose_graph_slam;
+    const auto& gnss = tls_registration.gnss;
+    const auto& bow = bow_state.params;
+    json inputs = describeStep2Parameters(tls_registration);
+    inputs["range"] = { index_begin, index_end, angle_diff };
+    inputs["endpoints"] = { index_loop_closure_source, index_loop_closure_target, num_edge_extended_before, num_edge_extended_after };
+    inputs["import"] = { tls_registration.calculate_offset, tls_registration.is_decimate, fillInSession, session.load_cache_mode };
+    inputs["decimation"] = { tls_registration.bucket_x, tls_registration.bucket_y, tls_registration.bucket_z };
+    inputs["trajectory_export"] = { skip_ts_0,
+                                    tls_registration.is_trajectory_export_downsampling,
+                                    tls_registration.curve_consecutive_distance_meters,
+                                    tls_registration.not_curve_consecutive_distance_meters };
+    inputs["graph_solver"] = { pgs.search_radius,
+                               pgs.number_of_threads,
+                               pgs.number_of_iterations_pair_wise_matching,
+                               pgs.overlap_threshold,
+                               pgs.is_adaptive_robust_kernel,
+                               pgs.is_fix_first_node,
+                               PGSnomSelection,
+                               PGSpeSelection,
+                               PGS3dSelection,
+                               PGSpwmtSelection };
+    inputs["manual_graph"] = { graph.index_active_edge,
+                               graph.search_radious,
+                               graph.icp_all_edges_start_radius,
+                               graph.keep_initial_trajectory_curvature,
+                               graph.use_gnss_correspondences };
+    inputs["motion_sigmas"] = { graph.motion_model_w_px_1_sigma_m,   graph.motion_model_w_py_1_sigma_m,
+                                graph.motion_model_w_pz_1_sigma_m,   graph.motion_model_w_om_1_sigma_deg,
+                                graph.motion_model_w_fi_1_sigma_deg, graph.motion_model_w_ka_1_sigma_deg };
+    inputs["gnss"] = { gnssWithOffset,
+                       selected_geoid_model,
+                       gnss.WGS84ReferenceLatitude,
+                       gnss.WGS84ReferenceLongitude,
+                       gnss.geoidSeparation,
+                       gnss.setWGS84ReferenceFromFirstPose,
+                       gnss.gnss_poses.size() };
+    inputs["tum"] = { tumSubtractFirstPose, tls_registration.tum.version };
+    inputs["bow"] = { bow.min_arc_gap_m, bow.max_xy_dist_m, bow.min_bow_score, bow.min_inliers, bow.orb_features, bow.max_image_size_px };
+    inputs["offset"] = { clouds.offset.x(), clouds.offset.y(), clouds.offset.z() };
+    inputs["offset_to_apply"] = { clouds.offset_to_apply.x(), clouds.offset_to_apply.y(), clouds.offset_to_apply.z() };
+    inputs["sections"] = { clouds.xz_intersection, clouds.yz_intersection, clouds.xy_intersection, clouds.intersection_width };
+    inputs["picking"] = { observation_picking.picking_plane_height,
+                          observation_picking.picking_plane_threshold,
+                          session.ground_control_points.default_lidar_height_above_ground };
+    for (const auto& dir : bow_state.camera_dirs)
+        inputs["camera_dirs"].push_back(dir.data());
+    // Group pose matrices in contiguous storage. Comparing lightweight scan
+    // metadata never traverses the points or serializes them per frame.
+    std::vector<std::uint8_t> poses;
+    poses.reserve(32 * sizeof(double) * clouds.point_clouds.size());
+    for (const auto& scan : clouds.point_clouds)
+    {
+        for (const auto* matrix : { scan.m_pose.data(), scan.m_initial_pose.data() })
+        {
+            const auto* data = reinterpret_cast<const std::uint8_t*>(matrix);
+            poses.insert(poses.end(), data, data + 16 * sizeof(double));
+        }
+        inputs["scans"].push_back(
+            { scan.file_name,
+              scan.points_local.size(),
+              scan.normal_vectors_local.size(),
+              scan.local_trajectory.size(),
+              scan.fuse_inclination_from_IMU,
+              scan.fixed_x,
+              scan.fixed_y,
+              scan.fixed_z,
+              scan.fixed_om,
+              scan.fixed_fi,
+              scan.fixed_ka });
+    }
+    inputs["poses"] = json::binary(std::move(poses));
+    for (const auto& edge : graph.edges)
+    {
+        const auto& p = edge.relative_pose_tb;
+        const auto& w = edge.relative_pose_tb_weights;
+        inputs["edges"].push_back(
+            { edge.index_from,
+              edge.index_to,
+              p.px,
+              p.py,
+              p.pz,
+              p.om,
+              p.fi,
+              p.ka,
+              w.px,
+              w.py,
+              w.pz,
+              w.om,
+              w.fi,
+              w.ka,
+              edge.is_fixed_px,
+              edge.is_fixed_py,
+              edge.is_fixed_pz,
+              edge.is_fixed_om,
+              edge.is_fixed_fi,
+              edge.is_fixed_ka });
+    }
+    for (const auto& p : session.control_points.cps)
+        inputs["cp"].push_back(
+            { p.name,
+              p.x_source_local,
+              p.y_source_local,
+              p.z_source_local,
+              p.x_target_global,
+              p.y_target_global,
+              p.z_target_global,
+              p.sigma_x,
+              p.sigma_y,
+              p.sigma_z,
+              p.index_to_pose,
+              p.is_z_0 });
+    for (const auto& p : session.ground_control_points.gpcs)
+        inputs["gcp"].push_back(
+            { p.name,
+              p.x,
+              p.y,
+              p.z,
+              p.sigma_x,
+              p.sigma_y,
+              p.sigma_z,
+              p.lidar_height_above_ground,
+              p.index_to_node_inner,
+              p.index_to_node_outer });
+    auto observation = [](const auto& points)
+    {
+        json values = json::array();
+        for (const auto& [index, p] : points)
+            values.push_back({ index, p.x(), p.y(), p.z() });
+        return values;
+    };
+    inputs["current_observation"] = observation(observation_picking.current_observation);
+    for (const auto& o : observation_picking.observations)
+        inputs["observations"].push_back(observation(o));
+    for (const auto& i : observation_picking.intersections)
+        inputs["intersections"].push_back({ i.translation, i.rotation, i.width_length_height });
+    return inputs;
+}
+
+static nlohmann::json step2CaptureParameters()
+{
+    auto parameters = describeStep2Parameters(tls_registration);
+    parameters.update(proc::DescribeSessionExchange(session));
+    auto selected = nlohmann::json::array();
+    const auto& scans = session.point_clouds_container.point_clouds;
+    for (std::size_t i = 0; i < scans.size(); ++i)
+        if (scans[i].visible)
+            selected.push_back(i);
+    parameters["visible_scans"] = std::move(selected);
+    parameters["range"] = { index_begin, index_end };
+    parameters["manual_graph"] = proc::DescribeManualGraphSettings(session.pose_graph_loop_closure);
+    parameters["observations"] = nlohmann::json::array();
+    for (const auto& observation : observation_picking.observations)
+    {
+        auto points = nlohmann::json::array();
+        for (const auto& [scan_id, value] : observation)
+            points.push_back({ { "scan_id", scan_id }, { "local_coords", { value.x(), value.y(), value.z() } } });
+        parameters["observations"].push_back(std::move(points));
+    }
+    parameters["intersections"] = nlohmann::json::array();
+    for (const auto& roi : observation_picking.intersections)
+        parameters["intersections"].push_back(
+            { { "translation", roi.translation }, { "rotation", roi.rotation }, { "size", roi.width_length_height } });
+    return parameters;
+}
+
+static proc::StateSummary describeStep2()
+{
+    auto operations = nlohmann::json::array(
+        { "step2.set_parameters",
+          proc::register_scans_operation,
+          proc::list_constraints_operation,
+          proc::detect_candidates_operation,
+          "constraints.add",
+          "constraints.update",
+          "constraints.remove",
+          "constraints.replace",
+          proc::constraint_icp_operation,
+          proc::optimize_graph_operation });
+    for (const auto& operation : proc::DescribeStep2Georeference())
+        operations.push_back(operation.id);
+    for (const auto& operation : proc::DescribeStep2Segments())
+        operations.push_back(operation.id);
+    for (const auto operation : { proc::session_open_operation,
+                                  proc::session_save_operation,
+                                  proc::session_subsession_operation,
+                                  proc::import_session_poses_operation,
+                                  proc::import_session_observations_operation,
+                                  proc::export_session_operation })
+        operations.push_back(operation);
+    return { {},
+             step2CaptureParameters(),
+             { { "kind", "session" },
+               { "path", state_path },
+               { "registration_result_path", registration_result_path },
+               { "constraint_result_path", constraint_result_path },
+               { "georeference_result_path", georeference_result_path },
+               { "loop_candidates_path",
+                 bow_state.result_target.state_id == state_bridge->Target().state_id ? sessionPathText(bow_state.report_path)
+                                                                                     : std::string{} },
+               { "active_edges", proc::DescribeActiveConstraints(session) },
+               { "control_points", proc::DescribeControlPoints(session) },
+               { "ground_control_points", proc::DescribeGroundControlPoints(session) },
+               { "reference",
+                 { { "gnss_count", tls_registration.gnss.gnss_poses.size() },
+                   { "tum_count", tls_registration.tum.tum_poses.size() },
+                   { "projected_crs", tls_registration.gnss.projected_crs },
+                   { "projected_vertical_datum", tls_registration.gnss.projected_vertical_datum },
+                   { "supported_crs", CRTs::SupportedCRTs },
+                   { "available_geoids", geoids } } },
+               { "scan_count", session.point_clouds_container.point_clouds.size() },
+               { "operations", std::move(operations) } } };
+}
+
+static proc::MutationResult mutateStep2(const proc::OperationRequest& request)
+{
+    if (proc::IsStep2SegmentOperation(request.operation))
+    {
+        auto result = proc::EditStep2Poses(session.point_clouds_container, request);
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        return describeStep2();
+    }
+    if (proc::IsStep2GeoreferenceOperation(request.operation))
+    {
+        if (auto error = proc::EditStep2Georeference(session, request))
+            return *error;
+        return describeStep2();
+    }
+    if (request.operation != "step2.set_parameters")
+    {
+        if (request.operation == proc::list_constraints_operation || !proc::IsStep2ConstraintOperation(request.operation))
+            return proc::OperationError{ "unknown_operation", "Unknown Step 2 mutation", {} };
+        if (auto error = proc::EditStep2Constraints(session, request))
+            return *error;
+        return describeStep2();
+    }
+    if (!request.scope.empty())
+        return proc::OperationError{ "invalid_scope", "Step 2 registration settings apply to the whole session", {} };
+    if (auto error = updateStep2Parameters(tls_registration, request.parameters))
+        return *error;
+    return describeStep2();
+}
+
+static std::optional<proc::OperationError> applyStep2Result(const proc::ArtifactManifest& artifact)
+{
+    auto snapshot = proc::ReadSnapshot(artifact.snapshot);
+    if (auto* error = std::get_if<proc::OperationError>(&snapshot))
+        return *error;
+    const auto& source = std::get<proc::SnapshotContents>(snapshot);
+    const auto imported_io = source.parameters.value("session_io_import", std::string{});
+    if (source.kind == "native_session" && imported_io == proc::import_session_poses_operation)
+    {
+        Session poses{};
+        if (!poses.load_snapshot_metadata(source.entry))
+            return proc::OperationError{ "invalid_result", "Could not read the imported RESSO poses", {} };
+        const bool initial = source.parameters.at("session_io_initial_poses").get<bool>();
+        auto result = proc::ApplyStep2PoseResult(
+            session.point_clouds_container, poses.point_clouds_container, source.parameters.at("session_io_pose_scope"), initial);
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+        return {};
+    }
+    if (source.kind == "native_session" && imported_io == proc::import_session_observations_operation)
+    {
+        std::vector<std::map<int, Eigen::Vector3d>> imported;
+        const auto& clouds = session.point_clouds_container;
+        const auto& scans = clouds.point_clouds;
+        for (const auto& observation : source.parameters.at("observations"))
+        {
+            auto& points = imported.emplace_back();
+            for (const auto& point : observation)
+            {
+                const auto index = point.at("scan_id").get<int>();
+                if (index < 0 || static_cast<std::size_t>(index) >= scans.size())
+                    return proc::OperationError{ "invalid_result", "Observation does not match a live scan", {} };
+                const auto coordinates = point.at("local_coords").get<std::array<double, 3>>();
+                points.try_emplace(index, coordinates[0], coordinates[1], coordinates[2]);
+            }
+        }
+        observation_picking.observations = std::move(imported);
+        for (const auto& points : observation_picking.observations)
+        {
+            if (points.empty())
+                continue;
+            const auto& [index, position] = *points.begin();
+            const auto& scan = scans[static_cast<std::size_t>(index)];
+            const auto& pose = clouds.show_with_initial_pose ? scan.m_initial_pose : scan.m_pose;
+            observation_picking.add_intersection(pose * position);
+        }
+        return {};
+    }
+    if (source.kind == "native_session" && source.parameters.contains("segment_result"))
+    {
+        const auto& edit = source.parameters.at("segment_result");
+        Session poses{};
+        if (!proc::IsStep2SegmentOperation(edit.at("operation").get_ref<const std::string&>()) ||
+            !poses.load_snapshot_metadata(source.entry))
+            return proc::OperationError{ "invalid_result", "Could not read the published Step 2 pose edit", {} };
+        auto result = proc::ApplyStep2PoseResult(session.point_clouds_container, poses.point_clouds_container, edit.at("scope"));
+        if (const auto* error = std::get_if<proc::OperationError>(&result))
+            return *error;
+        return {};
+    }
+    const auto constraintResult = source.parameters.find("constraints_result");
+    const bool graph_job = constraintResult != source.parameters.end();
+    const auto referenceResult = source.parameters.find("georeference_result");
+    const bool georeference_job = referenceResult != source.parameters.end();
+    if (source.kind == "native_session" && (graph_job || georeference_job || source.parameters.contains("registration")))
+    {
+        Session poses{};
+        auto& live = session.point_clouds_container.point_clouds;
+        if (!poses.load_snapshot_metadata(source.entry) || poses.point_clouds_container.point_clouds.size() != live.size())
+            return proc::OperationError{ "invalid_result", "Registered poses do not match the live session", {} };
+        if (georeference_job)
+        {
+            const auto& operation = referenceResult->at("operation").get_ref<const std::string&>();
+            if (!proc::IsStep2GeoreferenceOperation(operation))
+                return proc::OperationError{ "invalid_result", "Unknown georeference result operation", {} };
+            if (operation.starts_with("cp."))
+                session.control_points.cps = std::move(poses.control_points.cps);
+            if (operation.starts_with("gcp."))
+                session.ground_control_points.gpcs = std::move(poses.ground_control_points.gpcs);
+            if (operation.starts_with("gnss.") || operation == "tum.import")
+            {
+                std::ifstream input(source.entry);
+                const auto tracks = nlohmann::json::parse(input);
+                GNSS gnss;
+                TUM tum;
+                HDMapping::DecodeReferenceTracks(tracks, gnss, tum);
+                if (operation.starts_with("gnss."))
+                {
+                    auto& live_gnss = tls_registration.gnss;
+                    live_gnss.gnss_poses = std::move(gnss.gnss_poses);
+                    live_gnss.WGS84ReferenceLatitude = gnss.WGS84ReferenceLatitude;
+                    live_gnss.WGS84ReferenceLongitude = gnss.WGS84ReferenceLongitude;
+                    live_gnss.geoidSeparation = gnss.geoidSeparation;
+                    live_gnss.setWGS84ReferenceFromFirstPose = gnss.setWGS84ReferenceFromFirstPose;
+                    live_gnss.projected_crs = std::move(gnss.projected_crs);
+                    live_gnss.projected_vertical_datum = std::move(gnss.projected_vertical_datum);
+                    session.point_clouds_container.offset_to_apply = poses.point_clouds_container.offset_to_apply;
+                }
+                else
+                {
+                    auto& live_tum = tls_registration.tum;
+                    live_tum.tum_poses = std::move(tum.tum_poses);
+                    ++live_tum.version;
+                }
+            }
+            georeference_result_path = sessionPathText(source.entry);
+            if (operation != "step2.align_reference")
+                return {};
+        }
+        else if (graph_job)
+        {
+            auto& graph = session.pose_graph_loop_closure;
+            const auto& operation = constraintResult->at("operation").get_ref<const std::string&>();
+            const bool optimized = operation == proc::optimize_graph_operation;
+            if (optimized)
+                if (auto error = proc::UpdateManualGraphSettings(graph, source.parameters.at("manual_graph")))
+                    return error;
+            if (operation == proc::constraint_icp_operation)
+            {
+                const auto failed = constraintResult->at("failed_edge_indices").get<std::vector<int>>();
+                graph.icp_failed_edges = failed;
+                if (constraintResult->at("edge_indices").size() == graph.edges.size())
+                    graph.icp_all_edges_count = graph.edges.size();
+            }
+            graph.edges = std::move(poses.pose_graph_loop_closure.edges);
+            graph.gizmo = false;
+            constraint_result_path = sessionPathText(source.entry);
+            if (!optimized)
+                return {};
+        }
+        else
+        {
+            nlohmann::json settings = nlohmann::json::object();
+            for (const auto* solver : { "ndt", "icp", "plane_features" })
+                settings[solver] = source.parameters.at(solver);
+            if (auto error = updateStep2Parameters(tls_registration, settings))
+                return error;
+            registration_result_path = sessionPathText(source.entry);
+        }
+        for (std::size_t i = 0; i < live.size(); ++i)
+        {
+            auto& scan = live[i];
+            scan.m_pose = poses.point_clouds_container.point_clouds[i].m_pose;
+            scan.pose = pose_tait_bryan_from_affine_matrix(scan.m_pose);
+            scan.gui_translation[0] = static_cast<float>(scan.pose.px);
+            scan.gui_translation[1] = static_cast<float>(scan.pose.py);
+            scan.gui_translation[2] = static_cast<float>(scan.pose.pz);
+            scan.gui_rotation[0] = static_cast<float>(scan.pose.om * RAD_TO_DEG);
+            scan.gui_rotation[1] = static_cast<float>(scan.pose.fi * RAD_TO_DEG);
+            scan.gui_rotation[2] = static_cast<float>(scan.pose.ka * RAD_TO_DEG);
+        }
+        session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+        return {};
+    }
+    Session loaded{};
+    if (source.kind != "native_session" || !loaded.load_published(source.entry))
+        return proc::OperationError{ "invalid_result", "The result could not be opened as a published session", {} };
+    nlohmann::json settings = nlohmann::json::object();
+    for (const auto* solver : { "ndt", "icp" })
+        if (source.parameters.contains(solver))
+            settings[solver] = source.parameters.at(solver);
+    if (!settings.empty())
+        if (auto error = updateStep2Parameters(tls_registration, settings))
+            return error;
+    // Session has a user-declared destructor and its assignment copies. Transfer the
+    // large scan buffers independently so applying a result does not duplicate them.
+    auto scans = std::move(loaded.point_clouds_container.point_clouds);
+    session = loaded;
+    session.point_clouds_container.point_clouds = std::move(scans);
+    if (const auto names = source.parameters.find("scan_names");
+        names != source.parameters.end() && names->is_array() && names->size() == session.point_clouds_container.point_clouds.size())
+    {
+        for (std::size_t index = 0; index < names->size(); ++index)
+            if (names->at(index).is_string())
+                session.point_clouds_container.point_clouds[index].source_scan_name = names->at(index).get<std::string>();
+    }
+    if (const auto origins = source.parameters.find("e57_origins");
+        origins != source.parameters.end() && origins->is_array() && origins->size() == session.point_clouds_container.point_clouds.size())
+    {
+        for (std::size_t index = 0; index < origins->size(); ++index)
+        {
+            const auto& origin = origins->at(index);
+            if (!origin.is_object() || !origin.contains("path") || !origin["path"].is_string() || !origin.contains("index") ||
+                !origin["index"].is_number_integer())
+                continue;
+            auto& scan = session.point_clouds_container.point_clouds[index];
+            scan.e57_source_path = origin.at("path").get<std::string>();
+            scan.e57_scan_index = origin.at("index").get<int>();
+        }
+    }
+    session_file_name = sessionPathText(source.entry);
+    state_path = session_file_name;
+    registration_result_path.clear();
+    constraint_result_path.clear();
+    georeference_result_path.clear();
+    readGnssTumFromSessionFile(session_file_name, tls_registration.gnss, tls_registration.tum);
+    session_loaded = true;
+    session_total_number_of_points = 0;
+    for (const auto& scan : session.point_clouds_container.point_clouds)
+        session_total_number_of_points += scan.points_local.size();
+    index_begin = 0;
+    index_end = static_cast<int>(session.point_clouds_container.point_clouds.size()) - 1;
+    index_loop_closure_source = index_loop_closure_target = 0;
+    gizmo_drag_first_index = -1;
+    gizmo_drag_preview_poses.clear();
+    clearTranslatePreview();
+    if (source.parameters.value("session_open", false))
+    {
+        observation_picking.observations.clear();
+        observation_picking.current_observation.clear();
+        observation_picking.intersections.clear();
+        observations_file_name.clear();
+    }
+    auto unavailable = [](const auto& point)
+    {
+        const int scan_index = point.first;
+        return scan_index < 0 || scan_index > index_end;
+    };
+    for (auto& observation : observation_picking.observations)
+        std::erase_if(observation, unavailable);
+    std::erase_if(observation_picking.current_observation, unavailable);
+    bow_loop_closure_clear_preview();
+    bow_state.results.clear();
+    session_dims = session.point_clouds_container.compute_point_cloud_dimension();
+    scan_renderer.rebuildAll(session.point_clouds_container.point_clouds);
+    SetWindowTitle((winTitle + " - " + truncPath(session_file_name)).c_str());
+    return {};
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     bool export_requested = false;
@@ -7754,11 +8837,43 @@ int main(int argc, char* argv[])
             return exportSessionToDirectory(input_arguments.front(), export_directory, same_as_gui);
         }
 
+#ifdef HDMAPPING_GUI_STATE
+        // The GUI has historically selected camera<-world when its registration panels open.
+        tls_registration.registration_plane_feature.is_cw = tls_registration.ndt.is_cw = tls_registration.icp.is_cw = true;
+        tls_registration.registration_plane_feature.is_wc = tls_registration.ndt.is_wc = tls_registration.icp.is_wc = false;
+#endif
+
         // search for available geoid models in the system and populate the menu
         geoids = GNSS::get_available_geoids();
 
         initGL(&argc, argv, winTitle, display, mouse);
 
+#ifdef HDMAPPING_GUI_STATE
+        proc::GuiStateBridge bridge(
+            { describeStep2,
+              mutateStep2,
+              [](proc::TargetRef target) -> std::unique_ptr<proc::CaptureSource>
+              {
+                  if (session.point_clouds_container.point_clouds.empty())
+                      return {};
+                  return std::make_unique<proc::SessionCaptureSource>(
+                      session_owner,
+                      [target]
+                      {
+                          return target;
+                      },
+                      step2CaptureParameters(),
+                      HDMapping::EncodeReferenceTracks(tls_registration.gnss, tls_registration.tum));
+              },
+              applyStep2Result,
+              {},
+              presentLoopCandidates,
+              {},
+              true });
+        state_bridge = &bridge;
+        proc::GuiStateConnection connection(bridge, "multi_view_tls_registration_step_2");
+        registration_connection = &connection;
+#endif
         if (argc > 1)
         {
             for (int i = 1; i < argc; i++)
@@ -7780,8 +8895,35 @@ int main(int argc, char* argv[])
         // every frame (mirroring glutMotionFunc -- motion() itself only acts
         // when app_state.mouse_buttons is set, so this is safe unconditionally), wheel()
         // when GetMouseWheelMove() is nonzero, and display() once per frame.
+#ifdef HDMAPPING_GUI_STATE
+        auto last_inputs = step2EditorInputs();
+        auto last_target = bridge.Target();
+#endif
         while (!WindowShouldClose())
         {
+#ifdef HDMAPPING_GUI_STATE
+            auto inputs = step2EditorInputs();
+            if (last_target == bridge.Target() && inputs != last_inputs)
+                bridge.Changed();
+            connection.Poll();
+            pollRegistration(connection);
+            finishLoopCandidateJob();
+            if (last_target != bridge.Target())
+                inputs = step2EditorInputs();
+            last_inputs = std::move(inputs);
+            last_target = bridge.Target();
+            if (translate_tool.target != last_target)
+                clearTranslatePreview();
+#endif
+#ifdef HDMAPPING_SNAPSHOT_PROBE
+            if (session_loaded && IsKeyPressed(KEY_F9))
+            {
+                if (const char* destination = std::getenv("HDMAPPING_SNAPSHOT_TEST_DIRECTORY"))
+                {
+                    captureSessionProbe(destination);
+                }
+            }
+#endif
             int mx = static_cast<int>(GetMouseX());
             int my = static_cast<int>(GetMouseY());
 
@@ -7817,7 +8959,10 @@ int main(int argc, char* argv[])
                     paths.reserve(dropped_files.count);
                     for (unsigned int i = 0; i < dropped_files.count; i++)
                         paths.emplace_back(dropped_files.paths[i]);
-                    loadDroppedFiles(paths);
+#ifdef HDMAPPING_GUI_STATE
+                    if (!bridge.Reserved())
+#endif
+                        loadDroppedFiles(paths);
                 }
                 UnloadDroppedFiles(dropped_files);
             }
@@ -7827,8 +8972,16 @@ int main(int argc, char* argv[])
             EndDrawing();
         }
 
+#ifdef HDMAPPING_GUI_STATE
+        SetWindowState(FLAG_WINDOW_HIDDEN);
+        connection.Close();
+        registration_connection = nullptr;
+        state_bridge = nullptr;
+#endif
+#ifndef HDMAPPING_GUI_STATE
         if (bow_state.detect_thread.joinable())
             bow_state.detect_thread.join();
+#endif
         if (bow_state.montage_tex_valid)
             UnloadTexture(bow_state.montage_tex);
 

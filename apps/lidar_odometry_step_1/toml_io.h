@@ -21,7 +21,7 @@ public:
     using ParamValue = std::
         variant<bool LidarOdometryParams::*, double LidarOdometryParams::*, int LidarOdometryParams::*, std::string LidarOdometryParams::*>;
 
-    const std::map<std::string, ParamValue> POINTERS = {
+    inline static const std::map<std::string, ParamValue> POINTERS = {
         // version information
         { "software_version", &LidarOdometryParams::software_version },
         { "config_version", &LidarOdometryParams::config_version },
@@ -113,12 +113,22 @@ public:
         { "max_distance_lidar_rigid_sf", &LidarOdometryParams::max_distance_lidar_rigid_sf },
         { "current_output_dir", &LidarOdometryParams::current_output_dir },
         { "working_directory_preview", &LidarOdometryParams::working_directory_preview },
+        { "ablation_study_use_planarity", &LidarOdometryParams::ablation_study_use_planarity },
+        { "ablation_study_use_norm", &LidarOdometryParams::ablation_study_use_norm },
+        { "ablation_study_use_hierarchical_rgd", &LidarOdometryParams::ablation_study_use_hierarchical_rgd },
+        { "ablation_study_use_view_point_and_normal_vectors", &LidarOdometryParams::ablation_study_use_view_point_and_normal_vectors },
+        { "ablation_study_use_threshold_outdoor_rgd", &LidarOdometryParams::ablation_study_use_threshold_outer_rgd },
+        { "ablation_study_use_anisotropic_weighting", &LidarOdometryParams::ablation_study_use_anisotropic_weighting },
+        { "save_index_pose", &LidarOdometryParams::save_index_pose },
+        { "remove_initial_imu_bias", &LidarOdometryParams::use_removie_imu_bias_from_first_stationary_scan },
+        { "lm_factor_damping", &LidarOdometryParams::lm_factor_damping },
+        { "convergence_delta_threshold_outer_rgd", &LidarOdometryParams::convergence_delta_threshold_outer_rgd },
         { "use_imu_preintegration", &LidarOdometryParams::use_imu_preintegration },
         { "imu_preintegration_method", &LidarOdometryParams::imu_preintegration_method }
     };
 
     // Special handling for TaitBryanPose members
-    const std::map<std::string, double TaitBryanPose::*> MOTION_MODEL_CORRECTION_POINTERS = {
+    inline static const std::map<std::string, double TaitBryanPose::*> MOTION_MODEL_CORRECTION_POINTERS = {
         { "motion_model_correction_om", &TaitBryanPose::om },
         { "motion_model_correction_fi", &TaitBryanPose::fi },
         { "motion_model_correction_ka", &TaitBryanPose::ka }
@@ -231,5 +241,5 @@ public:
     template<typename T>
     void set_if_exists(NDT::GridParameters& grid, const toml::table* tbl, const std::string& key, T NDT::GridParameters::* member);
     void read_grid_params(NDT::GridParameters& grid, const toml::table* grid_tbl);
-    bool LoadParametersFromTomlFile(const std::string& filepath, LidarOdometryParams& params);
+    bool LoadParametersFromTomlFile(const std::string& filepath, LidarOdometryParams& params, std::string* validation_error = nullptr);
 };

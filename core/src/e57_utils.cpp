@@ -321,6 +321,7 @@ namespace mandeye::e57io
                 }
 
                 E57Scan scan;
+                scan.data3d_index = si;
                 scan.name = !header.name.empty() ? header.name : ("scan_" + std::to_string(si));
                 scan.pose = pose_from_header(header);
                 scan.points.reserve(static_cast<size_t>(points_size));
@@ -445,6 +446,10 @@ namespace mandeye::e57io
             ::e57::E57Root root;
             reader.GetE57Root(root);
 
+            const int64_t scan_count = reader.GetData3DCount();
+            if (!new_poses.empty() && (new_poses.begin()->first < 0 || new_poses.rbegin()->first >= scan_count))
+                throw std::invalid_argument("E57 pose update references a missing Data3D block");
+
             ::e57::WriterOptions wopts;
             wopts.coordinateMetadata = root.coordinateMetadata; // fresh file guid on purpose
             ::e57::Writer writer(dst_path, wopts);
@@ -456,7 +461,6 @@ namespace mandeye::e57io
 
             std::map<std::string, Eigen::Affine3d> pose_deltas; // Data3D guid -> new * old^-1
 
-            const int64_t scan_count = reader.GetData3DCount();
             for (int64_t i = 0; i < scan_count; i++)
             {
                 ::e57::Data3D header;

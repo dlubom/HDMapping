@@ -6,8 +6,10 @@
 #include <Core/ground_control_points.h>
 #include <Core/icp.h>
 #include <Core/m_estimators.h>
+#include <Core/manual_pose_graph_loop_closure.h>
 #include <Core/pair_wise_iterative_closest_point.h>
 #include <Core/pose_graph_loop_closure.h>
+#include <Core/reference_alignment.h>
 #include <Core/transformations.h>
 
 #include <python-scripts/constraints/relative_pose_tait_bryan_cw_jacobian.h>
@@ -16,16 +18,15 @@
 #include <python-scripts/point-to-feature-metrics/point_to_plane_tait_bryan_wc_jacobian.h>
 #include <python-scripts/point-to-point-metrics/point_to_point_source_to_target_tait_bryan_wc_jacobian.h>
 
-void PoseGraphLoopClosure::add_edge(PointClouds& point_clouds_container, int index_loop_closure_source, int index_loop_closure_target)
+PoseGraphLoopClosure::Edge PoseGraphLoopClosure::make_edge(const PointClouds& clouds, int from, int to)
 {
     Edge edge;
-    edge.index_from = index_loop_closure_source;
-    edge.index_to = index_loop_closure_target;
+    edge.index_from = from;
+    edge.index_to = to;
     //
 
-    edge.relative_pose_tb = pose_tait_bryan_from_affine_matrix(
-        point_clouds_container.point_clouds[index_loop_closure_source].m_pose.inverse() *
-        point_clouds_container.point_clouds[index_loop_closure_target].m_pose);
+    edge.relative_pose_tb =
+        pose_tait_bryan_from_affine_matrix(clouds.point_clouds.at(from).m_pose.inverse() * clouds.point_clouds.at(to).m_pose);
 
     edge.relative_pose_tb_weights.px = 1000000.0;
     edge.relative_pose_tb_weights.py = 1000000.0;
@@ -34,7 +35,12 @@ void PoseGraphLoopClosure::add_edge(PointClouds& point_clouds_container, int ind
     edge.relative_pose_tb_weights.fi = 1000000.0;
     edge.relative_pose_tb_weights.ka = 1000000.0;
 
-    edges.push_back(edge);
+    return edge;
+}
+
+void PoseGraphLoopClosure::add_edge(PointClouds& point_clouds_container, int index_loop_closure_source, int index_loop_closure_target)
+{
+    edges.push_back(make_edge(point_clouds_container, index_loop_closure_source, index_loop_closure_target));
 }
 
 void PoseGraphLoopClosure::set_initial_poses_as_motion_model(PointClouds& point_clouds_container)
@@ -57,13 +63,27 @@ void PoseGraphLoopClosure::set_current_poses_as_motion_model(PointClouds& point_
     std::cout << "Set current result as motion model DONE" << std::endl;
 }
 
-void PoseGraphLoopClosure::graph_slam(PointClouds& point_clouds_container, GNSS& gnss, GroundControlPoints& gcps, ControlPoints& cps)
+bool ManualPoseGraphLoopClosure::compute_pose_graph_slam(
+    PointClouds& clouds, GNSS& gnss, GroundControlPoints& gcps, ControlPoints& cps, const std::function<bool(int, int)>& continue_iteration)
+{
+    if (keep_initial_trajectory_curvature)
+        set_initial_poses_as_motion_model(clouds);
+    else
+        set_current_poses_as_motion_model(clouds);
+    return graph_slam(clouds, gnss, gcps, cps, continue_iteration);
+}
+
+bool PoseGraphLoopClosure::graph_slam(
+    PointClouds& point_clouds_container,
+    GNSS& gnss,
+    GroundControlPoints& gcps,
+    ControlPoints& cps,
+    const std::function<bool(int, int)>& continue_iteration)
 {
     std::cout << "Compute Pose Graph SLAM" << std::endl;
 
     ///////////////////////////////////////////////////////////////////
     // graph slam
-    bool is_ok = true;
     std::vector<Eigen::Affine3d> m_poses;
     for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
     {
@@ -76,7 +96,7 @@ void PoseGraphLoopClosure::graph_slam(PointClouds& point_clouds_container, GNSS&
     bool is_cw = false;
     int iterations = 10;
     bool is_fix_first_node = true;
-    if (gnss.gnss_poses.size() > 0)
+    if (use_gnss_correspondences && !gnss.gnss_poses.empty())
     {
         is_fix_first_node = false;
     }
@@ -123,6 +143,8 @@ void PoseGraphLoopClosure::graph_slam(PointClouds& point_clouds_container, GNSS&
 
     for (int iter = 0; iter < iterations; iter++)
     {
+        if (continue_iteration && !continue_iteration(iter, iterations))
+            return false;
         std::cout << "iteration " << iter + 1 << " of " << iterations << std::endl;
         std::vector<Eigen::Triplet<double>> tripletListA;
         std::vector<Eigen::Triplet<double>> tripletListP;
@@ -809,101 +831,76 @@ void PoseGraphLoopClosure::graph_slam(PointClouds& point_clouds_container, GNSS&
         std::cout << "start solving AtPA=AtPB" << std::endl;
         Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA);
 
+        if (solver.info() != Eigen::Success)
+            return false;
+
         std::cout << "x = solver.solve(AtPB)" << std::endl;
         Eigen::SparseMatrix<double> x = solver.solve(AtPB);
 
-        std::vector<double> h_x;
+        const Eigen::VectorXd h_x(x);
+        if (!h_x.allFinite())
+            return false;
 
-        for (int k = 0; k < x.outerSize(); ++k)
+        int counter = 0;
+
+        for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
         {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(x, k); it; ++it)
+            TaitBryanPose pose = poses[i];
+            pose.px += h_x[counter++];
+            pose.py += h_x[counter++];
+            pose.pz += h_x[counter++];
+            pose.om += h_x[counter++];
+            pose.fi += h_x[counter++];
+            pose.ka += h_x[counter++];
+
+            if (!point_clouds_container.point_clouds[i].fixed_x)
             {
-                h_x.push_back(it.value());
+                poses[i].px = pose.px;
+            }
+            if (!point_clouds_container.point_clouds[i].fixed_y)
+            {
+                poses[i].py = pose.py;
+            }
+            if (!point_clouds_container.point_clouds[i].fixed_z)
+            {
+                poses[i].pz = pose.pz;
+            }
+            if (!point_clouds_container.point_clouds[i].fixed_om)
+            {
+                poses[i].om = pose.om;
+            }
+            if (!point_clouds_container.point_clouds[i].fixed_fi)
+            {
+                poses[i].fi = pose.fi;
+            }
+            if (!point_clouds_container.point_clouds[i].fixed_ka)
+            {
+                poses[i].ka = pose.ka;
             }
         }
 
-        std::cout << "h_x.size(): " << h_x.size() << std::endl;
-
-        std::cout << "AtPA=AtPB SOLVED" << std::endl;
-
-        if (h_x.size() == 6 * point_clouds_container.point_clouds.size())
+        for (size_t i = 0; i < m_poses.size(); i++)
         {
-            int counter = 0;
-
-            for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
+            if (is_wc)
             {
-                TaitBryanPose pose = poses[i];
-                pose.px += h_x[counter++];
-                pose.py += h_x[counter++];
-                pose.pz += h_x[counter++];
-                pose.om += h_x[counter++];
-                pose.fi += h_x[counter++];
-                pose.ka += h_x[counter++];
-
-                if (!point_clouds_container.point_clouds[i].fixed_x)
-                {
-                    poses[i].px = pose.px;
-                }
-                if (!point_clouds_container.point_clouds[i].fixed_y)
-                {
-                    poses[i].py = pose.py;
-                }
-                if (!point_clouds_container.point_clouds[i].fixed_z)
-                {
-                    poses[i].pz = pose.pz;
-                }
-                if (!point_clouds_container.point_clouds[i].fixed_om)
-                {
-                    poses[i].om = pose.om;
-                }
-                if (!point_clouds_container.point_clouds[i].fixed_fi)
-                {
-                    poses[i].fi = pose.fi;
-                }
-                if (!point_clouds_container.point_clouds[i].fixed_ka)
-                {
-                    poses[i].ka = pose.ka;
-                }
+                m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]);
             }
-            std::cout << "optimizing with tait bryan finished" << std::endl;
-        }
-        else
-        {
-            std::cout << "optimizing with tait bryan FAILED" << std::endl;
-            std::cout << "h_x.size(): " << h_x.size() << " should be: " << 6 * point_clouds_container.point_clouds.size() << std::endl;
-            is_ok = false;
-            break;
-        }
-
-        if (is_ok)
-        {
-            for (size_t i = 0; i < m_poses.size(); i++)
+            else if (is_cw)
             {
-                if (is_wc)
-                {
-                    m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]);
-                }
-                else if (is_cw)
-                {
-                    m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]).inverse();
-                }
+                m_poses[i] = affine_matrix_from_pose_tait_bryan(poses[i]).inverse();
             }
         }
 
-        if (is_ok)
+        for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
         {
-            for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
-            {
-                point_clouds_container.point_clouds[i].m_pose = m_poses[i];
-                point_clouds_container.point_clouds[i].pose =
-                    pose_tait_bryan_from_affine_matrix(point_clouds_container.point_clouds[i].m_pose);
-                point_clouds_container.point_clouds[i].gui_translation[0] = point_clouds_container.point_clouds[i].pose.px;
-                point_clouds_container.point_clouds[i].gui_translation[1] = point_clouds_container.point_clouds[i].pose.py;
-                point_clouds_container.point_clouds[i].gui_translation[2] = point_clouds_container.point_clouds[i].pose.pz;
-                point_clouds_container.point_clouds[i].gui_rotation[0] = rad2deg(point_clouds_container.point_clouds[i].pose.om);
-                point_clouds_container.point_clouds[i].gui_rotation[1] = rad2deg(point_clouds_container.point_clouds[i].pose.fi);
-                point_clouds_container.point_clouds[i].gui_rotation[2] = rad2deg(point_clouds_container.point_clouds[i].pose.ka);
-            }
+            point_clouds_container.point_clouds[i].m_pose = m_poses[i];
+            point_clouds_container.point_clouds[i].pose = pose_tait_bryan_from_affine_matrix(point_clouds_container.point_clouds[i].m_pose);
+            point_clouds_container.point_clouds[i].gui_translation[0] = point_clouds_container.point_clouds[i].pose.px;
+            point_clouds_container.point_clouds[i].gui_translation[1] = point_clouds_container.point_clouds[i].pose.py;
+            point_clouds_container.point_clouds[i].gui_translation[2] = point_clouds_container.point_clouds[i].pose.pz;
+            point_clouds_container.point_clouds[i].gui_rotation[0] = rad2deg(point_clouds_container.point_clouds[i].pose.om);
+            point_clouds_container.point_clouds[i].gui_rotation[1] = rad2deg(point_clouds_container.point_clouds[i].pose.fi);
+            point_clouds_container.point_clouds[i].gui_rotation[2] = rad2deg(point_clouds_container.point_clouds[i].pose.ka);
         }
     }
 
@@ -955,308 +952,19 @@ void PoseGraphLoopClosure::graph_slam(PointClouds& point_clouds_container, GNSS&
         std::cout << "--" << std::endl;
     }
     std::cout << "Compute Pose Graph SLAM FINISHED" << std::endl;
+    return true;
 }
 
 void PoseGraphLoopClosure::FuseTrajectoryWithGNSS(PointClouds& point_clouds_container, GNSS& gnss)
 {
-    for (int iter = 0; iter < 30; iter++)
-    {
-        std::vector<Eigen::Triplet<double>> tripletListA;
-        std::vector<Eigen::Triplet<double>> tripletListP;
-        std::vector<Eigen::Triplet<double>> tripletListB;
-        Eigen::Affine3d m_pose = Eigen::Affine3d::Identity();
-        bool is_ok = true;
-
-        for (int index_pose = 0; index_pose < point_clouds_container.point_clouds.size(); index_pose++)
-        {
-            const auto& pc = point_clouds_container.point_clouds[index_pose];
-
-            double time_stamp = pc.timestamps[0];
-
-            auto it = std::lower_bound(
-                gnss.gnss_poses.begin(),
-                gnss.gnss_poses.end(),
-                time_stamp,
-                [](const GNSS::GlobalPose& lhs, const double& time) -> bool
-                {
-                    return lhs.timestamp < time;
-                });
-
-            int index = it - gnss.gnss_poses.begin() - 1;
-
-            if (index > 0 && index < gnss.gnss_poses.size())
-            {
-                if (fabs(time_stamp - gnss.gnss_poses[index].timestamp) < 10e12)
-                {
-                    Eigen::Matrix<double, 3, 6, Eigen::RowMajor> jacobian;
-                    TaitBryanPose pose_s;
-                    pose_s = pose_tait_bryan_from_affine_matrix(m_pose);
-                    Eigen::Vector3d p_s = pc.m_pose.translation();
-                    point_to_point_source_to_target_tait_bryan_wc_jacobian(
-                        jacobian, pose_s.px, pose_s.py, pose_s.pz, pose_s.om, pose_s.fi, pose_s.ka, p_s.x(), p_s.y(), p_s.z());
-
-                    double delta_x;
-                    double delta_y;
-                    double delta_z;
-                    Eigen::Vector3d p_t(
-                        gnss.gnss_poses[index].enu_x - point_clouds_container.offset.x(),
-                        gnss.gnss_poses[index].enu_y - point_clouds_container.offset.y(),
-                        gnss.gnss_poses[index].enu_z - point_clouds_container.offset.z());
-
-                    point_to_point_source_to_target_tait_bryan_wc(
-                        delta_x,
-                        delta_y,
-                        delta_z,
-                        pose_s.px,
-                        pose_s.py,
-                        pose_s.pz,
-                        pose_s.om,
-                        pose_s.fi,
-                        pose_s.ka,
-                        p_s.x(),
-                        p_s.y(),
-                        p_s.z(),
-                        p_t.x(),
-                        p_t.y(),
-                        p_t.z());
-
-                    int ir = tripletListB.size();
-                    int ic = 0;
-                    for (int row = 0; row < 3; row++)
-                    {
-                        for (int col = 0; col < 6; col++)
-                        {
-                            if (jacobian(row, col) != 0.0)
-                            {
-                                tripletListA.emplace_back(ir + row, ic + col, -jacobian(row, col));
-                            }
-                        }
-                    }
-
-                    tripletListP.emplace_back(ir, ir, 1);
-                    tripletListP.emplace_back(ir + 1, ir + 1, 1);
-                    tripletListP.emplace_back(ir + 2, ir + 2, 1);
-
-                    tripletListB.emplace_back(ir, 0, delta_x);
-                    tripletListB.emplace_back(ir + 1, 0, delta_y);
-                    tripletListB.emplace_back(ir + 2, 0, delta_z);
-                }
-            }
-        }
-
-        Eigen::SparseMatrix<double> matA(tripletListB.size(), 6);
-        Eigen::SparseMatrix<double> matP(tripletListB.size(), tripletListB.size());
-        Eigen::SparseMatrix<double> matB(tripletListB.size(), 1);
-
-        matA.setFromTriplets(tripletListA.begin(), tripletListA.end());
-        matP.setFromTriplets(tripletListP.begin(), tripletListP.end());
-        matB.setFromTriplets(tripletListB.begin(), tripletListB.end());
-
-        Eigen::SparseMatrix<double> AtPA(6, 6);
-        Eigen::SparseMatrix<double> AtPB(6, 1);
-
-        {
-            Eigen::SparseMatrix<double> AtP = matA.transpose() * matP;
-            AtPA = (AtP)*matA;
-            AtPB = (AtP)*matB;
-        }
-
-        tripletListA.clear();
-        tripletListP.clear();
-        tripletListB.clear();
-
-        std::cout << "AtPA.size: " << AtPA.size() << std::endl;
-        std::cout << "AtPB.size: " << AtPB.size() << std::endl;
-
-        std::cout << "start solving AtPA=AtPB" << std::endl;
-        Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA);
-
-        std::cout << "x = solver.solve(AtPB)" << std::endl;
-        Eigen::SparseMatrix<double> x = solver.solve(AtPB);
-
-        std::vector<double> h_x;
-
-        for (int k = 0; k < x.outerSize(); ++k)
-        {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(x, k); it; ++it)
-            {
-                std::cout << it.value() << std::endl;
-                h_x.push_back(it.value());
-            }
-        }
-
-        std::cout << "h_x.size(): " << h_x.size() << std::endl;
-
-        std::cout << "AtPA=AtPB SOLVED" << std::endl;
-        TaitBryanPose pose;
-
-        if (h_x.size() == 6)
-        {
-            int counter = 0;
-            pose.px = h_x[counter++];
-            pose.py = h_x[counter++];
-            pose.pz = h_x[counter++];
-            pose.om = h_x[counter++];
-            pose.fi = h_x[counter++];
-            pose.ka = h_x[counter++];
-            is_ok = true;
-            std::cout << "optimizing with tait bryan finished" << std::endl;
-        }
-        else
-        {
-            std::cout << "optimizing with tait bryan FAILED" << std::endl;
-            std::cout << "h_x.size(): " << h_x.size() << " should be: " << 6 * point_clouds_container.point_clouds.size() << std::endl;
-            is_ok = false;
-        }
-
-        if (is_ok)
-        {
-            m_pose = affine_matrix_from_pose_tait_bryan(pose);
-
-            for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
-            {
-                point_clouds_container.point_clouds[i].m_pose = m_pose * point_clouds_container.point_clouds[i].m_pose;
-                point_clouds_container.point_clouds[i].pose =
-                    pose_tait_bryan_from_affine_matrix(point_clouds_container.point_clouds[i].m_pose);
-                point_clouds_container.point_clouds[i].gui_translation[0] = point_clouds_container.point_clouds[i].pose.px;
-                point_clouds_container.point_clouds[i].gui_translation[1] = point_clouds_container.point_clouds[i].pose.py;
-                point_clouds_container.point_clouds[i].gui_translation[2] = point_clouds_container.point_clouds[i].pose.pz;
-                point_clouds_container.point_clouds[i].gui_rotation[0] = rad2deg(point_clouds_container.point_clouds[i].pose.om);
-                point_clouds_container.point_clouds[i].gui_rotation[1] = rad2deg(point_clouds_container.point_clouds[i].pose.fi);
-                point_clouds_container.point_clouds[i].gui_rotation[2] = rad2deg(point_clouds_container.point_clouds[i].pose.ka);
-            }
-        }
-    }
+    if (!HDMapping::AlignGnss(point_clouds_container, gnss))
+        std::cerr << "Could not align session to GNSS" << std::endl;
 }
 
-// Mirrors FuseTrajectoryWithGNSS() above -- same single-rigid-6DOF-transform
-// least-squares fit, applied to every point cloud pose in one shot, just
-// matched against a TUM trajectory instead of a GNSS one. The one real
-// difference is the timestamp comparison: pc.timestamps[0] is Unix-epoch
-// nanoseconds (as GNSS's own .timestamp happens to share, hence
-// FuseTrajectoryWithGNSS's direct comparison), while TUM's timestamp field
-// is Unix-epoch seconds -- scaled up by 1e9 here before comparing, same fix
-// as renderTUM()'s correspondence lines in multi_view_tls_registration_gui.cpp.
-//
-// Unlike FuseTrajectoryWithGNSS, the normal equations here are accumulated
-// as dense 6x6/6x1 blocks (one rank-3 Ai^T*Ai / Ai^T*bi update per
-// observation) rather than via triplet lists into a sparse matA/matP/matB --
-// there are always exactly 6 unknowns (one shared rigid delta-pose) and the
-// observation weight P is always identity, so the sparse machinery buys
-// nothing here.
 void PoseGraphLoopClosure::FuseTrajectoryWithTUM(PointClouds& point_clouds_container, TUM& tum)
 {
-    for (int iter = 0; iter < 30; iter++)
-    {
-        Eigen::Matrix<double, 6, 6> AtPA = Eigen::Matrix<double, 6, 6>::Zero();
-        Eigen::Matrix<double, 6, 1> AtPB = Eigen::Matrix<double, 6, 1>::Zero();
-        Eigen::Affine3d m_pose = Eigen::Affine3d::Identity();
-        int num_observations = 0;
-
-        for (int index_pose = 0; index_pose < point_clouds_container.point_clouds.size(); index_pose++)
-        {
-            const auto& pc = point_clouds_container.point_clouds[index_pose];
-
-            double time_stamp_ns = pc.timestamps[0];
-
-            auto it = std::lower_bound(
-                tum.tum_poses.begin(),
-                tum.tum_poses.end(),
-                time_stamp_ns,
-                [](const TUM::TumPose& lhs, const double& time) -> bool
-                {
-                    return lhs.timestamp * 1.0e9 < time;
-                });
-
-            int index = it - tum.tum_poses.begin() - 1;
-
-            if (index > 0 && index < tum.tum_poses.size())
-            {
-                if (fabs(time_stamp_ns - tum.tum_poses[index].timestamp * 1.0e9) < 5.0e8) // 0.5s, in ns
-                {
-                    Eigen::Matrix<double, 3, 6, Eigen::RowMajor> jacobian;
-                    TaitBryanPose pose_s;
-                    pose_s = pose_tait_bryan_from_affine_matrix(m_pose);
-                    Eigen::Vector3d p_s = pc.m_pose.translation();
-                    point_to_point_source_to_target_tait_bryan_wc_jacobian(
-                        jacobian, pose_s.px, pose_s.py, pose_s.pz, pose_s.om, pose_s.fi, pose_s.ka, p_s.x(), p_s.y(), p_s.z());
-
-                    double delta_x;
-                    double delta_y;
-                    double delta_z;
-                    Eigen::Vector3d p_t(
-                        tum.tum_poses[index].x - point_clouds_container.offset.x(),
-                        tum.tum_poses[index].y - point_clouds_container.offset.y(),
-                        tum.tum_poses[index].z - point_clouds_container.offset.z());
-
-                    point_to_point_source_to_target_tait_bryan_wc(
-                        delta_x,
-                        delta_y,
-                        delta_z,
-                        pose_s.px,
-                        pose_s.py,
-                        pose_s.pz,
-                        pose_s.om,
-                        pose_s.fi,
-                        pose_s.ka,
-                        p_s.x(),
-                        p_s.y(),
-                        p_s.z(),
-                        p_t.x(),
-                        p_t.y(),
-                        p_t.z());
-
-                    Eigen::Matrix<double, 3, 6> Ai = -jacobian;
-                    Eigen::Vector3d bi(delta_x, delta_y, delta_z);
-
-                    AtPA += Ai.transpose() * Ai;
-                    AtPB += Ai.transpose() * bi;
-                    ++num_observations;
-                }
-            }
-        }
-
-        bool is_ok = false;
-        TaitBryanPose pose;
-
-        if (num_observations > 0)
-        {
-            Eigen::LDLT<Eigen::Matrix<double, 6, 6>> solver(AtPA);
-            if (solver.info() == Eigen::Success)
-            {
-                Eigen::Matrix<double, 6, 1> x = solver.solve(AtPB);
-                pose.px = x(0);
-                pose.py = x(1);
-                pose.pz = x(2);
-                pose.om = x(3);
-                pose.fi = x(4);
-                pose.ka = x(5);
-                is_ok = true;
-            }
-            else
-            {
-                std::cout << "FuseTrajectoryWithTUM: solving AtPA=AtPB FAILED" << std::endl;
-            }
-        }
-
-        if (is_ok)
-        {
-            m_pose = affine_matrix_from_pose_tait_bryan(pose);
-
-            for (size_t i = 0; i < point_clouds_container.point_clouds.size(); i++)
-            {
-                point_clouds_container.point_clouds[i].m_pose = m_pose * point_clouds_container.point_clouds[i].m_pose;
-                point_clouds_container.point_clouds[i].pose =
-                    pose_tait_bryan_from_affine_matrix(point_clouds_container.point_clouds[i].m_pose);
-                point_clouds_container.point_clouds[i].gui_translation[0] = point_clouds_container.point_clouds[i].pose.px;
-                point_clouds_container.point_clouds[i].gui_translation[1] = point_clouds_container.point_clouds[i].pose.py;
-                point_clouds_container.point_clouds[i].gui_translation[2] = point_clouds_container.point_clouds[i].pose.pz;
-                point_clouds_container.point_clouds[i].gui_rotation[0] = rad2deg(point_clouds_container.point_clouds[i].pose.om);
-                point_clouds_container.point_clouds[i].gui_rotation[1] = rad2deg(point_clouds_container.point_clouds[i].pose.fi);
-                point_clouds_container.point_clouds[i].gui_rotation[2] = rad2deg(point_clouds_container.point_clouds[i].pose.ka);
-            }
-        }
-    }
+    if (!HDMapping::AlignTum(point_clouds_container, tum))
+        std::cerr << "Could not align session to TUM" << std::endl;
 }
 
 bool PoseGraphLoopClosure::run_icp(
@@ -1268,43 +976,24 @@ bool PoseGraphLoopClosure::run_icp(
     int num_edge_extended_after)
 {
     PairWiseICP icp;
-    auto m_pose = affine_matrix_from_pose_tait_bryan(edges[index_active_edge].relative_pose_tb);
-    // std::vector<Eigen::Vector3d> source = point_clouds_container.point_clouds[edges[index_active_edge].index_to].points_local;
-    // std::vector<Eigen::Vector3d> target = point_clouds_container.point_clouds[edges[index_active_edge].index_from].points_local;
-
-    ////////////////////////////////
-    std::vector<Eigen::Vector3d> source;
-    auto& e = edges[index_active_edge];
-    for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
+    const auto& e = edges.at(index_active_edge);
+    auto m_pose = affine_matrix_from_pose_tait_bryan(e.relative_pose_tb);
+    const auto collect = [&](int endpoint)
     {
-        int index_src = e.index_to + i;
-        if (index_src >= 0 && index_src < point_clouds_container.point_clouds.size())
+        std::vector<Eigen::Vector3d> points;
+        const int last = static_cast<int>(point_clouds_container.point_clouds.size()) - 1;
+        const int begin = endpoint - std::min(endpoint, num_edge_extended_before);
+        const int end = endpoint + std::min(last - endpoint, num_edge_extended_after);
+        for (int index = begin; index <= end; ++index)
         {
-            Eigen::Affine3d m_src = point_clouds_container.point_clouds.at(index_src).m_pose;
-            for (int k = 0; k < point_clouds_container.point_clouds[index_src].points_local.size(); k++)
-            {
-                Eigen::Vector3d p_g = m_src * point_clouds_container.point_clouds[index_src].points_local[k];
-                source.push_back(p_g);
-            }
-            // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
+            const auto& cloud = point_clouds_container.point_clouds.at(index);
+            for (const auto& point : cloud.points_local)
+                points.push_back(cloud.m_pose * point);
         }
-    }
-    std::vector<Eigen::Vector3d> target;
-
-    for (int i = -num_edge_extended_before; i <= num_edge_extended_after; i++)
-    {
-        int index_trg = e.index_from + i;
-        if (index_trg >= 0 && index_trg < point_clouds_container.point_clouds.size())
-        {
-            Eigen::Affine3d m_trg = point_clouds_container.point_clouds.at(index_trg).m_pose;
-            for (int k = 0; k < point_clouds_container.point_clouds[index_trg].points_local.size(); k++)
-            {
-                Eigen::Vector3d p_g = m_trg * point_clouds_container.point_clouds[index_trg].points_local[k];
-                target.push_back(p_g);
-            }
-            // point_clouds_container.point_clouds.at(index_src).render(m_src, 1);
-        }
-    }
+        return points;
+    };
+    auto source = collect(e.index_to);
+    auto target = collect(e.index_from);
 
     Eigen::Affine3d m_src_inv = point_clouds_container.point_clouds[e.index_to].m_pose.inverse();
 
@@ -1321,7 +1010,13 @@ bool PoseGraphLoopClosure::run_icp(
     }
     ////////////////////////////////
 
-    if (icp.compute(source, target, search_radius, number_of_iterations, m_pose))
+    const auto finite = [](const Eigen::Vector3d& point)
+    {
+        return point.allFinite();
+    };
+    if (source.empty() || target.empty() || !std::ranges::all_of(source, finite) || !std::ranges::all_of(target, finite))
+        return false;
+    if (icp.compute(source, target, search_radius, number_of_iterations, m_pose) && m_pose.matrix().allFinite())
     {
         edges[index_active_edge].relative_pose_tb = pose_tait_bryan_from_affine_matrix(m_pose);
         return true;

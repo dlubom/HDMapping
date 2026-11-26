@@ -1,0 +1,32 @@
+add_executable(hdmapping_worker main.cpp)
+target_compile_definitions(hdmapping_worker PRIVATE HDMAPPING_WORKER_VERSION="${PROJECT_VERSION}")
+target_link_libraries(hdmapping_worker PRIVATE processing_step1)
+hdmapping_processing_target(hdmapping_worker)
+add_dependencies(hdmapping_worker hdmapping_bow_vocabulary)
+hdmapping_install_app(hdmapping_worker)
+
+if(WIN32)
+    add_custom_command(TARGET hdmapping_worker POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy -t "$<TARGET_FILE_DIR:hdmapping_worker>" $<TARGET_RUNTIME_DLLS:hdmapping_worker>
+        COMMAND_EXPAND_LISTS VERBATIM)
+    install(FILES $<TARGET_RUNTIME_DLLS:hdmapping_worker> DESTINATION bin COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+else()
+    # These shared variants of core_no_gui dependencies are built in-tree.
+    # Leave system dependencies to the platform package manager.
+    set(worker_bundled_libraries)
+    foreach(library IN ITEMS laszip tbb vqf Fusion spdlog)
+        if(TARGET ${library})
+            get_target_property(library_type ${library} TYPE)
+            get_target_property(library_imported ${library} IMPORTED)
+            if(library_type STREQUAL "SHARED_LIBRARY" AND NOT library_imported)
+                list(APPEND worker_bundled_libraries ${library})
+            endif()
+        endif()
+    endforeach()
+    if(worker_bundled_libraries)
+        install(TARGETS ${worker_bundled_libraries} LIBRARY DESTINATION lib COMPONENT ${HDMAPPING_INSTALL_COMPONENT})
+        if(NOT APPLE)
+            set_property(TARGET hdmapping_worker APPEND PROPERTY INSTALL_RPATH "$ORIGIN/../lib")
+        endif()
+    endif()
+endif()

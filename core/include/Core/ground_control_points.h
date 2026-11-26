@@ -2,6 +2,7 @@
 
 #include <Core/point_clouds.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,7 @@ public:
     bool draw_uncertainty = false;
 
 #if WITH_GUI == 1
-    void imgui(PointClouds& point_clouds_container);
+    void imgui(PointClouds& point_clouds_container, const std::function<void()>& align = {});
     void render(const PointClouds& point_clouds_container);
     void draw_ellipse(const Eigen::Matrix3d& covar, const Eigen::Vector3d& mean, const Eigen::Vector3f& color, float nstd = 1);
 #endif

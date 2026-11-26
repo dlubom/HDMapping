@@ -16,6 +16,8 @@
 // the pose graph.
 
 #include <cstdint>
+#include <filesystem>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -101,15 +103,11 @@ namespace bow_loop_closure
     std::vector<std::vector<int>> associateFramesToChunks(
         const PointClouds& point_clouds_container, const std::vector<CameraFrame>& frames, int64_t max_time_gap_ns);
 
-    // Absolute path to the fbow ORB vocabulary bundled with this build
-    // (3rdparty/fbow/vocabularies/orb_mur.fbow), baked in at configure time via
-    // the FBOW_VOCABULARY_PATH compile definition. This is a source-tree path,
-    // fine for local/dev builds; a packaged install would instead want to copy
-    // the file next to the binary and resolve it relative to argv[0].
-    std::string defaultVocabularyPath();
+    //! Locate the bundled ORB vocabulary beside the running executable.
+    std::filesystem::path defaultVocabularyPath();
 
-    // Throws std::runtime_error if the vocabulary file can't be read.
-    fbow::Vocabulary loadVocabulary(const std::string& vocabulary_path);
+    //! Load the vocabulary using a native filesystem path.
+    fbow::Vocabulary loadVocabulary(const std::filesystem::path& vocabulary_path);
 
     // Runs the full pose-gate -> appearance-filter -> geometric-verification
     // pipeline. `chunk_frames` is associateFramesToChunks()'s output. With several
@@ -122,7 +120,8 @@ namespace bow_loop_closure
         const std::vector<CameraFrame>& frames,
         const std::vector<std::vector<int>>& chunk_frames,
         const DetectorParams& params,
-        fbow::Vocabulary& vocabulary);
+        fbow::Vocabulary& vocabulary,
+        std::stop_token stop = {});
 
     // Re-runs ORB detect + ratio-test match + RANSAC for one candidate's frame
     // pair (independent of detectCandidates' internal per-run cache) and draws the

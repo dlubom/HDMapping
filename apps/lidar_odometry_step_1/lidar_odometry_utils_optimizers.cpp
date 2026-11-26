@@ -2010,7 +2010,8 @@ bool process_worker_step_lidar_odometry_core(
     std::vector<Point3Di>& intermediate_points,
     int& iter_end,
     double& delta,
-    double& lm_factor)
+    double& lm_factor,
+    std::stop_token stop)
 {
     spdlog::stopwatch stopwatch_realtime;
 
@@ -2163,6 +2164,8 @@ bool process_worker_step_lidar_odometry_core(
 
     for (int iter = 0; iter < params.nr_iter; iter++)
     {
+        if (stop.stop_requested())
+            return false;
         // the bucket maps are only modified between chunks (update_rgd after the optimization, on this thread), so the
         // bucket pointers kept from the previous iteration stay valid
         std::scoped_lock lock(params.mutex_buckets_indoor, params.mutex_buckets_outdoor);
@@ -2399,7 +2402,8 @@ static bool compute_step_2_impl(
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
     bool debugMsg,
-    std::atomic<bool>& parked);
+    std::atomic<bool>& parked,
+    const OdometryControl& control);
 
 bool compute_step_2(
     std::vector<WorkerData>& worker_data,
@@ -2408,12 +2412,13 @@ bool compute_step_2(
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
     bool debugMsg,
-    std::atomic<bool>& parked)
+    std::atomic<bool>& parked,
+    const OdometryControl& control)
 {
     RunReport::Scope timing(params.run_report.get(), RunReport::Stage::Odometry);
     try
     {
-        const bool success = compute_step_2_impl(worker_data, params, ts_failure, loProgress, pause, debugMsg, parked);
+        const bool success = compute_step_2_impl(worker_data, params, ts_failure, loProgress, pause, debugMsg, parked, control);
         if (!success && params.run_report)
             params.run_report->fail("Odometry failed");
         return success;
@@ -2433,7 +2438,8 @@ static bool compute_step_2_impl(
     std::atomic<float>& loProgress,
     const std::atomic<bool>& pause,
     bool debugMsg,
-    std::atomic<bool>& parked)
+    std::atomic<bool>& parked,
+    const OdometryControl& control)
 {
     // exit(1);
     bool debug = false;
@@ -2450,7 +2456,8 @@ static bool compute_step_2_impl(
     PointsGlobalSpill spill(params); // a spill directory set: points_global lives in this call's file, removed at the end
 
     spdlog::stopwatch stopwatch_worker;
-    if (initialize_lidar_odometry(worker_data, params, ts_failure, loProgress, pause, debugMsg, lookup_stats))
+    if (!control.stop.stop_requested() &&
+        initialize_lidar_odometry(worker_data, params, ts_failure, loProgress, pause, debugMsg, lookup_stats))
     {
         if (params.publish_processing_head && !worker_data.empty() && !worker_data.front().intermediate_trajectory.empty())
             params.publish_processing_head(worker_data.front().intermediate_trajectory.front().translation());
@@ -2458,6 +2465,10 @@ static bool compute_step_2_impl(
             params.publish_trajectory(worker_data, true);
         for (int i = 0; i < worker_data.size(); i++)
         {
+            if (control.stop.stop_requested())
+                return false;
+            if (i % 10 == 0)
+                control.report("odometry", static_cast<size_t>(i), worker_data.size());
             HDMAP_ZONE_BEGIN(before_iter, "before_iterations");
 
             std::vector<Point3Di> intermediate_points;
@@ -2474,7 +2485,7 @@ static bool compute_step_2_impl(
                 if (params.run_report)
                     params.run_report->pause(true);
                 parked.store(true);
-                while (pause)
+                while (pause && !control.stop.stop_requested())
                 {
                     spdlog::info("pause");
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2484,6 +2495,8 @@ static bool compute_step_2_impl(
                     params.run_report->pause(false);
             }
 
+            if (control.stop.stop_requested())
+                return false;
             spdlog::stopwatch stopwatch_worker_process_worker_step_1;
             process_worker_step_1(
                 worker_data[i],
@@ -2503,6 +2516,8 @@ static bool compute_step_2_impl(
                 ts_failure);
             const double elapsed_seconds_process_worker_step_1 = stopwatch_worker_process_worker_step_1.elapsed().count();
 
+            if (control.stop.stop_requested())
+                return false;
             spdlog::stopwatch stopwatch_worker_process_worker_step_2;
             process_worker_step_2(
                 worker_data[i],
@@ -2536,6 +2551,8 @@ static bool compute_step_2_impl(
 
             HDMAP_ZONE_END(before_iter);
 
+            if (control.stop.stop_requested())
+                return false;
             spdlog::stopwatch stopwatch_worker_process_worker_step_lidar_odometry_core;
             process_worker_step_lidar_odometry_core(
                 worker_data[i],
@@ -2556,7 +2573,10 @@ static bool compute_step_2_impl(
                 intermediate_points,
                 iter_end,
                 delta,
-                lm_factor);
+                lm_factor,
+                control.stop);
+            if (control.stop.stop_requested())
+                return false;
             const double elapsed_seconds_process_worker_step_lidar_odometry_core =
                 stopwatch_worker_process_worker_step_lidar_odometry_core.elapsed().count();
 
@@ -2710,6 +2730,7 @@ static bool compute_step_2_impl(
         spdlog::info("avg_iteration_time: {:.3f}ms", avg_iteration_ms);
         spdlog::debug("lookup_stats: indoor={} outdoor_lookups={}", lookup_stats.indoor_lookups, lookup_stats.outdoor_lookups);
         spill.finish();
+        control.report("odometry", worker_data.size(), worker_data.size());
         return true;
     }
     else
@@ -2720,7 +2741,7 @@ static bool compute_step_2_impl(
     return true;
 }
 
-void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params)
+void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params, std::stop_token stop)
 {
     std::vector<Eigen::Affine3d> trajectory;
     std::vector<Eigen::Affine3d> trajectory_motion_model;
@@ -2733,6 +2754,8 @@ void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams
     spdlog::info("preparing data START");
     for (int i = 0; i < worker_data.size(); i++)
     {
+        if (stop.stop_requested())
+            return;
         for (int j = 0; j < worker_data[i].intermediate_trajectory.size(); j++)
         {
             trajectory.push_back(worker_data[i].intermediate_trajectory[j]);
@@ -2745,6 +2768,8 @@ void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams
 
     for (int i = 0; i < worker_data.size(); i++)
     {
+        if (stop.stop_requested())
+            return;
         std::vector<Point3Di> intermediate_points;
         if (!load_vector_data(worker_data[i].intermediate_points_cache_file_name.string(), intermediate_points))
             spdlog::warn("problem with load_vector_data file '{}'", worker_data[i].intermediate_points_cache_file_name.string());
@@ -2914,6 +2939,8 @@ void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams
     spdlog::info("NDT observations START");
     for (size_t index_point_begin = 0; index_point_begin < all_points_local.size(); index_point_begin += 1000000)
     {
+        if (stop.stop_requested())
+            return;
         NDTBucketMapType buckets;
         std::vector<Point3Di> points_local;
         std::vector<Point3Di> points_global;
@@ -3064,6 +3091,8 @@ void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams
     }
     spdlog::info("NDT observations FINISHED");
 
+    if (stop.stop_requested())
+        return;
     Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA);
     Eigen::SparseMatrix<double> x = solver.solve(AtPB);
     std::vector<double> h_x;
@@ -3092,7 +3121,7 @@ void Consistency(std::vector<WorkerData>& worker_data, const LidarOdometryParams
         worker_data[indexes[i].first].intermediate_trajectory[indexes[i].second] = trajectory[i];
 }
 
-void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params)
+void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParams& params, std::stop_token stop)
 {
     // global_tmp.clear();
 
@@ -3107,6 +3136,8 @@ void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParam
     spdlog::info("preparing data START");
     for (int i = 0; i < worker_data.size(); i++)
     {
+        if (stop.stop_requested())
+            return;
         for (int j = 0; j < worker_data[i].intermediate_trajectory.size(); j++)
         {
             trajectory.push_back(worker_data[i].intermediate_trajectory[j]);
@@ -3119,6 +3150,8 @@ void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParam
 
     for (int i = 0; i < worker_data.size(); i++)
     {
+        if (stop.stop_requested())
+            return;
         std::vector<Point3Di> intermediate_points;
         if (!load_vector_data(worker_data[i].intermediate_points_cache_file_name.string(), intermediate_points))
             spdlog::warn("problem with load_vector_data for file '{}'", worker_data[i].intermediate_points_cache_file_name.string());
@@ -3595,6 +3628,8 @@ void Consistency2(std::vector<WorkerData>& worker_data, const LidarOdometryParam
 
     spdlog::info("NDT observations start FINISHED");
 
+    if (stop.stop_requested())
+        return;
     Eigen::SimplicialCholesky<Eigen::SparseMatrix<double>> solver(AtPA);
     Eigen::SparseMatrix<double> x = solver.solve(AtPB);
     std::vector<double> h_x;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@ namespace mandeye::e57io
     struct E57Scan
     {
         std::string name;
+        std::int64_t data3d_index{};
         std::vector<Eigen::Vector3d> points; // cartesian, scan-local, meters
         std::vector<unsigned short> intensities; // empty when the scan has no intensity
         std::vector<Eigen::Vector3d> colors; // 0..1 RGB, empty when the scan has no color
