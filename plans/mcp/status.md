@@ -35,6 +35,7 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 - **P13 PASSED** dla `c06b6ec4133b83b38e8b4f620ebf34c8325b9173`. Macierz **8/8 PASS** na Windows Server x64, macOS ARM64, Ubuntu bundled i Debian ON/OFF. Lokalny CTest 18/18 ON i 5/5 OFF. ASan/UBSan i pełny TSan po 12/12, w tym I/O sesji i rejestracja Step 2. Parking potwierdził natywny MJS, wybór z ukrytym skanem, cykl E57 i bajtową zgodność obu trybów CLI. Przeszedł odczyt sześciu pobranych archiwów. Następny prompt dotyczy wyłącznie P14. [Raport P13](results/P13.md#odbiór-po-włączeniu-poprawki-build_rgd)
 - **P14 PASSED** dla `372ad2aa04b54e360059727c9c39298fba317ce4`. Macierz **8/8 PASS** po zaliczeniu macOS ARM64 ON z CTest 19/19 i odczytem archiwum DMG. ASan/UBSan i pełny TSan po 13/13. Projekt OmniWarsaw otworzył się po natywnym zapisie dwóch sesji po 14 skanów, z ground truth i więzem. Źródłowe pozy pozostały bajtowo identyczne. Przeszła próba przerwania pełnego zapisu. Następny prompt dotyczy wyłącznie P15. [Raport P14](results/P14.md)
 - **P15 PASSED** dla `5af3e6b1b3ad052cc7546be4735fd373d677b5e8`. Macierz **8/8 PASS**, CTest 20/20 ON i 5/5 OFF, pełny ASan/UBSan i osobny pełny TSan po 14/14. Rzeczywiste nakładanie OmniWarsaw potwierdziło 9032/15 731 punktów do 0,30 m. ICP i graf porównano z bazą. Optymalizacja trwała po zamknięciu GUI i ponownym połączeniu klienta. Natywne wyniki zachowały ground truth i pliki źródłowe. Następny prompt dotyczy wyłącznie P16. [Raport P15](results/P15.md)
+- **P16 PASSED** dla `aa2a2f16d6e45bb733b2b8835dcb8968a6b89a5d`. Macierz **8/8 PASS**, CTest 21/21 ON i 5/5 OFF, ASan/UBSan i osobny pełny TSan po 15/15. Codex wykonał sześć zadań dla kroków 1–3 oraz odczytał raport z zasobu MCP. Pełny eksport OmniWarsaw po odłączeniu źródła odzyskał 28 skanów i 8 718 825 punktów. Ponowny zapis wszystkich 63 plików natywnych był bajtowo zgodny ze źródłem. Następny prompt dotyczy wyłącznie P17. [Raport P16](results/P16.md)
 - **P00 INCOMPLETE.** Otwarte pozostają historyczne próby hostów Windows i Ubuntu, Linux TSan P00, bazowy projekt z potwierdzonym nakładaniem sesji oraz zapis i odczyt wyniku optymalizacji GUI kroku 2. Claude Desktop przypada na P17. [Raport P00](results/P00.md#pozostałe-braki-kwalifikacji-p00)
 - Odroczenie nie zmienia wyników kontroli ani wymagań przenośności i nie upoważnia do usuwania istniejących kontroli CI. Braki danych pozostają otwarte; nie są dowodem zgodności przyszłych zmian przetwarzania.
 - Kolejne czaty stosują [zasady przekazania](README.md).
@@ -57,7 +58,7 @@ Uzgodniony [standard jakości Go/C++](quality.md) jest częścią planu: P00 kwa
 | P13 | PASSED | [P13](results/P13.md) |
 | P14 | PASSED | [P14](results/P14.md) |
 | P15 | PASSED | [P15](results/P15.md) |
-| P16 | NOT STARTED | — |
+| P16 | PASSED | [P16](results/P16.md) |
 | P17 | NOT STARTED | — |
 
 Dozwolone stany: `NOT STARTED`, `IN PROGRESS`, `INCOMPLETE`, `PASSED`. Raport musi uzasadniać zmianę stanu. Sam commit, push lub ukończenie części sprawdzeń nie oznacza zaliczenia karty.
