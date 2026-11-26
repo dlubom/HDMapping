@@ -18,7 +18,7 @@ func addSessionIOTools(server *sdk.Server, call func(context.Context, string, an
 		{"session.subsession", "Publish a native session with the selected scans."},
 		{"session.import_poses", "Import initial, current or inverse RESSO poses for selected scans."},
 		{"session.import_observations", "Import native JSON observations tied to selected scan indices."},
-		{"export_result", "Publish an existing Step 2 export format for an explicit scan scope."},
+		{"export_result", "Publish a Step 2 export with scope.scan_indices, or a Step 3 project export with scope.sessions. Use parameters.format project and omit scope for a complete self-contained project."},
 	}
 	ids := make([]string, 0, len(operations))
 	for _, op := range operations {
@@ -44,6 +44,13 @@ func addSessionIOTools(server *sdk.Server, call func(context.Context, string, an
 func sessionIORequest(operation string, input step2MutationInput) (jobs.SubmitRequest, error) {
 	if operation == jobs.OpenSession {
 		return externalOpenRequest(operation, "step2", input)
+	}
+	if operation == "export_result" {
+		_, projectScope := input.Scope["sessions"]
+		format, _ := input.Parameters["format"].(string)
+		if projectScope || format == "project" {
+			operation = "project.export"
+		}
 	}
 	access := jobs.AccessRead
 	if operation == "session.import_poses" || operation == "session.import_observations" {

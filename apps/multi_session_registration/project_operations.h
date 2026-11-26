@@ -30,6 +30,9 @@ namespace HDMapping::Processing
     std::variant<SnapshotRef, OperationError> CaptureProjectAdd(
         const OperationRequest& request, const SnapshotRef& base, RunContext& context);
     std::variant<ProjectState, OperationError> LoadProjectSnapshot(const SnapshotRef& snapshot, std::stop_token stop = {});
+    //! Publish a complete native project with owned session dependencies.
+    RunResult PublishProject(const ProjectState& state, const TargetRef& target, RunContext& context);
+
     //! Apply one short project edit using the same index validation for GUI and snapshots.
     void EditProject(const OperationRequest& request, ProjectSettings& settings, std::vector<Session>& sessions);
     RunResult ExecuteProjectOperation(const OperationRequest& request, const SnapshotRef& snapshot, RunContext& context);

@@ -453,7 +453,7 @@ namespace HDMapping::Processing
             operation == detect || operation == icp;
     }
 
-    json ProjectEdgesJson(const std::vector<Edge>& edges)
+    json ProjectEdgesJson(std::span<const Edge> edges)
     {
         auto result = json::array();
         for (const auto& edge : edges)

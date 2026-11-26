@@ -203,10 +203,22 @@ def check(binaries, directory):
         io_job("project.add_session", "live-project-add", "applied", target=current, parameters={"path": str(second_session)})
         current = dict(current, revision=current["revision"] + 1)
         assert len(call("describe_state", {"target": current})["structuredContent"]["metadata"]["sessions"]) == 2
+        first = call("list_project_items", {"target": current, "scope": {"kind": "sessions", "limit": 1}})["structuredContent"]
+        assert first["total"] == 2 and first["items"][0]["index"] == 0 and first["next_offset"] == 1
+        second = call("list_project_items", {"target": current, "scope": {"kind": "sessions", "offset": first["next_offset"]}})["structuredContent"]
+        assert second["items"][0]["index"] == 1 and "next_offset" not in second
+        scans = call("list_project_items", {"target": current, "scope": {"kind": "scans", "session_index": 1}})["structuredContent"]
+        assert scans["total"] == 1 and scans["items"][0]["index"] == 0
+        _, exchange = io_job("export_result", "live-project-laz", target=current, scope={"sessions": [{"session_index": 1, "scan_indices": [0]}]},
+                             parameters={"format": "laz"})
+        exchange_manifest = json.loads(exchange.read_text())
+        assert exchange_manifest["parameters"]["sessions"][0]["session_index"] == 1
+        assert (exchange.parent / exchange_manifest["entry"]).read_bytes()[:4] == b"LASF"
         update = {"target": current, "scope": {"session_index": 1}}
         changed = call("project.set_ground_truth", update)["structuredContent"]["state"]
         assert changed["metadata"]["sessions"][1]["ground_truth"]
         assert call("project.remove_session", update)["isError"]
+        assert call("list_project_items", {"target": current, "scope": {"kind": "sessions"}})["isError"]
         _, saved = io_job("project.save", "live-project-save", target=changed["target"])
         saved_manifest = json.loads(saved.read_text())
         project = saved.parent / saved_manifest["entry"]

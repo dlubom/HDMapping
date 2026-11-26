@@ -1,6 +1,7 @@
 #include <HDMapping/Processing/Operation.h>
 
 #include <doctest/doctest.h>
+#include <laszip/laszip_api.h>
 
 #include <algorithm>
 
@@ -16,6 +17,7 @@ TEST_CASE("Step 3 advertises the project IO contract")
 
 #include "project_capture.h"
 #include "project_operations.h"
+#include "step3_io_operations.h"
 
 #include "../src/ResultPublisherIO.h"
 
@@ -248,4 +250,128 @@ TEST_CASE("interrupting a project write keeps the previous graph readable")
     CHECK(restored.sessions[1].is_ground_truth);
     CHECK(restored.settings.edges.size() == 1);
     CHECK(bytes(previous_entry.parent_path() / "0" / "poses.mrp") == previous_poses);
+}
+
+TEST_CASE("P16 project export owns its selected exchange files and relocates a complete project")
+{
+    const ProjectFiles files;
+    const TargetRef target{ "project-export", 8 };
+    auto sessions = make_sessions();
+    auto& scan = sessions.front().point_clouds_container.point_clouds.front();
+    scan.visible = false;
+    scan.file_name = "original-scan.laz";
+    scan.m_pose_temp = scan.m_pose;
+    scan.timestamps = { 1000000000.0 };
+    for (const double time : { 2000000000.0, 1000000000.0, 1000000000.0 })
+    {
+        auto& node = scan.local_trajectory.emplace_back();
+        node.m_pose = Eigen::Affine3d::Identity();
+        node.m_pose.translation().x() = 1;
+        node.timestamps = { time, time + 50 };
+    }
+    const auto input =
+        checked(PublishResult(stage(target, files.root / ".hdmapping-result-stage-input", make_project(), sessions), files.root / "input"));
+    ProjectCapture capture(target, sessions, ProjectSettingsJson(make_project()), json::object());
+    RunContext capture_context{ {}, {}, {} };
+    const auto live = checked(CaptureSnapshot(capture, target.revision, files.root / "live", capture_context));
+    const auto poses = entry(input).parent_path() / "0" / "poses.mrp";
+    const auto original = bytes(poses);
+    const auto selected = json{ { "sessions", { { { "session_index", 0 }, { "scan_indices", { 0 } } } } } };
+    const auto run = [&](const std::string& directory, const json& scope, const json& options)
+    {
+        RunContext context{ files.root / directory, {}, {} };
+        REQUIRE(fs::create_directory(context.output_directory));
+        return ExecuteOperation({ "project.export", target, scope, options }, live, context);
+    };
+
+    const auto catalog = DescribeOperations();
+    CHECK(std::ranges::find(catalog, "project.export", &OperationDescriptor::id) != catalog.end());
+    const auto tum = checked(run("tum", selected, { { "format", "trajectory_tum" } }));
+    CHECK(tum.dependencies.empty());
+    CHECK(
+        bytes(entry(tum)) ==
+        "1.000000000 10.1250000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 1.0000000000\n"
+        "2.000000000 10.1250000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 0.0000000000 1.0000000000\n");
+    const auto csv = checked(run("csv", selected, { { "format", "trajectory_csv" }, { "timestamps", "both" }, { "pose", "quaternion" } }));
+    auto csv_text = bytes(entry(csv));
+    std::erase(csv_text, '\r');
+    CHECK(csv_text.starts_with("timestampLidar,timestampUnix,x,y,z,qx,qy,qz,qw\n2000000000,2000000050,10.125"));
+    for (const std::string_view format : { "las", "laz", "trajectory_las", "trajectory_laz", "poses" })
+    {
+        const auto result = checked(run("parent.laz-" + std::string(format), selected, { { "format", format } }));
+        CHECK(result.files.size() == 2);
+        CHECK(result.dependencies.empty());
+        CHECK(fs::file_size(entry(result)) > 0);
+        if (format == "poses")
+        {
+            REQUIRE(bytes(entry(result)).find("original-scan.laz") != std::string::npos);
+            continue;
+        }
+        laszip_POINTER handle = nullptr;
+        REQUIRE(laszip_create(&handle) == 0);
+        const auto output = sessionPathText(entry(result));
+        laszip_BOOL compressed = 0;
+        REQUIRE(laszip_open_reader(handle, output.c_str(), &compressed) == 0);
+        CHECK((compressed != 0) == format.ends_with("laz"));
+        laszip_header* header = nullptr;
+        REQUIRE(laszip_get_header_pointer(handle, &header) == 0);
+        CHECK(header->number_of_point_records == (format.starts_with("trajectory") ? 3U : 1U));
+        REQUIRE(laszip_read_point(handle) == 0);
+        if (!format.starts_with("trajectory"))
+        {
+            laszip_point* point = nullptr;
+            REQUIRE(laszip_get_point_pointer(handle, &point) == 0);
+            CHECK(point->gps_time == scan.timestamps.front());
+            CHECK(point->intensity == 42);
+            double coordinates[3]{};
+            REQUIRE(laszip_get_coordinates(handle, coordinates) == 0);
+            CHECK(coordinates[0] == doctest::Approx(10.375));
+        }
+        CHECK(laszip_close_reader(handle) == 0);
+        CHECK(laszip_destroy(handle) == 0);
+    }
+    CHECK(bytes(poses) == original);
+    const auto bad = run("bad", { { "sessions", { { { "session_index", 1 }, { "scan_indices", { 999 } } } } } }, { { "format", "laz" } });
+    REQUIRE(std::holds_alternative<OperationError>(bad));
+    CHECK(std::get<OperationError>(bad).code == "invalid_parameter");
+    CHECK_FALSE(fs::exists(files.root / "bad" / "export"));
+
+    RunContext page_context{ files.root / "page", {}, {} };
+    REQUIRE(fs::create_directory(page_context.output_directory));
+    const auto page = checked(ExecuteOperation(
+        { "project.list_items", target, { { "kind", "scans" }, { "session_index", 0 } }, json::object() }, live, page_context));
+    CHECK(json::parse(bytes(entry(page))).at("items").front().at("trajectory_nodes") == 3);
+    const auto full = checked(run("full", json::object(), { { "format", "project" } }));
+    const auto old_root = full.snapshot.manifest_path.parent_path();
+    const auto moved = files.root / "relocated";
+    fs::rename(old_root, moved);
+    fs::rename(files.root / "input", files.root / "offline");
+    fs::rename(files.root / "live", files.root / "offline-live");
+    const auto reopened = checked(LoadProjectSnapshot({ moved / full.snapshot.manifest_path.filename(), target }));
+    REQUIRE(reopened.sessions.size() == 2);
+    CHECK(reopened.sessions.at(1).is_ground_truth);
+    CHECK(reopened.settings.edges.size() == 1);
+    CHECK(reopened.sessions.at(0).point_clouds_container.point_clouds.at(0).local_trajectory.size() == 3);
+    CHECK(full.dependencies.empty());
+}
+
+TEST_CASE("P16 project pages preserve indices and are bounded for large projects")
+{
+    std::vector<Session> sessions(2001);
+    std::vector<Edge> edges(2001, make_project().edges.front());
+    sessions.at(2000).is_ground_truth = true;
+    const auto first = ProjectItemsPage(sessions, edges, { { "kind", "sessions" }, { "limit", 100 } });
+    CHECK(first.at("total") == 2001);
+    CHECK(first.at("next_offset") == 100);
+    CHECK(first.at("items").size() == 100);
+    CHECK(first.at("items").back().at("index") == 99);
+    const auto last = ProjectItemsPage(sessions, edges, { { "kind", "sessions" }, { "offset", 2000 }, { "limit", 100 } });
+    CHECK_FALSE(last.contains("next_offset"));
+    CHECK(last.at("items").front().at("ground_truth") == true);
+    CHECK(last.at("items").front().at("index") == 2000);
+    const auto constraints = ProjectItemsPage(sessions, edges, { { "kind", "constraints" }, { "offset", 1000 }, { "limit", 25 } });
+    CHECK(constraints.at("next_offset") == 1025);
+    CHECK(constraints.at("items").front().at("index") == 1000);
+    CHECK(constraints.at("items").back().at("to").at("session_index") == 1);
+    CHECK_THROWS_AS(ProjectItemsPage(sessions, edges, { { "kind", "sessions" }, { "offset", 2002 } }), std::invalid_argument);
 }

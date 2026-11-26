@@ -17,6 +17,7 @@ import (
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/protocol"
+	"github.com/google/jsonschema-go/jsonschema"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -150,6 +151,10 @@ func TestStdioProduct(t *testing.T) {
 	}
 
 	if shipped {
+		checkInstalledCatalog(t, ctx, client)
+	}
+
+	if shipped {
 		input := map[string]any{"request_key": "empty-step1", "recording": map[string]string{"directory": t.TempDir()}}
 		operation, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "step1_odometry", Arguments: input})
 		if err != nil || operation.IsError {
@@ -223,5 +228,95 @@ func TestStdioProduct(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &message); err != nil || message.JSONRPC != "2.0" {
 			t.Fatalf("non-protocol stdout: %q", line)
 		}
+	}
+}
+
+func checkInstalledCatalog(t *testing.T, ctx context.Context, client *sdk.ClientSession) {
+	t.Helper()
+	result, err := client.CallTool(ctx, &sdk.CallToolParams{Name: "describe_operations"})
+	if err != nil || result.IsError {
+		t.Fatalf("read installed C++ registry: %v (%v)", err, result)
+	}
+	data, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Operations []struct {
+			ID         string          `json:"id"`
+			Tool       string          `json:"tool"`
+			Class      string          `json:"class"`
+			Scope      json.RawMessage `json:"scope_schema"`
+			Parameters json.RawMessage `json:"parameters_schema"`
+			Result     map[string]any  `json:"result_schema"`
+		}
+	}
+	if err := json.Unmarshal(data, &catalog); err != nil || len(catalog.Operations) < 40 {
+		t.Fatalf("decode installed operations: %d (%v)", len(catalog.Operations), err)
+	}
+	tools := make(map[string]*sdk.Tool)
+	for tool, err := range client.Tools(ctx, nil) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		tools[tool.Name] = tool
+	}
+	seen := make(map[string]bool)
+	for _, operation := range catalog.Operations {
+		tool := tools[operation.Tool]
+		if operation.ID == "" || seen[operation.ID] || tool == nil || operation.Class == "" ||
+			len(operation.Scope) == 0 || len(operation.Parameters) == 0 || operation.Result["properties"] == nil {
+			t.Fatalf("incomplete C++ operation mapping: %+v", operation)
+		}
+		seen[operation.ID] = true
+		input, err := json.Marshal(tool.InputSchema)
+		if err != nil || !bytes.Contains(input, operation.Scope) || (operation.ID != "project.list_items" && !bytes.Contains(input, operation.Parameters)) {
+			t.Fatalf("%s does not advertise the native input schema for %s: %v", operation.Tool, operation.ID, err)
+		}
+	}
+	if !seen["project.export"] || !seen["project.list_items"] {
+		t.Fatal("project export is absent from the installed registry")
+	}
+	checkExportSchema(t, tools["export_result"])
+	t.Logf("%d C++ operations with MCP tools and matching argument schemas", len(seen))
+}
+
+func checkExportSchema(t *testing.T, tool *sdk.Tool) {
+	t.Helper()
+	data, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectScope := map[string]any{"sessions": []any{map[string]any{"session_index": 0}}}
+	for _, test := range []struct {
+		name   string
+		scope  map[string]any
+		params map[string]any
+		valid  bool
+	}{
+		{"complete", nil, map[string]any{"format": "project"}, true},
+		{"extra-selection", projectScope, map[string]any{"format": "project"}, false},
+		{"missing-selection", nil, map[string]any{"format": "trajectory_tum"}, false},
+		{"partial-section", projectScope, map[string]any{"format": "section_laz"}, false},
+		{"section", projectScope, map[string]any{"format": "section_laz", "plane": "xy", "width_m": 1.0}, true},
+		{"existing-session", map[string]any{"scan_indices": []any{0}}, map[string]any{"format": "laz"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := map[string]any{"request_key": "schema-check", "target": map[string]any{"state_id": "test", "revision": 1}, "parameters": test.params}
+			if test.scope != nil {
+				args["scope"] = test.scope
+			}
+			if err := resolved.Validate(args); (err == nil) != test.valid {
+				t.Fatalf("advertised export contract validity = %v, want %v (%v)", err == nil, test.valid, err)
+			}
+		})
 	}
 }

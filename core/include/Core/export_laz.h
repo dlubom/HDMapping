@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,13 @@ public:
     LazWriter& operator=(const LazWriter&) = delete;
 
     //! with_rgb writes LAS point format 3 (format 1 + rgb) instead of format 1.
-    bool open(const std::string& filename, double offset_x, double offset_y, double offset_z, bool with_rgb = false)
+    bool open(
+        const std::string& filename,
+        double offset_x,
+        double offset_y,
+        double offset_z,
+        bool with_rgb = false,
+        std::optional<bool> compressed = std::nullopt)
     {
         if (laszip_create(&writer_))
         {
@@ -65,7 +72,7 @@ public:
         header->y_offset = offset_y;
         header->z_offset = offset_z;
 
-        laszip_BOOL compress = (strstr(filename.c_str(), ".laz") != 0);
+        laszip_BOOL compress = compressed.value_or(strstr(filename.c_str(), ".laz") != nullptr);
         if (laszip_open_writer(writer_, filename.c_str(), compress))
         {
             fprintf(stderr, "DLL ERROR: opening laszip writer for '%s'\n", filename.c_str());

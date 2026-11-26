@@ -256,6 +256,14 @@ namespace HDMapping::Processing
         {
             return error("stale_revision", "The opening has changed");
         }
+        if (method == "states.list_project_items")
+        {
+            if (!callbacks_.ListProjectItems)
+                return error("invalid_parameters", "The opening is not a Step 3 project");
+            auto page = callbacks_.ListProjectItems(params.at("scope"));
+            page["target"] = target_to_json(target_);
+            return page;
+        }
         if (method == "states.describe")
         {
             return summarize(callbacks_.DescribeState(), target_);

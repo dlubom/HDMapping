@@ -22,6 +22,8 @@ namespace HDMapping::Processing
         std::function<std::unique_ptr<CaptureSource>(const OperationRequest&)> PinOperationCapture = {};
         //! Present a verified read-only result without advancing the workspace revision.
         std::function<std::optional<OperationError>(const ArtifactManifest&)> PresentLoopCandidates = {};
+        //! Read one bounded page from a project at the checked revision.
+        std::function<nlohmann::json(const nlohmann::json&)> ListProjectItems = {};
     };
 
     using GuiResponse = std::variant<nlohmann::json, OperationError>;

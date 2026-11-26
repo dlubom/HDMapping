@@ -1,5 +1,7 @@
 #pragma once
 
+#include <span>
+
 #include "project_io.h"
 
 #include <HDMapping/Processing/Operation.h>
@@ -12,7 +14,7 @@ namespace HDMapping::Processing
     bool IsStep3Edit(std::string_view operation);
 
     //! Serialize active edges in index order for the editor and MCP.
-    nlohmann::json ProjectEdgesJson(const std::vector<Edge>& edges);
+    nlohmann::json ProjectEdgesJson(std::span<const Edge> edges);
 
     //! Validate and apply a short edit to a loaded project.
     void EditStep3(const OperationRequest& request, ProjectSettings& settings, std::vector<Session>& sessions);

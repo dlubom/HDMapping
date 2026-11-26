@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,6 +34,7 @@ type step1Job struct {
 	Result         *jobs.Publication  `json:"result,omitempty"`
 	Error          *toolJobError      `json:"error,omitempty"`
 	GUIApplyStatus string             `json:"gui_apply_status"`
+	ArtifactsURI   string             `json:"artifacts_uri,omitempty"`
 }
 
 type toolJobError struct {
@@ -45,26 +44,6 @@ type toolJobError struct {
 	// The SDK infers a byte-array schema from json.RawMessage. The worker
 	// supplies a JSON value whose encoding must survive the tool boundary.
 	Details any `json:"details,omitempty"`
-}
-
-type operationCatalog struct {
-	Operations []map[string]any `json:"operations"`
-}
-
-func addOperationCatalog(server *sdk.Server, call func(context.Context, string, any, any) error, family, description string, operationIDs ...string) {
-	sdk.AddTool(server, &sdk.Tool{Name: "describe_" + family + "_operations", Description: description, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
-		func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, operationCatalog, error) {
-			var all []map[string]any
-			err := call(ctx, "operations.describe", nil, &all)
-			result := operationCatalog{Operations: make([]map[string]any, 0)}
-			for _, operation := range all {
-				id, _ := operation["id"].(string)
-				if (len(operationIDs) == 0 && strings.HasPrefix(id, family+".")) || slices.Contains(operationIDs, id) {
-					result.Operations = append(result.Operations, operation)
-				}
-			}
-			return nil, result, err
-		})
 }
 
 func addStep1Tools(server *sdk.Server, call func(context.Context, string, any, any) error) []string {
@@ -99,8 +78,21 @@ func addStep1Tools(server *sdk.Server, call func(context.Context, string, any, a
 	sdk.AddTool(server, &sdk.Tool{Name: "get_job", Description: "Read a job's progress, result, error, and GUI apply outcome.", Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
 		func(ctx context.Context, _ *sdk.CallToolRequest, input jobInput) (*sdk.CallToolResult, step1Job, error) {
 			var record jobs.JobRecord
-			err := call(ctx, "jobs.get", input.ID, &record)
-			return nil, summarizeJob(record), err
+			if err := call(ctx, "jobs.get", input.ID, &record); err != nil {
+				return nil, step1Job{}, err
+			}
+			job := summarizeJob(record)
+			if job.ArtifactsURI == "" {
+				return nil, job, nil
+			}
+			data, err := json.Marshal(job)
+			if err != nil {
+				return nil, step1Job{}, err
+			}
+			return &sdk.CallToolResult{Content: []sdk.Content{
+				&sdk.TextContent{Text: string(data)},
+				&sdk.ResourceLink{URI: job.ArtifactsURI, Name: "Job artifacts", MIMEType: "application/json"},
+			}}, job, nil
 		})
 	sdk.AddTool(server, &sdk.Tool{Name: "cancel_job", Description: "Request cancellation of a job. Use get_job to observe the final outcome."},
 		func(ctx context.Context, _ *sdk.CallToolRequest, input jobInput) (*sdk.CallToolResult, step1Job, error) {
@@ -148,6 +140,9 @@ func summarizeJob(record jobs.JobRecord) step1Job {
 		ID: record.ID, Operation: record.Request.Operation.Operation, Target: record.Request.Operation.Target,
 		Status: record.Status, Progress: record.Progress, Snapshot: record.Snapshot, Result: record.Result,
 		GUIApplyStatus: record.GUIApplyStatus,
+	}
+	if record.Status == jobs.Completed && record.Result != nil && record.Result.Confirmed && record.Result.Snapshot != nil {
+		job.ArtifactsURI = jobResourceURI(job.ID, "artifacts")
 	}
 	if failure := record.Error; failure != nil {
 		job.Error = &toolJobError{Code: failure.Code, Message: failure.Message, OperationCode: failure.OperationCode}

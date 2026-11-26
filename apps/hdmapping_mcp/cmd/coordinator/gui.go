@@ -219,7 +219,7 @@ func (g *guiJobs) handle(ctx context.Context, method string, body json.RawMessag
 	case "states.list":
 		targets, err := g.registry.List(ctx)
 		return map[string]any{"states": targets}, err
-	case "states.describe", "states.execute":
+	case "states.describe", "states.execute", "states.list_project_items":
 		var req struct {
 			Target jobs.TargetRef `json:"target"`
 		}

@@ -35,11 +35,12 @@ if(MSVC)
 endif()
 
 set(_project_sources "${_step3_dir}/project_operations.cpp" "${_step3_dir}/project_capture.cpp"
-    "${_step3_dir}/step3_operations.cpp" "${_step3_dir}/multi_session_factor_graph.cpp")
+    "${_step3_dir}/step3_operations.cpp" "${_step3_dir}/multi_session_factor_graph.cpp"
+    "${_step3_dir}/step3_io_operations.cpp" "${_step3_dir}/step3_export_formats.cpp")
 add_library(processing_project STATIC ${_project_sources})
 target_include_directories(processing_project PUBLIC "${_step3_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(processing_project SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/shared/include"
-    "${THIRDPARTY_DIRECTORY}/observation_equations/codes")
+    "${THIRDPARTY_DIRECTORY}/observation_equations/codes" "${LASZIP_INCLUDE_DIR}/LASzip/include")
 target_compile_definitions(processing_project PRIVATE WITH_GUI=0)
 target_link_libraries(processing_project PUBLIC processing_session_snapshot PRIVATE core_math)
 hdmapping_processing_target(processing_project)
@@ -267,13 +268,15 @@ if(BUILD_TESTING)
     list(APPEND _runtime_sources tests/session_io_operations_test.cpp)
 
     add_executable(processing_project_io_test tests/project_io_test.cpp tests/runtime_test_main.cpp)
-    target_include_directories(processing_project_io_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest")
+    target_include_directories(processing_project_io_test SYSTEM PRIVATE "${THIRDPARTY_DIRECTORY}/doctest" "${LASZIP_INCLUDE_DIR}/LASzip/include")
     target_link_libraries(processing_project_io_test PRIVATE processing_step1 core_no_gui)
     if(MSVC)
         target_compile_options(processing_project_io_test PRIVATE /bigobj)
     endif()
     hdmapping_processing_target(processing_project_io_test)
-    add_test(NAME processing-project-io COMMAND processing_project_io_test)
+    add_test(NAME processing-project-io COMMAND processing_project_io_test --test-case-exclude=P16*)
+    add_test(NAME processing-project-export COMMAND processing_project_io_test --test-case=P16*)
+    set_tests_properties(processing-project-export PROPERTIES LABELS processing-project-export TIMEOUT 90)
     set_tests_properties(processing-project-io PROPERTIES LABELS processing-project-io TIMEOUT 90)
     list(APPEND _runtime_sources tests/project_io_test.cpp)
 

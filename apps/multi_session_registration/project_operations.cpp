@@ -1,6 +1,7 @@
 #include "project_operations.h"
 
 #include "project_capture.h"
+#include "step3_io_operations.h"
 #include "step3_operations.h"
 #include <HDMapping/Processing/ResultPublisher.h>
 #include <HDMapping/Processing/SessionSnapshot.h>
@@ -64,12 +65,14 @@ namespace HDMapping::Processing
         }
 
         //! Persist a project graph read result without publishing mutated project state.
-        class ConstraintReport final : public CaptureSource
+        class ProjectReport final : public CaptureSource
         {
         public:
-            ConstraintReport(TargetRef target, json report)
+            ProjectReport(TargetRef target, json report, fs::path entry, std::string kind)
                 : target_(std::move(target))
                 , report_(std::move(report))
+                , entry_(std::move(entry))
+                , kind_(std::move(kind))
             {
             }
 
@@ -81,49 +84,56 @@ namespace HDMapping::Processing
             CaptureResult Materialize(const fs::path& directory, RunContext& context) override
             {
                 if (context.stop.stop_requested())
-                    return OperationError{ "cancelled", "Project constraint report cancelled", json::object() };
-                std::ofstream file(directory / "constraints.json", std::ios::binary);
+                    return OperationError{ "cancelled", "Project report cancelled", json::object() };
+                std::ofstream file(directory / entry_, std::ios::binary);
                 file.exceptions(std::ios::failbit | std::ios::badbit);
                 file << report_.dump(2);
                 file.close();
-                return SnapshotContents{ "project_constraints", "constraints.json", json::object(), {} };
+                return SnapshotContents{ kind_, entry_, json::object(), {} };
             }
 
         private:
             TargetRef target_;
             json report_;
+            fs::path entry_;
+            std::string kind_;
         };
 
-        RunResult publish_constraints(const TargetRef& target, json report, RunContext& context)
+        RunResult publish_report(const TargetRef& target, json report, const fs::path& entry, std::string kind, RunContext& context)
         {
-            ConstraintReport source(target, std::move(report));
-            const auto captured = CaptureSnapshot(source, target.revision, context.output_directory / "project-constraints", context);
+            ProjectReport source(target, std::move(report), entry, kind);
+            const auto captured = CaptureSnapshot(
+                source,
+                target.revision,
+                context.output_directory / (kind == "project_constraints" ? fs::path("project-constraints") : entry.stem()),
+                context);
             if (const auto* error = std::get_if<OperationError>(&captured))
                 return *error;
             const auto& snapshot = std::get<SnapshotRef>(captured);
-            return ArtifactManifest{ "project-constraints",
+            return ArtifactManifest{ kind == "project_constraints" ? "project-constraints" : std::move(kind),
                                      target,
                                      snapshot,
-                                     { snapshot.manifest_path, snapshot.manifest_path.parent_path() / "constraints.json" },
+                                     { snapshot.manifest_path, snapshot.manifest_path.parent_path() / entry },
                                      {} };
         }
 
-        RunResult publish(const ProjectState& state, const TargetRef& target, RunContext& context)
-        {
-            const auto stage = context.output_directory / ".hdmapping-result-stage-project";
-            const auto destination = context.output_directory / "native";
-            ProjectCapture source(target, state.sessions, ProjectSettingsJson(state.settings), state.parameters, true, state.sources);
-            const auto captured = CaptureSnapshot(source, target.revision, stage, context);
-            if (const auto* failed = std::get_if<OperationError>(&captured))
-                return *failed;
-            if (context.stop.stop_requested())
-            {
-                DiscardResultStaging(stage, destination);
-                return OperationError{ "cancelled", "Project publication cancelled", json::object() };
-            }
-            return PublishResult(stage, destination, {}, context.stop);
-        }
     } // namespace
+
+    RunResult PublishProject(const ProjectState& state, const TargetRef& target, RunContext& context)
+    {
+        const auto stage = context.output_directory / ".hdmapping-result-stage-project";
+        const auto destination = context.output_directory / "native";
+        ProjectCapture source(target, state.sessions, ProjectSettingsJson(state.settings), state.parameters, true, state.sources);
+        const auto captured = CaptureSnapshot(source, target.revision, stage, context);
+        if (const auto* failed = std::get_if<OperationError>(&captured))
+            return *failed;
+        if (context.stop.stop_requested())
+        {
+            DiscardResultStaging(stage, destination);
+            return OperationError{ "cancelled", "Project publication cancelled", json::object() };
+        }
+        return PublishResult(stage, destination, {}, context.stop);
+    }
 
     TargetRef ProjectChildTarget(const TargetRef& project, std::size_t index)
     {
@@ -146,6 +156,8 @@ namespace HDMapping::Processing
             { std::string(remove), index(0), empty, artifact, OperationClass::Mutate },
             { std::string(ground_truth), index(-1), empty, artifact, OperationClass::Mutate },
         };
+        operations.push_back(DescribeProjectExport());
+        operations.push_back(DescribeProjectListing());
         auto graph = DescribeStep3Operations();
         operations.insert(operations.end(), std::make_move_iterator(graph.begin()), std::make_move_iterator(graph.end()));
         return operations;
@@ -154,7 +166,7 @@ namespace HDMapping::Processing
     bool IsProjectOperation(std::string_view operation)
     {
         return operation == open || operation == save || operation == add || operation == remove || operation == ground_truth ||
-            IsStep3Operation(operation);
+            IsStep3Operation(operation) || operation == project_export_operation || operation == project_listing_operation;
     }
 
     std::variant<SnapshotRef, OperationError> CaptureProjectOpen(const OperationRequest& request, RunContext& context)
@@ -253,7 +265,16 @@ namespace HDMapping::Processing
                     auto loaded = LoadSessionSnapshot({ child_snapshot, target }, stop);
                     if (const auto* failed = std::get_if<OperationError>(&loaded))
                         return *failed;
-                    state.sessions.push_back(std::move(*std::get<SessionSnapshot>(loaded).session));
+                    auto& captured = std::get<SessionSnapshot>(loaded);
+                    if (const auto names = captured.parameters.find("scan_names"); names != captured.parameters.end())
+                    {
+                        auto& scans = captured.session->point_clouds_container.point_clouds;
+                        if (!names->is_array() || names->size() != scans.size())
+                            throw std::invalid_argument("Project scan name inventory disagrees with the session");
+                        for (std::size_t scan = 0; scan < scans.size(); ++scan)
+                            scans[scan].source_scan_name = names->at(scan).get<std::string>();
+                    }
+                    state.sessions.push_back(std::move(*captured.session));
                     state.sessions.back().session_file_name = name;
                 }
                 auto& session = state.sessions.back();
@@ -306,6 +327,19 @@ namespace HDMapping::Processing
             if (const auto* failed = std::get_if<OperationError>(&result))
                 return *failed;
             auto& state = std::get<ProjectState>(result);
+            if (request.operation == project_export_operation)
+                return ExportProject(request, state, context);
+            if (request.operation == project_listing_operation)
+            {
+                if (!request.parameters.empty())
+                    throw std::invalid_argument("Project listing takes an empty parameters object");
+                return publish_report(
+                    request.target,
+                    ProjectItemsPage(state.sessions, state.settings.edges, request.scope),
+                    "project-items.json",
+                    "project_items",
+                    context);
+            }
             if (request.operation == open || request.operation == add)
             {
                 const auto path = requested_path(request);
@@ -318,12 +352,12 @@ namespace HDMapping::Processing
             {
                 auto report = RunStep3(request, state.settings, state.sessions, context);
                 if (!report.is_null())
-                    return publish_constraints(request.target, std::move(report), context);
+                    return publish_report(request.target, std::move(report), "constraints.json", "project_constraints", context);
             }
             else if (request.operation != save || !request.parameters.empty() || !request.scope.empty())
                 throw std::invalid_argument("Invalid project save request");
             state.parameters.erase("project_import");
-            return publish(state, request.target, context);
+            return PublishProject(state, request.target, context);
         } catch (const std::exception& error)
         {
             return failure(context, error);

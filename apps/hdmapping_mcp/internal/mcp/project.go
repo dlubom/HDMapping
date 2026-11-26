@@ -2,7 +2,10 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/MapsHD/HDMapping/apps/hdmapping_mcp/internal/jobs"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -64,7 +67,7 @@ func addProjectTools(server *sdk.Server, call func(context.Context, string, any,
 	const list = "project.constraints.list"
 	addProjectConstraintList(server, call, list)
 	ids = append(ids, list)
-	addOperationCatalog(server, call, "project", "List the native multi-session project contracts.", ids...)
+	addOperationCatalog(server, call, "project", "List the native multi-session project contracts.", slices.Concat(ids, []string{"project.export", "project.list_items"})...)
 	return append(ids, "describe_project_operations")
 }
 
@@ -98,6 +101,72 @@ func addProjectConstraintList(server *sdk.Server, call func(context.Context, str
 			if err != nil {
 				return nil, out, err
 			}
+			var record jobs.JobRecord
+			if err := call(ctx, "jobs.submit", request, &record); err != nil {
+				return nil, out, err
+			}
+			job := summarizeJob(record)
+			out.Job = &job
+			return nil, out, nil
+		})
+}
+
+type projectPageScope struct {
+	Kind         string `json:"kind" jsonschema:"sessions, scans, or constraints"`
+	SessionIndex *int   `json:"session_index,omitempty" jsonschema:"Required for scans"`
+	Offset       int    `json:"offset,omitempty" jsonschema:"Zero-based offset from next_offset"`
+	Limit        int    `json:"limit,omitempty" jsonschema:"Page size 1 through 100, default 50"`
+}
+
+type projectPageInput struct {
+	Target     *jobs.TargetRef   `json:"target,omitempty"`
+	Snapshot   *jobs.SnapshotRef `json:"snapshot,omitempty"`
+	RequestKey string            `json:"request_key,omitempty" jsonschema:"Stable request key, required with a snapshot"`
+	Scope      projectPageScope  `json:"scope"`
+}
+
+type projectPage struct {
+	Target     *jobs.TargetRef   `json:"target,omitempty"`
+	Items      *[]map[string]any `json:"items,omitempty"`
+	Total      *int              `json:"total,omitempty"`
+	NextOffset *int              `json:"next_offset,omitempty"`
+	Job        *step1Job         `json:"job,omitempty"`
+}
+
+func addProjectListing(server *sdk.Server, call func(context.Context, string, any, any) error) {
+	sdk.AddTool(server, &sdk.Tool{Name: "list_project_items",
+		Description: "Page through sessions, scans, or active constraints at a project revision. A live target returns a page. A snapshot requires request_key and publishes the page as project-items.json.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}},
+		func(ctx context.Context, _ *sdk.CallToolRequest, input projectPageInput) (*sdk.CallToolResult, projectPage, error) {
+			var out projectPage
+			if (input.Target == nil) == (input.Snapshot == nil) {
+				return nil, out, errors.New("supply exactly one of target or snapshot")
+			}
+			if input.Scope.Kind != "sessions" && input.Scope.Kind != "scans" && input.Scope.Kind != "constraints" {
+				return nil, out, errors.New("kind must be sessions, scans, or constraints")
+			}
+			if (input.Scope.Kind == "scans") != (input.Scope.SessionIndex != nil) {
+				return nil, out, errors.New("supply session_index for a scans page only")
+			}
+			limit, err := pageLimit(input.Scope.Offset, input.Scope.Limit)
+			if err != nil {
+				return nil, out, err
+			}
+			input.Scope.Limit = limit
+			if input.Target != nil {
+				err = call(ctx, "states.list_project_items", input, &out)
+				return nil, out, err
+			}
+			if input.RequestKey == "" {
+				return nil, out, errors.New("request_key is required with a snapshot")
+			}
+			scope, err := json.Marshal(input.Scope)
+			if err != nil {
+				return nil, out, fmt.Errorf("encode project page scope: %w", err)
+			}
+			request := jobs.SubmitRequest{RequestKey: input.RequestKey, Source: jobs.SourceMCP, Access: jobs.AccessRead,
+				Snapshot: input.Snapshot, Operation: jobs.OperationRequest{Operation: "project.list_items", Target: input.Snapshot.Target,
+					Scope: scope, Parameters: json.RawMessage("{}")}}
 			var record jobs.JobRecord
 			if err := call(ctx, "jobs.submit", request, &record); err != nil {
 				return nil, out, err
