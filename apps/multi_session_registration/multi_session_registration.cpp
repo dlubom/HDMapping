@@ -2072,7 +2072,7 @@ namespace
         {
             const auto& snapshot = projectJob.at("result").at("snapshot");
             const auto manifest = sessionPathFromText(snapshot.at("manifest_path").get<std::string>());
-            const auto operation = projectJob.at("request").at("operation").at("operation");
+            const std::string_view operation = projectJob.at("request").at("operation").at("operation").get_ref<const std::string&>();
             const auto path = operation == proc::project_export_operation ? manifest.parent_path() : manifest.parent_path() / "project.mjp";
             ImGui::TextWrapped("%s", sessionPathText(path).c_str());
         }
